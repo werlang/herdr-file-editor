@@ -712,6 +712,28 @@ export default class FileEditor extends View {
   }
 
   /**
+   * Restores keyboard focus to the editor element without requiring mouse clicks.
+   * Focuses the tab container handle and advances focus into the child Editor tab stop.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  focusEditor(cx) {
+    if (this.closed || this.isImage || (this.viewMode !== "code" && (isMarkdownFile(this.file) || this.isSvg))) {
+      return;
+    }
+    const attempt = () => {
+      try {
+        if (this.closed || !this.code) return;
+        this.focusHandle?.focus();
+        globalThis.window?.focus_next();
+      } catch {}
+    };
+    attempt();
+    cx.timer.after(20, attempt);
+    cx.timer.after(80, attempt);
+  }
+
+  /**
    * Toggles soft wrapping, persists setting in shared state, and rebuilds editor.
    *
    * @param {boolean} wrap
@@ -724,6 +746,7 @@ export default class FileEditor extends View {
     setShared("file-editor.wrap", wrap);
     this.rebuildEditor();
     cx.notify();
+    this.focusEditor(cx);
   }
 
   /**
@@ -742,8 +765,11 @@ export default class FileEditor extends View {
       }
     }
     this.viewMode = mode;
-    if (mode === "code" && !this.code) {
-      this.rebuildEditor();
+    if (mode === "code") {
+      if (!this.code) {
+        this.rebuildEditor();
+      }
+      this.focusEditor(cx);
     } else if (mode === "preview" && this.isSvg && !this.imageSrc && !this.imageLoading) {
       this.loadImage(cx);
     }
