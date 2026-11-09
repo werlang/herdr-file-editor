@@ -360,8 +360,12 @@ export default class FileEditor extends View {
       this.updateCachedTabState({
         code: this.code,
         editorInputs: this.editorInputs,
+        mdScrollY: this.mdScrollY,
+        pictureScrollX: this.pictureScrollX,
+        pictureScrollY: this.pictureScrollY,
         imageSrc: this.imageSrc,
         pictureViewport: this.pictureViewport,
+        tabViewport: this.tabViewport,
         lastAccess: Date.now(),
       });
     }
@@ -434,11 +438,15 @@ export default class FileEditor extends View {
     const initialZoom = typeof p.zoom === "number" ? p.zoom : (cached?.imageZoom ?? 1);
     this.imageZoom = normalizeImageZoom(initialZoom);
     this.pictureViewport = cached?.pictureViewport ?? null;
+    this.tabViewport = cached?.tabViewport ?? null;
     this.isTruncated = cached?.isTruncated ?? false;
     this.loading = false;
     this.reloadPending = false;
     this.code = cached?.code ?? null;
     this.editorInputs = cached?.editorInputs ?? null;
+    this.mdScrollY = cached?.mdScrollY ?? 0;
+    this.pictureScrollX = cached?.pictureScrollX ?? 0;
+    this.pictureScrollY = cached?.pictureScrollY ?? 0;
     this.watched = null;
     this.watchToken = null;
     this.focusHandle = cx.focus_handle();
@@ -484,9 +492,13 @@ export default class FileEditor extends View {
       imageSize: this.imageSize,
       imageSrc: this.imageSrc ?? existing.imageSrc,
       pictureViewport: this.pictureViewport ?? existing.pictureViewport,
+      tabViewport: this.tabViewport ?? existing.tabViewport,
       wrap: this.wrap,
       code: this.code ?? existing.code,
       editorInputs: this.editorInputs ?? existing.editorInputs,
+      mdScrollY: this.mdScrollY ?? existing.mdScrollY ?? 0,
+      pictureScrollX: this.pictureScrollX ?? existing.pictureScrollX ?? 0,
+      pictureScrollY: this.pictureScrollY ?? existing.pictureScrollY ?? 0,
       dirty: this.dirty,
       lastAccess: Date.now(),
       ...patch,
@@ -496,6 +508,9 @@ export default class FileEditor extends View {
       viewMode: updated.viewMode,
       imageZoom: updated.imageZoom,
       wrap: updated.wrap,
+      mdScrollY: updated.mdScrollY,
+      pictureScrollX: updated.pictureScrollX,
+      pictureScrollY: updated.pictureScrollY,
     });
     const evicted = pruneFileTabStates(fileTabStates, MAX_CACHED_FILE_STATES, this.fileKey);
     for (const { entry } of evicted) {
@@ -1088,9 +1103,24 @@ export default class FileEditor extends View {
     const bounds = event.bounds;
     if (bounds) {
       this.pictureViewport = { width: Math.round(bounds.width), height: Math.round(bounds.height) };
+      this.tabViewport = this.pictureViewport;
     }
     const modifiers = event.modifiers || {};
-    if (!modifiers.platform && !modifiers.control) return;
+    if (!modifiers.platform && !modifiers.control) {
+      if (this.imageZoom > 1) {
+        const dx = event.delta?.x || 0;
+        const dy = event.delta?.y || 0;
+        const nextX = Math.max(0, (this.pictureScrollX || 0) - dx);
+        const nextY = Math.max(0, (this.pictureScrollY || 0) - dy);
+        if (nextX !== this.pictureScrollX || nextY !== this.pictureScrollY) {
+          this.pictureScrollX = nextX;
+          this.pictureScrollY = nextY;
+          this.updateCachedTabState();
+          cx.notify();
+        }
+      }
+      return;
+    }
     const delta = event.delta?.y || event.delta?.x || 0;
     if (delta === 0) return;
     this.zoomPicture(delta < 0 ? 1 : -1, cx);
@@ -1098,24 +1128,26 @@ export default class FileEditor extends View {
   }
 
   /**
-   * Remembers the tab's bounds as the picture viewport, so the pixel-based fit
-   * math has the real pane size. Called from pointer events on the tab root,
-   * before a click reaches the zoom controls.
+   * Remembers the tab's bounds as the viewport, so the pixel-based fit and scroll math
+   * have the real pane size. Called from pointer events on the tab root.
    *
    * @param {{ width: number, height: number } | undefined} bounds
    * @param {import("gpui-kit").Context} cx
    */
   rememberViewport(bounds, cx) {
-    if (!bounds || !this.showsPicturePreview()) return;
+    if (!bounds) return;
     const width = Math.round(bounds.width);
     const height = Math.max(1, Math.round(bounds.height - HEADER_HEIGHT));
-    const previous = this.pictureViewport;
+    const previous = this.tabViewport;
     if (previous && previous.width === width && previous.height === height) return;
-    this.pictureViewport = { width, height };
-    this.updateCachedTabState({ pictureViewport: this.pictureViewport });
-    // The percentage fallback fits by width; the measured path also fits by
-    // height and centers the picture. Repaint once the real size is known.
-    cx.notify();
+    this.tabViewport = { width, height };
+    if (this.showsPicturePreview()) {
+      this.pictureViewport = { width, height };
+    }
+    this.updateCachedTabState({ tabViewport: this.tabViewport, pictureViewport: this.pictureViewport });
+    if (this.showsPicturePreview()) {
+      cx.notify();
+    }
   }
 
   /**
@@ -1763,6 +1795,8 @@ export default class FileEditor extends View {
         .when(zoom > 1, (e) => e.items_start())
         .child(
           v_flex()
+            .relative()
+            .when(zoom > 1, (e) => e.left(-this.pictureScrollX).top(-this.pictureScrollY))
             .flex_none()
             .p(PICTURE_PADDING)
             .when(whiteCanvas, (e) => e.bg("#ffffff").rounded(8).border(1).border_color(t.border))
@@ -1788,16 +1822,31 @@ export default class FileEditor extends View {
   renderMarkdownView(t) {
     const codeFont = settings()?.font_family ?? null;
     const mdId = fileElementId("file-editor-markdown", this.fileKey);
+    const viewportHeight = this.tabViewport?.height || 600;
+    const estContentHeight = Math.max(viewportHeight, (this.lineCount || 100) * 32);
+    const maxScroll = Math.max(0, estContentHeight - viewportHeight);
+    this.mdScrollY = Math.max(0, Math.min(maxScroll, this.mdScrollY || 0));
+
     return div()
       .relative()
       .size_full()
       .flex_1()
       .min_h(0)
+      .overflow_hidden()
+      .on_scroll_wheel((event, cx) => {
+        const delta = event.delta?.y || 0;
+        const next = Math.max(0, Math.min(maxScroll, (this.mdScrollY || 0) - delta));
+        if (next !== this.mdScrollY) {
+          this.mdScrollY = next;
+          this.updateCachedTabState();
+          cx.notify();
+        }
+      })
       .child(
         v_flex()
-          .id(mdId)
-          .size_full()
-          .overflow_y_scroll()
+          .relative()
+          .top(-this.mdScrollY)
+          .w_full()
           .bg(t.background)
           .px(32)
           .py(24)
@@ -1813,7 +1862,21 @@ export default class FileEditor extends View {
               )
           )
       )
-      .child(Scrollbar.vertical(mdId).absolute().inset_0());
+      .when(maxScroll > 0, (e) => {
+        const thumbH = Math.max(28, Math.round((viewportHeight / estContentHeight) * viewportHeight));
+        const thumbTop = Math.round((this.mdScrollY / maxScroll) * (viewportHeight - thumbH));
+        return e.child(
+          div()
+            .absolute()
+            .right(3)
+            .top(thumbTop)
+            .w(4)
+            .h(thumbH)
+            .rounded(2)
+            .bg(t.dim)
+            .opacity(0.6)
+        );
+      });
   }
 
   /**
