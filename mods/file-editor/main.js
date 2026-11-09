@@ -13,7 +13,7 @@
  */
 
 import { View, div, svg, image } from "gpui-kit";
-import { v_flex, h_flex, Editor, EditorState, Scrollbar } from "gpui-base";
+import { v_flex, h_flex, Editor, EditorState, Input, InputState, Scrollbar } from "gpui-base";
 import { readFile as readBinaryFile } from "fs/promises";
 import {
   spaces,
@@ -67,6 +67,13 @@ import {
   parseTabFileName,
   resolveActiveOpenedFile,
   FOLDER_ICON_PATH,
+  validateEntryName,
+  resolveRenamedName,
+  getRenamedPath,
+  remapRenamedFolderSet,
+  remapRenamedFolderEntries,
+  removeDeletedFolderSet,
+  removeDeletedFolderEntries,
   toFileKey,
   fileElementId,
   pruneFileTabStates,
@@ -218,6 +225,104 @@ async function writeRemoteTextFile(fullPath, text, on, expected) {
   }
 }
 
+/**
+ * Renames a file or directory on local or remote machine.
+ *
+ * @param {string | null} root - Workspace root.
+ * @param {string} oldRelPath - Current relative path.
+ * @param {string} newRelPath - New relative path.
+ * @param {string | null} on - Remote machine target if applicable.
+ * @returns {Promise<void>}
+ */
+async function renamePath(root, oldRelPath, newRelPath, on) {
+  const oldFull = root ? `${root}/${oldRelPath}` : oldRelPath;
+  const newFull = root ? `${root}/${newRelPath}` : newRelPath;
+  const isWindows = !on && window()?.platform === "windows";
+
+  if (isWindows) {
+    const r = await exec(
+      "powershell",
+      [
+        "-NoProfile",
+        "-Command",
+        "Move-Item -LiteralPath $args[0] -Destination $args[1] -ErrorAction Stop",
+        oldFull,
+        newFull,
+      ],
+      { on }
+    );
+    if (r.code !== 0) throw new Error(r.stderr?.trim() || `Rename failed with code ${r.code}`);
+    return;
+  }
+
+  const script = 'mv "$1" "$2"';
+  let r;
+  try {
+    r = await exec("sh", ["-c", script, "rename", oldFull, newFull], { on });
+  } catch (e) {
+    if (on && String(e).includes("cannot start sh: program not found")) {
+      const psRes = await exec(
+        "powershell",
+        [
+          "-NoProfile",
+          "-Command",
+          "Move-Item -LiteralPath $args[0] -Destination $args[1] -ErrorAction Stop",
+          oldFull,
+          newFull,
+        ],
+        { on }
+      );
+      if (psRes.code !== 0) throw new Error(psRes.stderr?.trim() || `Rename failed`);
+      return;
+    }
+    throw e;
+  }
+  if (r.code !== 0) throw new Error(r.stderr?.trim() || `Rename failed with code ${r.code}`);
+}
+
+/**
+ * Deletes a file or directory on local or remote machine.
+ *
+ * @param {string | null} root - Workspace root.
+ * @param {string} relPath - Relative path to delete.
+ * @param {boolean} isDir - Whether target is a directory.
+ * @param {string | null} on - Remote machine target if applicable.
+ * @returns {Promise<void>}
+ */
+async function deletePath(root, relPath, isDir, on) {
+  if (!relPath || relPath === "." || relPath === "/") {
+    throw new Error("Cannot delete root directory");
+  }
+  const full = root ? `${root}/${relPath}` : relPath;
+  const isWindows = !on && window()?.platform === "windows";
+
+  if (isWindows) {
+    const cmd = isDir
+      ? "Remove-Item -LiteralPath $args[0] -Recurse -Force -ErrorAction Stop"
+      : "Remove-Item -LiteralPath $args[0] -Force -ErrorAction Stop";
+    const r = await exec("powershell", ["-NoProfile", "-Command", cmd, full], { on });
+    if (r.code !== 0) throw new Error(r.stderr?.trim() || `Delete failed with code ${r.code}`);
+    return;
+  }
+
+  const script = isDir ? 'rm -rf "$1"' : 'rm -f "$1"';
+  let r;
+  try {
+    r = await exec("sh", ["-c", script, "delete", full], { on });
+  } catch (e) {
+    if (on && String(e).includes("cannot start sh: program not found")) {
+      const cmd = isDir
+        ? "Remove-Item -LiteralPath $args[0] -Recurse -Force -ErrorAction Stop"
+        : "Remove-Item -LiteralPath $args[0] -Force -ErrorAction Stop";
+      const psRes = await exec("powershell", ["-NoProfile", "-Command", cmd, full], { on });
+      if (psRes.code !== 0) throw new Error(psRes.stderr?.trim() || `Delete failed`);
+      return;
+    }
+    throw e;
+  }
+  if (r.code !== 0) throw new Error(r.stderr?.trim() || `Delete failed with code ${r.code}`);
+}
+
 export default class FileEditor extends View {
   /**
    * Initializes the view based on whether props().file is provided.
@@ -267,6 +372,8 @@ export default class FileEditor extends View {
     this.dirty = false;
     this.lastSavedText = null;
 
+    this.closeModals();
+    this.contextMenu = null;
     const active = shared("file-editor.activeFile");
     if (active && active.file === this.file && active.root === this.root) {
       setShared("file-editor.activeFile", null);
@@ -464,6 +571,22 @@ export default class FileEditor extends View {
     if (this.closed) return;
 
     let changed = false;
+
+    // React to file renames performed from the file browser
+    const renamed = shared("file-editor.renamedFile");
+    if (
+      renamed &&
+      renamed.timestamp &&
+      renamed.timestamp !== this.lastRenamedTimestamp &&
+      renamed.root === this.root &&
+      renamed.oldPath === this.file
+    ) {
+      this.lastRenamedTimestamp = renamed.timestamp;
+      this.file = renamed.newPath;
+      this.fileKey = toFileKey(this.root, this.file);
+      this.loadFile(cx);
+      changed = true;
+    }
 
     // Resolve tabId if not discovered at mount time
     if (!this.tabId) {
@@ -1394,26 +1517,10 @@ export default class FileEditor extends View {
               )
           : this.isImage
             ? this.renderImageView(t)
-            : hasPreview
-              ? div()
-                  .size_full()
-                  .flex_1()
-                  .min_h(0)
-                  .relative()
-                  .child(
-                    div()
-                      .size_full()
-                      .min_h(0)
-                      .when(isCodeView, (e) => e.hidden())
-                      .child(isMarkdown ? this.renderMarkdownView(t) : this.renderSvgView(t))
-                  )
-                  .child(
-                    div()
-                      .size_full()
-                      .min_h(0)
-                      .when(!isCodeView, (e) => e.hidden())
-                      .child(this.renderCodeView(t))
-                  )
+            : !isCodeView
+              ? isMarkdown
+                ? this.renderMarkdownView(t)
+                : this.renderSvgView(t)
               : this.renderCodeView(t)
       );
   }
@@ -1755,6 +1862,11 @@ export default class FileEditor extends View {
     this.selectedFile = null;
     this.hoveredPath = null;
     this.contextMenu = null;
+    this.renameDialog = null;
+    this.deleteDialog = null;
+    this.renameInput = null;
+    this.actionPending = false;
+    this.filesFocusHandle = cx.focus_handle();
     this.filesOrigin = null;
     this.filesBounds = null;
     this.loading = false;
@@ -2022,6 +2134,7 @@ export default class FileEditor extends View {
       this.selectedFile = saved?.selectedFile ?? null;
       this.hoveredPath = null;
       this.contextMenu = null;
+      this.closeModals();
       this.watched = null;
       this.watchToken = null;
       this.error = null;
@@ -2209,7 +2322,7 @@ export default class FileEditor extends View {
    */
   openRowContextMenu(entry, path, event, cx) {
     const menuWidth = 180;
-    const menuHeight = entry.dir ? 34 : 60;
+    const menuHeight = entry.dir ? 88 : 114;
     const origin = this.filesOrigin;
     const bounds = this.filesBounds;
     const paneX = origin?.x ?? bounds?.x ?? 0;
@@ -2227,12 +2340,551 @@ export default class FileEditor extends View {
   /**
    * Closes the file tree right-click menu.
    *
-   * @param {import("gpui-kit").ViewContext} cx
+   * @param {import("gpui-kit").ViewContext} [cx]
    */
   closeRowContextMenu(cx) {
     if (!this.contextMenu) return;
     this.contextMenu = null;
+    if (cx) cx.notify();
+  }
+
+  /**
+   * Opens the rename modal dialog for a given path.
+   *
+   * @param {string} path
+   * @param {boolean} isDir
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  openRenameDialog(path, isDir, cx) {
+    this.closeRowContextMenu();
+    const { base, dir } = splitPathInfo(path);
+    this.deleteDialog = null;
+    this.renameDialog = {
+      path,
+      isDir,
+      oldName: base,
+      dir,
+      error: null,
+    };
+    if (this.renameInput) {
+      try {
+        this.renameInput.release();
+      } catch {}
+    }
+    this.renameInput = InputState.new({ placeholder: "New name", value: base });
+    this.renameInput.on("submit", (_e, cx) => this.submitRename(cx));
+    this.renameInput.on("change", () => cx.notify());
+    this.renameInput.focus();
+    cx.timer?.after?.(50, () => this.renameInput?.focus());
     cx.notify();
+  }
+
+  /**
+   * Submits the rename operation.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  submitRename(cx) {
+    const dialog = this.renameDialog;
+    if (!dialog || this.actionPending) return;
+
+    const rawNewName = this.renameInput ? this.renameInput.value() : "";
+    const newName = rawNewName.trim();
+    const isDir = Boolean(dialog.isDir);
+
+    const validation = validateEntryName(newName, dialog.oldName, isDir);
+    if (!validation.valid) {
+      dialog.error = validation.error;
+      cx.notify();
+      return;
+    }
+
+    const resolvedName = resolveRenamedName(newName, dialog.oldName, isDir);
+    const parentFolder = dialog.dir || "";
+    const siblings = this.entries.get(parentFolder) ?? [];
+    if (siblings.some((e) => e.name === resolvedName)) {
+      dialog.error = `An item named "${resolvedName}" already exists`;
+      cx.notify();
+      return;
+    }
+
+    const newPath = getRenamedPath(dialog.path, newName, isDir);
+    const root = this.root;
+    const on = this.on;
+    const oldPath = dialog.path;
+
+    this.actionPending = true;
+    dialog.error = null;
+    cx.notify();
+
+    cx.spawn(async (cx) => {
+      try {
+        await renamePath(root, oldPath, newPath, on);
+
+        setShared("file-editor.renamedFile", {
+          root,
+          oldPath,
+          newPath,
+          timestamp: Date.now(),
+        });
+
+        if (this.selectedFile === oldPath) {
+          this.selectedFile = newPath;
+          setShared("file-editor.activeFile", { root, file: newPath });
+        }
+
+        const openTabs = shared("file-editor.openTabs");
+        if (openTabs && typeof openTabs === "object") {
+          const oldKey = root ? `${root}/${oldPath}` : oldPath;
+          const newKey = root ? `${root}/${newPath}` : newPath;
+          if (openTabs[oldKey]) {
+            const entry = openTabs[oldKey];
+            delete openTabs[oldKey];
+            openTabs[newKey] = { ...entry, file: newPath, tabName: resolvedName };
+            setShared("file-editor.openTabs", openTabs);
+            if (entry.tabId) {
+              try {
+                run("tab.rename", { id: entry.tabId, name: resolvedName });
+              } catch {}
+            }
+          }
+        }
+
+        if (isDir) {
+          this.folders = remapRenamedFolderSet(this.folders, oldPath, newPath);
+          this.entries = remapRenamedFolderEntries(this.entries, oldPath, newPath);
+        }
+
+        remapRenamedFileStates(fileTabStates, oldPath, newPath, root);
+
+        if (this.context) {
+          await this.loadFolder(parentFolder, this.context);
+        }
+
+        this.closeModals(cx);
+        notify({
+          title: isDir ? "Folder renamed" : "File renamed",
+          body: `${dialog.oldName} → ${resolvedName}`,
+          level: "success",
+          timeout: 2000,
+        });
+      } catch (err) {
+        if (this.renameDialog) {
+          this.renameDialog.error = err?.message || String(err) || "Failed to rename";
+        }
+      } finally {
+        this.actionPending = false;
+        cx.notify();
+      }
+    });
+  }
+
+  /**
+   * Opens the delete confirmation dialog for a given path.
+   *
+   * @param {string} path
+   * @param {boolean} isDir
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  openDeleteDialog(path, isDir, cx) {
+    this.closeRowContextMenu();
+    const { base, dir } = splitPathInfo(path);
+    this.renameDialog = null;
+    this.deleteDialog = {
+      path,
+      isDir,
+      name: base,
+      dir,
+      error: null,
+    };
+    cx.notify();
+  }
+
+  /**
+   * Submits the delete operation.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  submitDelete(cx) {
+    const dialog = this.deleteDialog;
+    if (!dialog || this.actionPending) return;
+
+    const root = this.root;
+    const on = this.on;
+    const isDir = dialog.isDir;
+    const path = dialog.path;
+    const parentFolder = dialog.dir || "";
+
+    this.actionPending = true;
+    dialog.error = null;
+    cx.notify();
+
+    cx.spawn(async (cx) => {
+      try {
+        await deletePath(root, path, isDir, on);
+
+        if (this.selectedFile === path || (isDir && this.selectedFile?.startsWith(path + "/"))) {
+          this.selectedFile = null;
+        }
+
+        const openTabs = shared("file-editor.openTabs");
+        if (openTabs && typeof openTabs === "object") {
+          const oldKey = root ? `${root}/${path}` : path;
+          if (openTabs[oldKey]) {
+            const entry = openTabs[oldKey];
+            delete openTabs[oldKey];
+            setShared("file-editor.openTabs", openTabs);
+            if (entry.tabId) {
+              try {
+                run("tab.close", { id: entry.tabId });
+              } catch {}
+            }
+          }
+        }
+
+        if (isDir) {
+          this.folders = removeDeletedFolderSet(this.folders, path);
+          this.entries = removeDeletedFolderEntries(this.entries, path);
+        }
+
+        const removedEntries = removeDeletedFileStates(fileTabStates, path, root);
+        for (const { entry } of removedEntries) {
+          entry.code?.release();
+        }
+
+        if (this.context) {
+          await this.loadFolder(parentFolder, this.context);
+        }
+
+        this.closeModals(cx);
+        notify({
+          title: isDir ? "Folder deleted" : "File deleted",
+          body: dialog.name,
+          level: "info",
+          timeout: 2000,
+        });
+      } catch (err) {
+        if (this.deleteDialog) {
+          this.deleteDialog.error = err?.message || String(err) || "Failed to delete";
+        }
+      } finally {
+        this.actionPending = false;
+        cx.notify();
+      }
+    });
+  }
+
+  /**
+   * Closes active modal dialogs (rename/delete) and releases input states.
+   *
+   * @param {import("gpui-kit").ViewContext} [cx]
+   */
+  closeModals(cx) {
+    if (this.renameInput) {
+      try {
+        this.renameInput.release();
+      } catch {}
+      this.renameInput = null;
+    }
+    this.renameDialog = null;
+    this.deleteDialog = null;
+    if (cx) cx.notify();
+  }
+
+  /**
+   * Keyboard handler for Files pane mode.
+   *
+   * @param {import("gpui-kit").KeyboardEvent} event
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  handleFilesKeyDown(event, cx) {
+    if (this.renameDialog) {
+      if (event.key === "escape") {
+        cx.stop_propagation();
+        this.closeModals(cx);
+      }
+      return;
+    }
+    if (this.deleteDialog) {
+      if (event.key === "escape") {
+        cx.stop_propagation();
+        this.closeModals(cx);
+      } else if (event.key === "enter") {
+        cx.stop_propagation();
+        this.submitDelete(cx);
+      }
+      return;
+    }
+    if (this.contextMenu) {
+      if (event.key === "escape") {
+        cx.stop_propagation();
+        this.closeRowContextMenu(cx);
+      }
+    }
+  }
+
+  /**
+   * Renders the Rename modal dialog.
+   *
+   * @param {Record<string, string>} t
+   * @returns {import("gpui-kit").Element | null}
+   */
+  renderRenameDialog(t) {
+    const dialog = this.renameDialog;
+    if (!dialog) return null;
+
+    const title = dialog.isDir ? "Rename Folder" : "Rename File";
+    const currentVal = this.renameInput ? this.renameInput.value() : "";
+    const previewName = currentVal.trim()
+      ? resolveRenamedName(currentVal.trim(), dialog.oldName, dialog.isDir)
+      : dialog.oldName;
+    const showPreview = previewName && previewName !== currentVal.trim();
+
+    return div()
+      .id("files-rename-backdrop")
+      .absolute()
+      .inset_0()
+      .bg(isLightColor(t.background) ? "#00000040" : "#0000008c")
+      .items_center()
+      .justify_center()
+      .p(12)
+      .on_key_down((e, cx) => {
+        if (e.key === "escape") {
+          cx.stop_propagation();
+          this.closeModals(cx);
+        }
+      })
+      .on_mouse_down("left", (_e, cx) => this.closeModals(cx))
+      .on_mouse_down("right", (_e, cx) => this.closeModals(cx))
+      .child(
+        v_flex()
+          .id("files-rename-dialog")
+          .w_full()
+          .max_w(280)
+          .p(14)
+          .gap(10)
+          .rounded(10)
+          .bg(t.popover)
+          .border_1()
+          .border_color(t.border)
+          .shadow_lg()
+          .text_size(12.5)
+          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+          .on_mouse_down("right", (_e, cx) => cx.stop_propagation())
+          .child(
+            h_flex()
+              .items_center()
+              .child(div().flex_1().font_semibold().text_size(13).text_color(t.foreground).child(title))
+              .child(
+                div()
+                  .text_size(11)
+                  .text_color(t.dim)
+                  .cursor_pointer()
+                  .hover((s) => s.text_color(t.foreground))
+                  .on_click((_e, cx) => this.closeModals(cx))
+                  .child("Esc")
+              )
+          )
+          .child(
+            div()
+              .truncate()
+              .text_size(11.5)
+              .text_color(t.muted)
+              .child(`Current: ${dialog.oldName}`)
+          )
+          .child(
+            Input.new(this.renameInput)
+              .h(30)
+              .px(8)
+              .rounded(6)
+              .border_1()
+              .border_color(dialog.error ? t.blocked || "#e05252" : t.accent || t.input)
+              .bg(t.background)
+              .text_size(12)
+              .text_color(t.foreground)
+          )
+          .when(Boolean(showPreview), (el) =>
+            el.child(
+              div()
+                .truncate()
+                .text_size(11)
+                .text_color(t.dim)
+                .child(`Will rename to: ${previewName}`)
+            )
+          )
+          .when(Boolean(dialog.error), (el) =>
+            el.child(
+              div()
+                .text_size(11)
+                .text_color(t.blocked || "#e05252")
+                .child(dialog.error)
+            )
+          )
+          .child(
+            h_flex()
+              .justify_end()
+              .gap(8)
+              .pt(4)
+              .child(
+                h_flex()
+                  .id("files-rename-cancel")
+                  .h(26)
+                  .px(10)
+                  .items_center()
+                  .rounded(6)
+                  .border_1()
+                  .border_color(t.border)
+                  .bg(t.raised)
+                  .text_color(t.foreground)
+                  .cursor_pointer()
+                  .hover((s) => s.bg(t.hover))
+                  .on_click((_e, cx) => this.closeModals(cx))
+                  .child("Cancel")
+              )
+              .child(
+                h_flex()
+                  .id("files-rename-confirm")
+                  .h(26)
+                  .px(10)
+                  .items_center()
+                  .rounded(6)
+                  .border_1()
+                  .border_color(t.solid || t.accent)
+                  .bg(t.solid || t.accent)
+                  .text_color(t.solid_foreground || "#ffffff")
+                  .cursor_pointer()
+                  .hover((s) => s.opacity(0.88))
+                  .on_click((_e, cx) => this.submitRename(cx))
+                  .child(this.actionPending ? "Renaming…" : "Rename")
+              )
+          )
+      );
+  }
+
+  /**
+   * Renders the Delete confirmation modal dialog.
+   *
+   * @param {Record<string, string>} t
+   * @returns {import("gpui-kit").Element | null}
+   */
+  renderDeleteDialog(t) {
+    const dialog = this.deleteDialog;
+    if (!dialog) return null;
+
+    const title = dialog.isDir ? "Delete Folder" : "Delete File";
+    const question = dialog.isDir
+      ? `Are you sure you want to delete "${dialog.name}" and all its contents?`
+      : `Are you sure you want to delete "${dialog.name}"?`;
+
+    return div()
+      .id("files-delete-backdrop")
+      .absolute()
+      .inset_0()
+      .bg(isLightColor(t.background) ? "#00000040" : "#0000008c")
+      .items_center()
+      .justify_center()
+      .p(12)
+      .on_key_down((e, cx) => {
+        if (e.key === "escape") {
+          cx.stop_propagation();
+          this.closeModals(cx);
+        } else if (e.key === "enter") {
+          cx.stop_propagation();
+          this.submitDelete(cx);
+        }
+      })
+      .on_mouse_down("left", (_e, cx) => this.closeModals(cx))
+      .on_mouse_down("right", (_e, cx) => this.closeModals(cx))
+      .child(
+        v_flex()
+          .id("files-delete-dialog")
+          .w_full()
+          .max_w(280)
+          .p(14)
+          .gap(10)
+          .rounded(10)
+          .bg(t.popover)
+          .border_1()
+          .border_color(t.border)
+          .shadow_lg()
+          .text_size(12.5)
+          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+          .on_mouse_down("right", (_e, cx) => cx.stop_propagation())
+          .child(
+            h_flex()
+              .items_center()
+              .child(div().flex_1().font_semibold().text_size(13).text_color(t.foreground).child(title))
+              .child(
+                div()
+                  .text_size(11)
+                  .text_color(t.dim)
+                  .cursor_pointer()
+                  .hover((s) => s.text_color(t.foreground))
+                  .on_click((_e, cx) => this.closeModals(cx))
+                  .child("Esc")
+              )
+          )
+          .child(
+            div()
+              .text_size(12)
+              .text_color(t.muted)
+              .child(question)
+          )
+          .when(dialog.isDir, (el) =>
+            el.child(
+              div()
+                .text_size(11)
+                .text_color(t.blocked || "#e05252")
+                .child("This action cannot be undone.")
+            )
+          )
+          .when(Boolean(dialog.error), (el) =>
+            el.child(
+              div()
+                .text_size(11)
+                .text_color(t.blocked || "#e05252")
+                .child(dialog.error)
+            )
+          )
+          .child(
+            h_flex()
+              .justify_end()
+              .gap(8)
+              .pt(4)
+              .child(
+                h_flex()
+                  .id("files-delete-cancel")
+                  .h(26)
+                  .px(10)
+                  .items_center()
+                  .rounded(6)
+                  .border_1()
+                  .border_color(t.border)
+                  .bg(t.raised)
+                  .text_color(t.foreground)
+                  .cursor_pointer()
+                  .hover((s) => s.bg(t.hover))
+                  .on_click((_e, cx) => this.closeModals(cx))
+                  .child("Cancel")
+              )
+              .child(
+                h_flex()
+                  .id("files-delete-confirm")
+                  .h(26)
+                  .px(10)
+                  .items_center()
+                  .rounded(6)
+                  .border_1()
+                  .border_color(t.blocked || "#e05252")
+                  .bg(t.blocked || "#e05252")
+                  .text_color("#ffffff")
+                  .cursor_pointer()
+                  .hover((s) => s.opacity(0.88))
+                  .on_click((_e, cx) => this.submitDelete(cx))
+                  .child(this.actionPending ? "Deleting…" : "Delete")
+              )
+          )
+      );
   }
 
   /**
@@ -2245,20 +2897,35 @@ export default class FileEditor extends View {
     const menu = this.contextMenu;
     if (!menu) return null;
 
-    const item = (id, label, action) =>
+    const item = (id, label, iconPath, action, options = {}) =>
       h_flex()
         .id(id)
         .h(26)
         .px(8)
+        .gap(8)
+        .items_center()
         .rounded(5)
         .cursor_pointer()
-        .hover((s) => s.bg(t.hover))
+        .hover((s) => s.bg(options.danger ? (t.blocked ? `${t.blocked}22` : t.hover) : t.hover))
         .on_click((_e, cx) => {
           this.contextMenu = null;
           action(cx);
           cx.notify();
         })
-        .child(div().truncate().child(label));
+        .when(Boolean(iconPath), (el) =>
+          el.child(
+            svg(iconPath)
+              .size(13)
+              .flex_none()
+              .text_color(options.danger ? (t.blocked || t.muted) : t.muted)
+          )
+        )
+        .child(
+          div()
+            .truncate()
+            .when(Boolean(options.danger), (el) => el.text_color(t.blocked || t.foreground))
+            .child(label)
+        );
 
     return div()
       .id("files-context-backdrop")
@@ -2283,9 +2950,15 @@ export default class FileEditor extends View {
           .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
           .on_mouse_down("right", (_e, cx) => cx.stop_propagation())
           .when(!menu.dir, (el) =>
-            el.child(item("files-menu-open", "Open file", (cx) => this.openFileTab(menu.path, cx)))
+            el.child(item("files-menu-open", "Open file", "mods/file-editor/file.svg", (cx) => this.openFileTab(menu.path, cx)))
           )
-          .child(item("files-menu-copy", "Copy path", (cx) => this.copyPathToClipboard(menu.path, menu.dir, cx)))
+          .child(item("files-menu-copy", "Copy path", "mods/file-editor/copy.svg", (cx) => this.copyPathToClipboard(menu.path, menu.dir, cx)))
+          .child(item("files-menu-rename", "Rename", "mods/file-editor/rename.svg", (cx) => this.openRenameDialog(menu.path, menu.dir, cx)))
+          .child(
+            item("files-menu-delete", "Delete", "mods/file-editor/trash.svg", (cx) => this.openDeleteDialog(menu.path, menu.dir, cx), {
+              danger: true,
+            })
+          )
       );
   }
 
@@ -2400,6 +3073,8 @@ export default class FileEditor extends View {
       .border_color(t.border)
       .text_color(t.foreground)
       .text_size(13)
+      .track_focus(this.filesFocusHandle)
+      .on_key_down((event, cx) => this.handleFilesKeyDown(event, cx))
       .on_mouse_move((e, _cx) => {
         if (e.bounds) this.filesBounds = e.bounds;
         if (e.position && e.local_position) {
@@ -2448,7 +3123,9 @@ export default class FileEditor extends View {
             el.child(div().p(8).text_size(11).text_color(t.dim).child("File list limited to 500 entries per folder and 5,000 total"))
           )
       )
-      .when(Boolean(this.contextMenu), (el) => el.child(this.renderRowContextMenu(t)));
+      .when(Boolean(this.contextMenu), (el) => el.child(this.renderRowContextMenu(t)))
+      .when(Boolean(this.renameDialog), (el) => el.child(this.renderRenameDialog(t)))
+      .when(Boolean(this.deleteDialog), (el) => el.child(this.renderDeleteDialog(t)));
   }
 
   /**

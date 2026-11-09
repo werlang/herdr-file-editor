@@ -44,6 +44,13 @@ import {
   FILE_ICON_DEFAULT,
   FILE_ICON_BY_EXT,
   FILE_ICON_BY_NAME,
+  resolveRenamedName,
+  validateEntryName,
+  getRenamedPath,
+  remapRenamedFolderSet,
+  remapRenamedFolderEntries,
+  removeDeletedFolderSet,
+  removeDeletedFolderEntries,
   toFileKey,
   fileElementId,
   pruneFileTabStates,
@@ -1244,6 +1251,79 @@ test("matchCandidateFile - verifies candidate against root entries, marks, and p
   assert.equal(matchCandidateFile("Terminal", root, entries, marks), null);
   assert.equal(matchCandidateFile("Git Graph", root, entries, marks), null);
 });
+
+test("validateEntryName - rejects empty, invalid characters, unchanged, and accepts valid names", () => {
+  // Empty or invalid input
+  assert.deepEqual(validateEntryName(""), { valid: false, error: "Name cannot be empty" });
+  assert.deepEqual(validateEntryName("   "), { valid: false, error: "Name cannot be empty" });
+  assert.deepEqual(validateEntryName(null), { valid: false, error: "Name cannot be empty" });
+  assert.deepEqual(validateEntryName(undefined), { valid: false, error: "Name cannot be empty" });
+
+  // Special relative directory names
+  assert.deepEqual(validateEntryName("."), { valid: false, error: "Invalid name" });
+  assert.deepEqual(validateEntryName(".."), { valid: false, error: "Invalid name" });
+
+  // Invalid characters
+  assert.deepEqual(validateEntryName("foo/bar"), { valid: false, error: "Name contains invalid characters" });
+  assert.deepEqual(validateEntryName("foo\\bar"), { valid: false, error: "Name contains invalid characters" });
+  assert.deepEqual(validateEntryName("file:name"), { valid: false, error: "Name contains invalid characters" });
+  assert.deepEqual(validateEntryName("file*name"), { valid: false, error: "Name contains invalid characters" });
+  assert.deepEqual(validateEntryName("file?name"), { valid: false, error: "Name contains invalid characters" });
+  assert.deepEqual(validateEntryName('file"name'), { valid: false, error: "Name contains invalid characters" });
+  assert.deepEqual(validateEntryName("file<name"), { valid: false, error: "Name contains invalid characters" });
+  assert.deepEqual(validateEntryName("file>name"), { valid: false, error: "Name contains invalid characters" });
+  assert.deepEqual(validateEntryName("file|name"), { valid: false, error: "Name contains invalid characters" });
+
+  // Unchanged name
+  assert.deepEqual(validateEntryName("file.txt", "file.txt"), { valid: false, error: "Name is unchanged" });
+  assert.deepEqual(validateEntryName("  file.txt  ", "file.txt"), { valid: false, error: "Name is unchanged" });
+
+  // Valid names
+  assert.deepEqual(validateEntryName("new-file.txt", "old-file.txt"), { valid: true, error: null });
+  assert.deepEqual(validateEntryName(".gitignore", "old-file.txt"), { valid: true, error: null });
+  assert.deepEqual(validateEntryName("MyComponent.tsx"), { valid: true, error: null });
+  assert.deepEqual(validateEntryName("file_with-dashes.json"), { valid: true, error: null });
+});
+
+test("getRenamedPath - calculates new relative path preserving directory structure", () => {
+  assert.equal(getRenamedPath("README.md", "DOCS.md"), "DOCS.md");
+  assert.equal(getRenamedPath("src/components/Header.tsx", "Navbar.tsx"), "src/components/Navbar.tsx");
+  assert.equal(getRenamedPath("deep/nested/dir/file.js", "renamed.js"), "deep/nested/dir/renamed.js");
+  assert.equal(getRenamedPath("folder", "new-folder"), "new-folder");
+  assert.equal(getRenamedPath("parent/child", "renamed-child"), "parent/renamed-child");
+});
+
+test("remapRenamedFolderSet & remapRenamedFolderEntries - updates paths on rename", () => {
+  const folders = new Set(["src", "src/components", "src/components/sub", "docs"]);
+  const remapped = remapRenamedFolderSet(folders, "src/components", "src/views");
+  assert.deepEqual([...remapped], ["src", "src/views", "src/views/sub", "docs"]);
+
+  const entries = new Map([
+    ["src", [{ name: "components", dir: true }]],
+    ["src/components", [{ name: "Header.tsx", dir: false }]],
+    ["src/components/sub", [{ name: "sub.ts", dir: false }]],
+    ["docs", [{ name: "README.md", dir: false }]],
+  ]);
+  const remappedEntries = remapRenamedFolderEntries(entries, "src/components", "src/views");
+  assert.deepEqual([...remappedEntries.keys()], ["src", "src/views", "src/views/sub", "docs"]);
+  assert.deepEqual(remappedEntries.get("src/views"), [{ name: "Header.tsx", dir: false }]);
+});
+
+test("removeDeletedFolderSet & removeDeletedFolderEntries - cleans up deleted directory and descendants", () => {
+  const folders = new Set(["src", "src/components", "src/components/sub", "docs"]);
+  const cleaned = removeDeletedFolderSet(folders, "src/components");
+  assert.deepEqual([...cleaned], ["src", "docs"]);
+
+  const entries = new Map([
+    ["src", [{ name: "components", dir: true }]],
+    ["src/components", [{ name: "Header.tsx", dir: false }]],
+    ["src/components/sub", [{ name: "sub.ts", dir: false }]],
+    ["docs", [{ name: "README.md", dir: false }]],
+  ]);
+  const cleanedEntries = removeDeletedFolderEntries(entries, "src/components");
+  assert.deepEqual([...cleanedEntries.keys()], ["src", "docs"]);
+});
+
 test("toFileKey - canonicalizes root and file accurately", () => {
   assert.equal(toFileKey("/Users/foo/repo", "src/main.js"), "/Users/foo/repo/src/main.js");
   assert.equal(toFileKey("/Users/foo/repo/", "/src/main.js"), "/Users/foo/repo/src/main.js");
@@ -1341,6 +1421,38 @@ test("removeDeletedFileStates - removes deleted files and descendants", () => {
 
   removed.forEach(({ entry }) => entry.code?.release());
   assert.equal(releasedCount, 2);
+});
+
+test("resolveRenamedName - preserves original extension unless changed or explicitly stripped", () => {
+  // Preserves extension when user supplies name without extension
+  assert.equal(resolveRenamedName("app", "main.js"), "app.js");
+  assert.equal(resolveRenamedName("component", "Button.tsx"), "component.tsx");
+  assert.equal(resolveRenamedName("styles", "theme.module.css"), "styles.css");
+
+  // Allows explicit extension change
+  assert.equal(resolveRenamedName("main.ts", "main.js"), "main.ts");
+  assert.equal(resolveRenamedName("data.json", "data.yaml"), "data.json");
+
+  // Allows explicitly stripping extension with trailing dot
+  assert.equal(resolveRenamedName("executable.", "executable.sh"), "executable");
+  assert.equal(resolveRenamedName("LICENSE.", "LICENSE.txt"), "LICENSE");
+
+  // Leaves dotfiles alone
+  assert.equal(resolveRenamedName(".env.local", ".env"), ".env.local");
+  assert.equal(resolveRenamedName(".npmrc", ".gitignore"), ".npmrc");
+  assert.equal(resolveRenamedName("gitignore", ".gitignore"), "gitignore");
+
+  // Leaves folders alone (isDir = true)
+  assert.equal(resolveRenamedName("app", "src", true), "app");
+  assert.equal(resolveRenamedName("components.new", "components", true), "components.new");
+
+  // Files without extension
+  assert.equal(resolveRenamedName("Containerfile", "Dockerfile"), "Containerfile");
+  assert.equal(resolveRenamedName("Makefile.bak", "Makefile"), "Makefile.bak");
+
+  // Empty or whitespace inputs
+  assert.equal(resolveRenamedName("", "main.js"), "");
+  assert.equal(resolveRenamedName("   ", "main.js"), "");
 });
 
 test("resolveFileTab - claimedTabIds prevents matching tabs owned by other files", () => {

@@ -1724,6 +1724,171 @@ export function resolveActiveOpenedFile({
 
   return null;
 }
+
+/**
+ * Resolves the final renamed entry name, preserving the original file extension
+ * if the user provided a name without an extension.
+ *
+ * @param {string} newName - Proposed new name from user input.
+ * @param {string} oldName - Current entry name.
+ * @param {boolean} [isDir=false] - Whether the entry is a directory.
+ * @returns {string}
+ */
+export function resolveRenamedName(newName, oldName, isDir = false) {
+  const clean = String(newName || "").trim();
+  if (!clean || isDir || !oldName) return clean;
+
+  const safeOld = String(oldName).trim();
+  const oldInfo = splitPathInfo(safeOld);
+  // Dotfiles without secondary extension (e.g. .gitignore, .env): treat as complete name
+  const isDotfile = safeOld.startsWith(".") && !safeOld.slice(1).includes(".");
+  if (!oldInfo.ext || isDotfile) {
+    return clean;
+  }
+
+  // If user explicitly typed a trailing dot (e.g. "name."), user explicitly wanted no extension
+  if (clean.endsWith(".")) {
+    return clean.slice(0, -1);
+  }
+
+  // Check if clean already has an extension
+  const newInfo = splitPathInfo(clean);
+  if (newInfo.ext) {
+    return clean;
+  }
+
+  // Preserve the original extension
+  return `${clean}.${oldInfo.ext}`;
+}
+
+/**
+ * Validates a proposed filename or folder name.
+ *
+ * @param {string} newName - Proposed new name.
+ * @param {string} [currentName] - Current name to check for unchanged input.
+ * @param {boolean} [isDir=false] - Whether the entry is a directory.
+ * @returns {{ valid: boolean, error: string | null }}
+ */
+export function validateEntryName(newName, currentName, isDir = false) {
+  if (typeof newName !== "string") {
+    return { valid: false, error: "Name cannot be empty" };
+  }
+  const trimmed = newName.trim();
+  if (!trimmed) {
+    return { valid: false, error: "Name cannot be empty" };
+  }
+  if (trimmed === "." || trimmed === "..") {
+    return { valid: false, error: "Invalid name" };
+  }
+  if (/[/\\:*?"<>|\0]/.test(trimmed)) {
+    return { valid: false, error: "Name contains invalid characters" };
+  }
+  const resolved = resolveRenamedName(trimmed, currentName, isDir);
+  if (!resolved) {
+    return { valid: false, error: "Name cannot be empty" };
+  }
+  if (currentName && resolved === currentName.trim()) {
+    return { valid: false, error: "Name is unchanged" };
+  }
+  return { valid: true, error: null };
+}
+
+/**
+ * Computes the new relative path when renaming an existing relative path.
+ *
+ * @param {string} oldPath - Existing relative path.
+ * @param {string} newName - New base name.
+ * @param {boolean} [isDir=false] - Whether the entry is a directory.
+ * @returns {string}
+ */
+export function getRenamedPath(oldPath, newName, isDir = false) {
+  const { dir, base } = splitPathInfo(oldPath);
+  const resolvedName = resolveRenamedName(newName, base, isDir);
+  return dir ? `${dir}/${resolvedName}` : resolvedName;
+}
+
+/**
+ * Updates an expanded folders Set when a directory is renamed.
+ *
+ * @param {Set<string>} folders - Current expanded folder paths.
+ * @param {string} oldPath - Old directory path.
+ * @param {string} newPath - New directory path.
+ * @returns {Set<string>}
+ */
+export function remapRenamedFolderSet(folders, oldPath, newPath) {
+  const next = new Set();
+  const prefix = oldPath + "/";
+  for (const folder of folders) {
+    if (folder === oldPath) {
+      next.add(newPath);
+    } else if (folder.startsWith(prefix)) {
+      next.add(newPath + "/" + folder.slice(prefix.length));
+    } else {
+      next.add(folder);
+    }
+  }
+  return next;
+}
+
+/**
+ * Updates a directory entries Map when a directory is renamed.
+ *
+ * @param {Map<string, Array<{ name: string, dir: boolean }>>} entries
+ * @param {string} oldPath
+ * @param {string} newPath
+ * @returns {Map<string, Array<{ name: string, dir: boolean }>>}
+ */
+export function remapRenamedFolderEntries(entries, oldPath, newPath) {
+  const next = new Map();
+  const prefix = oldPath + "/";
+  for (const [key, val] of entries.entries()) {
+    if (key === oldPath) {
+      next.set(newPath, val);
+    } else if (key.startsWith(prefix)) {
+      next.set(newPath + "/" + key.slice(prefix.length), val);
+    } else {
+      next.set(key, val);
+    }
+  }
+  return next;
+}
+
+/**
+ * Removes a directory and all its descendants from an expanded folders Set.
+ *
+ * @param {Set<string>} folders
+ * @param {string} deletedPath
+ * @returns {Set<string>}
+ */
+export function removeDeletedFolderSet(folders, deletedPath) {
+  const next = new Set();
+  const prefix = deletedPath + "/";
+  for (const folder of folders) {
+    if (folder !== deletedPath && !folder.startsWith(prefix)) {
+      next.add(folder);
+    }
+  }
+  return next;
+}
+
+/**
+ * Removes a directory and all its descendants from a directory entries Map.
+ *
+ * @param {Map<string, Array<{ name: string, dir: boolean }>>} entries
+ * @param {string} deletedPath
+ * @returns {Map<string, Array<{ name: string, dir: boolean }>>}
+ */
+export function removeDeletedFolderEntries(entries, deletedPath) {
+  const next = new Map();
+  const prefix = deletedPath + "/";
+  for (const [key, val] of entries.entries()) {
+    if (key !== deletedPath && !key.startsWith(prefix)) {
+      next.set(key, val);
+    }
+  }
+  return next;
+}
+
 /**
  * Normalizes root and file into a canonical file key.
  *
