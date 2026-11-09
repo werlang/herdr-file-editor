@@ -819,18 +819,45 @@ export function resolveFileTab(filePath, root, activeTabs, openTabsMap = {}) {
           continue;
         }
 
+        // Check if recorded tabName/tabId was poisoned and clean it
+        let cleanTabName = val.tabName;
+        let cleanTabId = val.tabId;
+        if (val.file && cleanTabName && !isTabMatchingFile(cleanTabName, val.file, valRoot || normRoot)) {
+          cleanTabName = splitPathInfo(val.file).base || "File";
+          cleanTabId = null;
+        }
+
         // Strict tabId matching when tabId is known
         const isStillLive = liveTabs.some((t) => {
-          if (typeof val.tabId === "string" && val.tabId.length > 0) {
-            return t.id === val.tabId;
+          if (typeof cleanTabId === "string" && cleanTabId.length > 0) {
+            return t.id === cleanTabId && (!val.file || isTabMatchingFile(t.name, val.file, valRoot || normRoot));
           }
-          return typeof val.tabName === "string" && val.tabName.length > 0 && t.name === val.tabName;
+          return (
+            typeof cleanTabName === "string" &&
+            cleanTabName.length > 0 &&
+            t.name === cleanTabName &&
+            (!val.file || isTabMatchingFile(t.name, val.file, valRoot || normRoot))
+          );
         });
 
         if (isStillLive) {
-          updatedOpenTabs[key] = { ...val };
+          const entry = { ...val, tabName: cleanTabName };
+          if (cleanTabId) {
+            entry.tabId = cleanTabId;
+          } else {
+            delete entry.tabId;
+          }
+          updatedOpenTabs[key] = entry;
         }
       }
+    }
+  }
+
+  // Collect all tabIds that are ALREADY claimed by OTHER files in updatedOpenTabs
+  const claimedTabIds = new Set();
+  for (const [key, entry] of Object.entries(updatedOpenTabs)) {
+    if (key !== fileKey && entry && typeof entry === "object" && entry.tabId) {
+      claimedTabIds.add(entry.tabId);
     }
   }
 
@@ -839,9 +866,18 @@ export function resolveFileTab(filePath, root, activeTabs, openTabsMap = {}) {
   if (recorded) {
     const matchedLiveTab = liveTabs.find((t) => {
       if (typeof recorded.tabId === "string" && recorded.tabId.length > 0) {
-        return t.id === recorded.tabId;
+        return t.id === recorded.tabId && isTabMatchingFile(t.name, normFile, normRoot);
       }
-      return typeof recorded.tabName === "string" && recorded.tabName.length > 0 && t.name === recorded.tabName;
+      // Never match a tab that is already claimed by a different file
+      if (claimedTabIds.has(t.id)) {
+        return false;
+      }
+      return (
+        typeof recorded.tabName === "string" &&
+        recorded.tabName.length > 0 &&
+        t.name === recorded.tabName &&
+        isTabMatchingFile(t.name, normFile, normRoot)
+      );
     });
 
     if (matchedLiveTab) {
@@ -1481,6 +1517,47 @@ export function parseTabFileName(tabName) {
 }
 
 /**
+ * Checks whether a tab name matches a file path.
+ * Tab names can be the basename ("main.js"), a relative path ("src/main.js"),
+ * disambiguated with folder ("main.js (src)"), counter ("main.js (2)"),
+ * diff prefix ("Diff · main.js"), or root prefix ("repo/main.js").
+ *
+ * @param {string | null | undefined} tabName
+ * @param {string | null | undefined} filePath
+ * @param {string | null | undefined} [root]
+ * @returns {boolean}
+ */
+export function isTabMatchingFile(tabName, filePath, root) {
+  if (typeof tabName !== "string" || !tabName.trim()) return false;
+  if (typeof filePath !== "string" || !filePath.trim()) return false;
+
+  const normFile = filePath.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  const { base, dir } = splitPathInfo(normFile);
+  if (!base) return false;
+
+  const parsed = parseTabFileName(tabName);
+  if (!parsed) return false;
+
+  const normParsed = parsed.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+
+  // 1. Direct equality with file basename or relative file path
+  if (normParsed === base || normParsed === normFile) return true;
+
+  // 2. Disambiguated with root folder prefix (e.g. "myrepo/index.js" or "myrepo/src/index.js")
+  if (root && typeof root === "string") {
+    const rootBase = root.replace(/\\/g, "/").split("/").filter(Boolean).pop();
+    if (rootBase && normParsed === `${rootBase}/${normFile}`) return true;
+  }
+
+  // 3. Tab name has directory path matching normFile (e.g. dir is "src", normParsed is "src/index.js")
+  if (dir) {
+    if (normParsed.endsWith("/" + normFile) || normFile.endsWith("/" + normParsed)) return true;
+  }
+
+  return false;
+}
+
+/**
  * Resolves a candidate filename or relative path against the current workspace tree, open tabs, and git marks.
  * Returns the matched relative path if verified, or null if the candidate does not represent a file.
  *
@@ -1523,6 +1600,7 @@ export function matchCandidateFile(candidate, currentRoot, entries, marks, openT
       if (!entry || typeof entry !== "object" || !entry.file) continue;
       const { base } = splitPathInfo(entry.file);
       if (base === clean || entry.tabName === clean || entry.file === clean) {
+        if (!isTabMatchingFile(clean, entry.file, entry.root || currentRoot)) continue;
         const norm = normalizeFileToRoot(entry.file, entry.root, currentRoot);
         if (norm) return norm;
       }
@@ -1615,6 +1693,10 @@ export function resolveActiveOpenedFile({
     if (openTabs && typeof openTabs === "object") {
       for (const entry of Object.values(openTabs)) {
         if (!entry || typeof entry !== "object" || !entry.file) continue;
+        // Ignore poisoned openTabs entries where recorded tabName does not match the file
+        if (entry.tabName && !isTabMatchingFile(entry.tabName, entry.file, entry.root || currentRoot)) {
+          continue;
+        }
         const matchesId = entry.tabId && entry.tabId === activeTab.id;
         const matchesName = entry.tabName && entry.tabName === activeTab.name;
         if (matchesId || matchesName) {

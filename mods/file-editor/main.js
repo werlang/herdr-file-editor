@@ -52,6 +52,7 @@ import {
   buildSyntaxTheme,
   resolveLocationState,
   resolveFileTab,
+  isTabMatchingFile,
   mergeOpenTabEntry,
   fileIconPath,
   isLightColor,
@@ -222,8 +223,13 @@ export default class FileEditor extends View {
     }
     const openTabsMap = shared("file-editor.openTabs");
     if (openTabsMap && this.file) {
-      const fileKey = this.root ? `${this.root}/${this.file}` : this.file;
-      if (openTabsMap[fileKey]) {
+      const fileKey = this.fileKey || (this.root ? `${this.root}/${this.file}` : this.file);
+      const tabStillExists = (spaces() || []).some((sp) =>
+        (sp.tabs || []).some((t) =>
+          this.tabId ? t.id === this.tabId : isTabMatchingFile(t.name, this.file, this.root)
+        )
+      );
+      if (!tabStillExists && openTabsMap[fileKey]) {
         const next = { ...openTabsMap };
         delete next[fileKey];
         setShared("file-editor.openTabs", next);
@@ -304,39 +310,33 @@ export default class FileEditor extends View {
     if (p.pane) {
       const matchedPane = (panes() || []).find((pn) => pn.pane === p.pane);
       if (matchedPane?.tab) {
-        tabId = matchedPane.tab;
-        for (const sp of spaces() || []) {
-          const foundTab = (sp.tabs || []).find((t) => t.id === tabId);
-          if (foundTab?.name) {
-            tabName = foundTab.name;
-            break;
-          }
+        const allTabs = (spaces() || []).flatMap((sp) => sp.tabs || []);
+        const foundTab = allTabs.find((t) => t.id === matchedPane.tab);
+        if (foundTab && isTabMatchingFile(foundTab.name, this.file, this.root)) {
+          tabId = foundTab.id;
+          tabName = foundTab.name;
         }
       }
     }
 
     if (!tabId) {
-      const f = focused();
-      if (f?.tab) {
-        tabId = f.tab;
-        for (const sp of spaces() || []) {
-          const foundTab = (sp.tabs || []).find((t) => t.id === tabId);
-          if (foundTab?.name) {
-            tabName = foundTab.name;
-            break;
-          }
+      const allTabs = (spaces() || []).flatMap((sp) => sp.tabs || []);
+      const focusedTabId = focused()?.tab;
+      const focusedTab = focusedTabId ? allTabs.find((t) => t.id === focusedTabId) : null;
+      if (focusedTab && isTabMatchingFile(focusedTab.name, this.file, this.root)) {
+        tabId = focusedTab.id;
+        tabName = focusedTab.name;
+      } else {
+        const activeSpace = (spaces() || []).find((s) => s.active);
+        const activeTab = activeSpace?.tabs?.find((t) => t.active);
+        if (activeTab && isTabMatchingFile(activeTab.name, this.file, this.root)) {
+          tabId = activeTab.id;
+          tabName = activeTab.name;
         }
       }
     }
 
-    if (!tabId) {
-      const activeSpace = (spaces() || []).find((s) => s.active);
-      const activeTab = activeSpace?.tabs?.find((t) => t.active);
-      if (activeTab) {
-        tabId = activeTab.id;
-        tabName = activeTab.name;
-      }
-    }
+    this.tabId = tabId;
 
     const updatedOpenTabs = {
       ...openTabsMap,
@@ -348,7 +348,6 @@ export default class FileEditor extends View {
       }),
     };
     setShared("file-editor.openTabs", updatedOpenTabs);
-    setShared("file-editor.activeFile", { root: this.root, file: this.file });
   }
 
   /**
@@ -360,6 +359,39 @@ export default class FileEditor extends View {
     if (this.closed) return;
 
     let changed = false;
+
+    // Resolve tabId if not discovered at mount time
+    if (!this.tabId) {
+      const allTabs = (spaces() || []).flatMap((sp) => sp.tabs || []);
+      const focusedTabId = focused()?.tab;
+      const focusedTab = focusedTabId ? allTabs.find((t) => t.id === focusedTabId) : null;
+      let matchedTab = null;
+      if (focusedTab && isTabMatchingFile(focusedTab.name, this.file, this.root)) {
+        matchedTab = focusedTab;
+      } else {
+        const activeSpace = (spaces() || []).find((s) => s.active);
+        const activeTab = activeSpace?.tabs?.find((t) => t.active);
+        if (activeTab && isTabMatchingFile(activeTab.name, this.file, this.root)) {
+          matchedTab = activeTab;
+        }
+      }
+      if (matchedTab) {
+        this.tabId = matchedTab.id;
+        const fileKey = this.fileKey;
+        const openTabsMap = shared("file-editor.openTabs") || {};
+        if (openTabsMap[fileKey] && openTabsMap[fileKey].tabId !== this.tabId) {
+          setShared("file-editor.openTabs", {
+            ...openTabsMap,
+            [fileKey]: {
+              ...openTabsMap[fileKey],
+              tabId: this.tabId,
+              tabName: matchedTab.name,
+            },
+          });
+        }
+      }
+    }
+
     if (!this.explicitWrap) {
       const sharedWrap = shared("file-editor.wrap") === true;
       if (this.wrap !== sharedWrap) {
@@ -1582,6 +1614,23 @@ export default class FileEditor extends View {
     this.error = null;
     this.limited = false;
 
+    // Sanitize any poisoned openTabs entries loaded from shared state
+    const openTabsMap = shared("file-editor.openTabs");
+    if (openTabsMap && typeof openTabsMap === "object") {
+      let changed = false;
+      const cleaned = {};
+      for (const [k, v] of Object.entries(openTabsMap)) {
+        if (v && v.file && v.tabName && !isTabMatchingFile(v.tabName, v.file, v.root)) {
+          changed = true;
+          continue;
+        }
+        cleaned[k] = v;
+      }
+      if (changed) {
+        setShared("file-editor.openTabs", cleaned);
+      }
+    }
+
     this.refresh(cx);
     // Poll location every 250ms in memory so space switches reload immediately
     cx.timer.every(250, (cx) => this.checkLocation(cx));
@@ -1959,6 +2008,26 @@ export default class FileEditor extends View {
     const tabProps = { folder: this.root, file: path };
     if (this.on) tabProps.on = this.on;
     run("tab.new", { name: tabName, mod: "file-editor", props: tabProps });
+
+    cx.timer?.after?.(60, () => {
+      const activeSp = (spaces() || []).find((s) => s.active);
+      const activeTab = (activeSp?.tabs || []).find((t) => t.active);
+      if (activeTab?.id && isTabMatchingFile(activeTab.name, path, this.root)) {
+        const currentTabs = shared("file-editor.openTabs") || {};
+        const fileKey = this.root ? `${this.root}/${path}` : path;
+        if (currentTabs[fileKey]) {
+          setShared("file-editor.openTabs", {
+            ...currentTabs,
+            [fileKey]: {
+              ...currentTabs[fileKey],
+              tabId: activeTab.id,
+              tabName: activeTab.name || tabName,
+            },
+          });
+        }
+      }
+    });
+
     cx.notify();
   }
 

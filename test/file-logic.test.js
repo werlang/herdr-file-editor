@@ -24,6 +24,7 @@ import {
   buildSyntaxTheme,
   resolveLocationState,
   resolveFileTab,
+  isTabMatchingFile,
   mergeOpenTabEntry,
   fileIconPath,
   isLightColor,
@@ -637,6 +638,57 @@ test("resolveFileTab - manages cross-space tabs, strict tabId matching, and iter
   });
   assert.equal(rSettled.existingTabId, null);
   assert.equal(rSettled.tabName, "index.js");
+
+  // Case 6: Poisoned tab mapping (e.g. Antigravity mapped to README.md) auto-recovers and selects README.md tab
+  const poisonedMap = {
+    [`${rootA}/README.md`]: { root: rootA, file: "README.md", tabName: "Antigravity", tabId: "tab-antigravity" },
+  };
+  const liveTabsWithAntigravityAndReadme = [
+    { id: "tab-antigravity", name: "Antigravity", settled: false, active: true },
+    { id: "tab-readme", name: "README.md", settled: false, active: false },
+  ];
+  const rPoison = resolveFileTab("README.md", rootA, liveTabsWithAntigravityAndReadme, poisonedMap);
+  assert.equal(rPoison.existingTabId, "tab-readme");
+  assert.equal(rPoison.tabName, "README.md");
+
+  // Case 7: Off-by-one tab poisoned entry (README.md mapped to RECIPE.md tab) recovers and selects README.md
+  const offByOneMap = {
+    [`${rootA}/README.md`]: { root: rootA, file: "README.md", tabName: "RECIPE.md", tabId: "tab-recipe" },
+  };
+  const liveTabsUserScenario = [
+    { id: "tab-antigravity", name: "Antigravity", settled: false },
+    { id: "tab-gitignore", name: ".gitignore", settled: false },
+    { id: "tab-agents", name: "AGENTS.md", settled: false },
+    { id: "tab-preview", name: "preview.png", settled: false },
+    { id: "tab-sync", name: "sync.sh", settled: false },
+    { id: "tab-recipe", name: "RECIPE.md", settled: false },
+    { id: "tab-readme", name: "README.md", settled: false },
+  ];
+  const rOffByOne = resolveFileTab("README.md", rootA, liveTabsUserScenario, offByOneMap);
+  assert.equal(rOffByOne.existingTabId, "tab-readme");
+  assert.equal(rOffByOne.tabName, "README.md");
+});
+
+test("isTabMatchingFile - accurately validates tab names against file paths", () => {
+  const root = "/Users/pablowerlang/myrepo";
+  assert.equal(isTabMatchingFile("README.md", "README.md", root), true);
+  assert.equal(isTabMatchingFile("README.md (2)", "README.md", root), true);
+  assert.equal(isTabMatchingFile("myrepo/README.md", "README.md", root), true);
+  assert.equal(isTabMatchingFile("Diff · README.md", "README.md", root), true);
+  assert.equal(isTabMatchingFile("src/index.js", "src/index.js", root), true);
+  assert.equal(isTabMatchingFile("index.js", "src/index.js", root), true);
+  assert.equal(isTabMatchingFile("myrepo/src/index.js", "src/index.js", root), true);
+
+  // Unrelated or colliding names must NOT match
+  assert.equal(isTabMatchingFile("Antigravity", "README.md", root), false);
+  assert.equal(isTabMatchingFile("RECIPE.md", "README.md", root), false);
+  assert.equal(isTabMatchingFile("preview.png", "sync.sh", root), false);
+  assert.equal(isTabMatchingFile("New tab", "index.js", root), false);
+  assert.equal(isTabMatchingFile("1", "main.js", root), false);
+  assert.equal(isTabMatchingFile("lib/index.js", "test/index.js", root), false);
+  assert.equal(isTabMatchingFile("lib/index.js", "index.js", root), false);
+  assert.equal(isTabMatchingFile(null, "README.md", root), false);
+  assert.equal(isTabMatchingFile("README.md", null, root), false);
 });
 
 test("mergeOpenTabEntry - keeps recorded tabName and tabId when opened without a pane (R2-1)", () => {
@@ -1186,4 +1238,29 @@ test("matchCandidateFile - verifies candidate against root entries, marks, and p
   // Non-file label without extension
   assert.equal(matchCandidateFile("Terminal", root, entries, marks), null);
   assert.equal(matchCandidateFile("Git Graph", root, entries, marks), null);
+});
+test("resolveFileTab - claimedTabIds prevents matching tabs owned by other files", () => {
+  const root = "/work/repo";
+  const fileA = "src/main.js";
+  const fileB = "dist/main.js";
+  const keyA = `${root}/${fileA}`;
+  const keyB = `${root}/${fileB}`;
+
+  const liveTabs = [
+    { id: "tab-src-main", name: "main.js", settled: false, active: true },
+    { id: "tab-dist-main", name: "dist/main.js", settled: false, active: false },
+  ];
+
+  const openTabsMap = {
+    [keyA]: { root, file: fileA, tabName: "main.js", tabId: "tab-src-main" },
+    // fileB was recorded without tabId initially
+    [keyB]: { root, file: fileB, tabName: "main.js" },
+  };
+
+  // Resolving fileB must NEVER steal tab-src-main even though its recorded tabName is "main.js"
+  // because tab-src-main is already claimed by fileA!
+  const resB = resolveFileTab(fileB, root, liveTabs, openTabsMap);
+  assert.notEqual(resB.existingTabId, "tab-src-main");
+  // And disambiguates to dist/main.js or matches tab-dist-main
+  assert.ok(resB.tabName.includes("dist/main.js"));
 });
