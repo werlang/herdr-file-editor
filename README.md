@@ -34,12 +34,14 @@ Instead of opening raw code files inside the narrow Files panel, `file-editor` o
   - Raster images and SVG previews support zoom controls (`−` / percentage / `+`), a reset-to-fit button, and Cmd/Ctrl + wheel zooming.
   - 100% fits the picture to the pane; larger levels overflow and scroll in both directions.
 - **Toolbar Craft**:
-  - **Header Info**: Bold basename with unsaved dot (`●`), truncated folder path, line count & language pill, dynamic `Save` button, or `Read-only` badge with tooltip explanation.
-  - **View Switcher**: `Preview` / `Code` for Markdown and SVG files.
-  - **Zoom Controls**: `−` / percentage / `+` for raster images and SVG previews; the percentage resets to fit.
-  - **Wrap Toggle**: Toggles soft line wrapping on and off (via toolbar button or `Alt+Z` / `Opt+Z`), remembered in shared settings (`file-editor.wrap`).
-  - **Copy Button**: Copies file text to the clipboard with an instant toast notification.
-  - **Refresh Button**: Reloads file contents directly from disk.
+  - **Header Info**: Bold basename with unsaved dot (`●`), copy button, truncated folder path, line count & language pill.
+  - **Action Controls**: Compact icon buttons with tooltips and uniform 24px vertical alignment:
+    - `Save` icon button (`save.svg`), accent-highlighted when dirty, or `Read-only` lock icon indicator (`lock.svg`).
+    - `Preview` / `Code` segmented icon switcher (`eye.svg` and `code.svg`) for Markdown and SVG files.
+    - `Zoom Controls`: `−` / percentage / `+` for raster images and SVG previews; the percentage resets to fit.
+    - `Wrap Toggle`: `wrap.svg` icon button toggling soft line wrapping on and off (via button or `Alt+Z` / `Opt+Z`), remembered in shared settings (`file-editor.wrap`).
+    - `Copy Button`: `copy.svg` button copying file text to the clipboard with an instant toast notification.
+    - `Refresh Button`: `refresh.svg` button reloading file contents directly from disk.
 - **Live Disk Watching & Polling**:
   - Integrates with `watchFolder` off the UI thread and a 1.5s disk change poll so external modifications by agents or tools automatically update the open tab without clobbering unsaved edits.
 - **Edge Case & Safety Protections**:
