@@ -44,6 +44,11 @@ import {
   FILE_ICON_DEFAULT,
   FILE_ICON_BY_EXT,
   FILE_ICON_BY_NAME,
+  toFileKey,
+  fileElementId,
+  pruneFileTabStates,
+  remapRenamedFileStates,
+  removeDeletedFileStates,
 } from "../mods/file-editor/file-logic.js";
 
 test("splitPathInfo - extracts base, dir, and ext correctly", () => {
@@ -1239,6 +1244,105 @@ test("matchCandidateFile - verifies candidate against root entries, marks, and p
   assert.equal(matchCandidateFile("Terminal", root, entries, marks), null);
   assert.equal(matchCandidateFile("Git Graph", root, entries, marks), null);
 });
+test("toFileKey - canonicalizes root and file accurately", () => {
+  assert.equal(toFileKey("/Users/foo/repo", "src/main.js"), "/Users/foo/repo/src/main.js");
+  assert.equal(toFileKey("/Users/foo/repo/", "/src/main.js"), "/Users/foo/repo/src/main.js");
+  assert.equal(toFileKey("C:\\Users\\foo\\repo", "src\\main.js"), "C:/Users/foo/repo/src/main.js");
+  assert.equal(toFileKey("", "src/main.js"), "src/main.js");
+  assert.equal(toFileKey("/Users/foo/repo", "/Users/foo/repo/src/main.js"), "/Users/foo/repo/src/main.js");
+  assert.equal(toFileKey(null, "file.txt"), "file.txt");
+});
+
+test("fileElementId - generates safe and deterministic GPUI element IDs", () => {
+  assert.equal(
+    fileElementId("editor-code", "/Users/pablo/work/main.js"),
+    "editor-code-Users-pablo-work-main-js"
+  );
+  assert.equal(
+    fileElementId("editor-markdown", "docs/README.md"),
+    "editor-markdown-docs-README-md"
+  );
+  assert.equal(
+    fileElementId("editor-tab", "special!@#$%^&*()name.ts"),
+    "editor-tab-special-name-ts"
+  );
+  assert.equal(fileElementId("editor-code", ""), "editor-code-default");
+});
+
+test("pruneFileTabStates - LRU eviction respects capacity and protects activeKey", () => {
+  let releasedCount = 0;
+  const mockCode = (id) => ({
+    id,
+    release: () => {
+      releasedCount++;
+    },
+  });
+
+  const cache = new Map([
+    ["file1.js", { code: mockCode(1), lastAccess: 100 }],
+    ["file2.js", { code: mockCode(2), lastAccess: 300 }],
+    ["file3.js", { code: mockCode(3), lastAccess: 200 }],
+    ["file4.js", { code: mockCode(4), lastAccess: 400 }],
+  ]);
+
+  // Max 2 entries, file1 is active (even though it's oldest, it must not be evicted)
+  const evicted = pruneFileTabStates(cache, 2, "file1.js");
+  assert.equal(cache.size, 2);
+  assert.ok(cache.has("file1.js"), "Active key preserved");
+  assert.ok(cache.has("file4.js"), "Newest key preserved");
+  assert.equal(evicted.length, 2);
+  assert.equal(evicted[0].key, "file3.js"); // 200 evicted before 300
+  assert.equal(evicted[1].key, "file2.js");
+
+  // Call release on evicted
+  evicted.forEach(({ entry }) => entry.code?.release());
+  assert.equal(releasedCount, 2);
+});
+
+test("remapRenamedFileStates - updates cache keys on file and directory rename", () => {
+  const cache = new Map([
+    ["/root/src/Header.tsx", { viewMode: "code" }],
+    ["/root/src/sub/Icon.tsx", { viewMode: "code" }],
+    ["/root/docs/README.md", { viewMode: "preview" }],
+  ]);
+
+  // Rename single file
+  remapRenamedFileStates(cache, "docs/README.md", "docs/INDEX.md", "/root");
+  assert.ok(!cache.has("/root/docs/README.md"));
+  assert.ok(cache.has("/root/docs/INDEX.md"));
+  assert.equal(cache.get("/root/docs/INDEX.md").viewMode, "preview");
+
+  // Rename folder with nested files
+  remapRenamedFileStates(cache, "src", "app", "/root");
+  assert.ok(!cache.has("/root/src/Header.tsx"));
+  assert.ok(!cache.has("/root/src/sub/Icon.tsx"));
+  assert.ok(cache.has("/root/app/Header.tsx"));
+  assert.ok(cache.has("/root/app/sub/Icon.tsx"));
+});
+
+test("removeDeletedFileStates - removes deleted files and descendants", () => {
+  let releasedCount = 0;
+  const mockCode = () => ({
+    release: () => {
+      releasedCount++;
+    },
+  });
+
+  const cache = new Map([
+    ["/root/src/Header.tsx", { code: mockCode() }],
+    ["/root/src/sub/Icon.tsx", { code: mockCode() }],
+    ["/root/docs/README.md", { code: mockCode() }],
+  ]);
+
+  const removed = removeDeletedFileStates(cache, "src", "/root");
+  assert.equal(cache.size, 1);
+  assert.ok(cache.has("/root/docs/README.md"));
+  assert.equal(removed.length, 2);
+
+  removed.forEach(({ entry }) => entry.code?.release());
+  assert.equal(releasedCount, 2);
+});
+
 test("resolveFileTab - claimedTabIds prevents matching tabs owned by other files", () => {
   const root = "/work/repo";
   const fileA = "src/main.js";

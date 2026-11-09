@@ -13,7 +13,7 @@
  */
 
 import { View, div, svg, image } from "gpui-kit";
-import { v_flex, h_flex, Editor, EditorState } from "gpui-base";
+import { v_flex, h_flex, Editor, EditorState, Scrollbar } from "gpui-base";
 import { readFile as readBinaryFile } from "fs/promises";
 import {
   spaces,
@@ -67,8 +67,55 @@ import {
   parseTabFileName,
   resolveActiveOpenedFile,
   FOLDER_ICON_PATH,
+  toFileKey,
+  fileElementId,
+  pruneFileTabStates,
+  remapRenamedFileStates,
+  removeDeletedFileStates,
 } from "./file-logic.js";
 import { renderMarkdownDocument } from "./markdown-view.js";
+
+/** In-memory cache for open and recent file tab states (scroll, cursor, text, view mode, EditorState). */
+const fileTabStates = new Map();
+
+/** Max number of file editor instances to retain in the LRU cache. */
+const MAX_CACHED_FILE_STATES = 15;
+
+/**
+ * Storage key prefix for persisted file tab state.
+ *
+ * @param {string} key
+ * @returns {string}
+ */
+function getStorageKey(key) {
+  return `file-editor.tabState.${key}`;
+}
+
+/**
+ * Loads persisted tab state from sessionStorage if available.
+ *
+ * @param {string} fileKey
+ * @returns {Record<string, any> | null}
+ */
+function loadPersistedTabState(fileKey) {
+  try {
+    const raw = sessionStorage.getItem(getStorageKey(fileKey));
+    if (raw) return JSON.parse(raw);
+  } catch {}
+  return null;
+}
+
+/**
+ * Saves tab state attributes to sessionStorage.
+ *
+ * @param {string} fileKey
+ * @param {Record<string, any>} state
+ */
+function savePersistedTabState(fileKey, state) {
+  try {
+    sessionStorage.setItem(getStorageKey(fileKey), JSON.stringify(state));
+  } catch {}
+}
 
 /** Max entries displayed per directory and total tree bounds. */
 const PER_FOLDER = 500;
@@ -191,32 +238,35 @@ export default class FileEditor extends View {
   }
 
   /**
-   * Lifecycle cleanup: marks view closed, releases EditorState, and invalidates active watchers.
+   * Lifecycle cleanup: marks view closed, caches active tab state, and invalidates active watchers.
    *
    * @param {import("gpui-kit").AsyncContext} _cx
    */
   async close(_cx) {
     this.closed = true;
-    if (this.imageSrc) {
-      const name = this.imageSrc.slice(this.imageSrc.lastIndexOf("/") + 1);
-      const prefix = name.replace(/-\d+\.[^.]+$/, "");
-      await exec("sh", ["-c", 'rm -f "$1/$2"-*', "rm", `${appHome()}/cache/file-editor`, prefix]).catch(() => null);
-      this.imageSrc = null;
-    }
     this.watched = null;
     this.watchToken = null;
     this.hoveredPath = null;
-    this.editorInputs = null;
-    this.imageSize = null;
-    this.pictureViewport = null;
     this.focusHandle = null;
-    this.dirty = false;
     this.saving = false;
-    this.lastSavedText = null;
-    if (this.code) {
-      this.code.release();
-      this.code = null;
+
+    // Cache the tab state before closing so returning to it preserves cursor, scroll and settings
+    if (this.fileKey) {
+      this.updateCachedTabState({
+        code: this.code,
+        editorInputs: this.editorInputs,
+        imageSrc: this.imageSrc,
+        pictureViewport: this.pictureViewport,
+        lastAccess: Date.now(),
+      });
     }
+
+    // Do NOT release this.code immediately here; pruneFileTabStates manages the bounded LRU entity cache
+    this.code = null;
+    this.editorInputs = null;
+    this.dirty = false;
+    this.lastSavedText = null;
+
     const active = shared("file-editor.activeFile");
     if (active && active.file === this.file && active.root === this.root) {
       setShared("file-editor.activeFile", null);
@@ -252,37 +302,48 @@ export default class FileEditor extends View {
     this.file = file;
     this.root = root;
     this.on = typeof p.on === "string" ? p.on : null;
+    this.fileKey = toFileKey(this.root, this.file);
 
-    const requestedMode = typeof p.viewMode === "string" ? p.viewMode : null;
+    // Look up cached state (in-memory LRU or sessionStorage) to restore where the user was
+    const cached = fileTabStates.get(this.fileKey) || loadPersistedTabState(this.fileKey);
+
+    const requestedMode = typeof p.viewMode === "string" ? p.viewMode : (cached?.viewMode ?? null);
     this.viewMode = defaultViewMode(this.file, requestedMode);
 
     this.explicitWrap = typeof p.wrap === "boolean";
     const savedWrap = shared("file-editor.wrap");
-    this.wrap = this.explicitWrap ? p.wrap : savedWrap === true;
+    this.wrap = this.explicitWrap ? p.wrap : typeof cached?.wrap === "boolean" ? cached.wrap : savedWrap === true;
 
-    this.rawText = null;
-    this.preparedText = null;
+    this.rawText = cached?.rawText ?? null;
+    this.preparedText = cached?.preparedText ?? null;
     this.fileError = null;
-    this.lineCount = 0;
-    this.isBinary = false;
+    this.lineCount = cached?.lineCount ?? 0;
+    this.isBinary = cached?.isBinary ?? false;
     this.isImage = isImageFile(this.file);
     this.isSvg = isSvgFile(this.file);
-    this.imageSrc = null;
+    this.imageSrc = cached?.imageSrc ?? null;
     this.imageLoading = false;
-    this.imageSize = null;
-    this.imageZoom = normalizeImageZoom(typeof p.zoom === "number" ? p.zoom : 1);
-    this.pictureViewport = null;
-    this.isTruncated = false;
+    this.imageSize = cached?.imageSize ?? null;
+    const initialZoom = typeof p.zoom === "number" ? p.zoom : (cached?.imageZoom ?? 1);
+    this.imageZoom = normalizeImageZoom(initialZoom);
+    this.pictureViewport = cached?.pictureViewport ?? null;
+    this.isTruncated = cached?.isTruncated ?? false;
     this.loading = false;
     this.reloadPending = false;
-    this.code = null;
-    this.editorInputs = null;
+    this.code = cached?.code ?? null;
+    this.editorInputs = cached?.editorInputs ?? null;
     this.watched = null;
     this.watchToken = null;
     this.focusHandle = cx.focus_handle();
-    this.dirty = false;
+    this.dirty = cached?.dirty ?? false;
     this.saving = false;
     this.lastSavedText = null;
+
+    if (fileTabStates.has(this.fileKey)) {
+      fileTabStates.get(this.fileKey).lastAccess = Date.now();
+    } else if (cached) {
+      fileTabStates.set(this.fileKey, { ...cached, lastAccess: Date.now() });
+    }
 
     // Register this open tab in shared state
     this.registerOpenTab(p);
@@ -297,12 +358,56 @@ export default class FileEditor extends View {
   }
 
   /**
+   * Updates cached file state in memory and persists view preferences.
+   *
+   * @param {Record<string, any>} [patch={}]
+   */
+  updateCachedTabState(patch = {}) {
+    if (!this.fileKey || this.closed) return;
+    const existing = fileTabStates.get(this.fileKey) || {};
+    const updated = {
+      ...existing,
+      rawText: this.rawText ?? existing.rawText,
+      preparedText: this.preparedText ?? existing.preparedText,
+      lineCount: this.lineCount,
+      isBinary: this.isBinary,
+      isTruncated: this.isTruncated,
+      viewMode: this.viewMode,
+      imageZoom: this.imageZoom,
+      imageSize: this.imageSize,
+      imageSrc: this.imageSrc ?? existing.imageSrc,
+      pictureViewport: this.pictureViewport ?? existing.pictureViewport,
+      wrap: this.wrap,
+      code: this.code ?? existing.code,
+      editorInputs: this.editorInputs ?? existing.editorInputs,
+      dirty: this.dirty,
+      lastAccess: Date.now(),
+      ...patch,
+    };
+    fileTabStates.set(this.fileKey, updated);
+    savePersistedTabState(this.fileKey, {
+      viewMode: updated.viewMode,
+      imageZoom: updated.imageZoom,
+      wrap: updated.wrap,
+    });
+    const evicted = pruneFileTabStates(fileTabStates, MAX_CACHED_FILE_STATES, this.fileKey);
+    for (const { entry } of evicted) {
+      entry.code?.release();
+      if (entry?.imageSrc) {
+        const name = entry.imageSrc.slice(entry.imageSrc.lastIndexOf("/") + 1);
+        const prefix = name.replace(/-\d+\.[^.]+$/, "");
+        exec("sh", ["-c", 'rm -f "$1/$2"-*', "rm", `${appHome()}/cache/file-editor`, prefix]).catch(() => null);
+      }
+    }
+  }
+
+  /**
    * Records this open tab in shared("file-editor.openTabs").
    *
    * @param {Record<string, any>} p
    */
   registerOpenTab(p) {
-    const fileKey = this.root ? `${this.root}/${this.file}` : this.file;
+    const fileKey = this.fileKey || (this.root ? `${this.root}/${this.file}` : this.file);
     const openTabsMap = shared("file-editor.openTabs") || {};
     let tabId = null;
     let tabName = null;
@@ -469,15 +574,13 @@ export default class FileEditor extends View {
             } else if (!this.code) {
               this.rebuildEditor();
             }
-          } else {
-            this.code?.release();
-            this.code = null;
-            this.editorInputs = null;
           }
+          this.updateCachedTabState();
         } else {
           this.code?.release();
           this.code = null;
           this.editorInputs = null;
+          this.updateCachedTabState();
         }
       } catch {
         this.fileError = "Cannot preview this file (binary, too large, or unreadable)";
@@ -490,6 +593,7 @@ export default class FileEditor extends View {
         this.code?.release();
         this.code = null;
         this.editorInputs = null;
+        this.updateCachedTabState();
       } finally {
         this.loading = false;
         cx.notify();
@@ -547,9 +651,6 @@ export default class FileEditor extends View {
 
     const hasPreview = isMarkdownFile(this.file) || this.isSvg;
     if (hasPreview && this.viewMode !== "code") {
-      this.code?.release();
-      this.code = null;
-      this.editorInputs = null;
       return;
     }
 
@@ -585,6 +686,7 @@ export default class FileEditor extends View {
       syntax: JSON.stringify(syntax),
     };
     this.setupEditorListeners();
+    this.updateCachedTabState({ code: this.code, editorInputs: this.editorInputs });
   }
 
   /**
@@ -617,6 +719,8 @@ export default class FileEditor extends View {
       this.lineCount = newLineCount;
       notifyNeeded = true;
     }
+    this.preparedText = current;
+    this.updateCachedTabState({ dirty: newDirty, lineCount: newLineCount, preparedText: current });
     if (notifyNeeded) {
       cx.notify();
     }
@@ -693,6 +797,7 @@ export default class FileEditor extends View {
         this.saving = false;
         this.fileError = null;
         this.lineCount = this.code ? countLines(this.code.value()) : countLines(textToSave);
+        this.updateCachedTabState({ dirty: false, rawText: textToSave, preparedText: textToSave });
         notify({
           title: "Saved",
           body: base,
@@ -776,6 +881,7 @@ export default class FileEditor extends View {
     this.wrap = wrap;
     this.explicitWrap = true;
     setShared("file-editor.wrap", wrap);
+    this.updateCachedTabState({ wrap });
     this.rebuildEditor();
     cx.notify();
     this.focusEditor(cx);
@@ -805,6 +911,7 @@ export default class FileEditor extends View {
     } else if (mode === "preview" && this.isSvg && !this.imageSrc && !this.imageLoading) {
       this.loadImage(cx);
     }
+    this.updateCachedTabState({ viewMode: mode });
     cx.notify();
   }
 
@@ -829,6 +936,7 @@ export default class FileEditor extends View {
     const next = stepImageZoom(this.imageZoom, direction);
     if (next === normalizeImageZoom(this.imageZoom)) return;
     this.imageZoom = next;
+    this.updateCachedTabState({ imageZoom: next });
     cx.notify();
   }
 
@@ -840,6 +948,7 @@ export default class FileEditor extends View {
   resetPictureZoom(cx) {
     if (this.imageZoom === 1) return;
     this.imageZoom = 1;
+    this.updateCachedTabState({ imageZoom: 1 });
     cx.notify();
   }
 
@@ -880,6 +989,7 @@ export default class FileEditor extends View {
     const previous = this.pictureViewport;
     if (previous && previous.width === width && previous.height === height) return;
     this.pictureViewport = { width, height };
+    this.updateCachedTabState({ pictureViewport: this.pictureViewport });
     // The percentage fallback fits by width; the measured path also fits by
     // height and centers the picture. Repaint once the real size is known.
     cx.notify();
@@ -1047,9 +1157,10 @@ export default class FileEditor extends View {
       ? `Image · ${(base.split(".").pop() || "").toUpperCase()}`
       : `${this.lineCount} line${this.lineCount === 1 ? "" : "s"} · ${langLabel}`;
     const isCodeView = !this.isImage && (!hasPreview || this.viewMode === "code");
+    const tabId = fileElementId("file-editor-tab", this.fileKey);
 
     return v_flex()
-      .id("file-editor-tab")
+      .id(tabId)
       .size_full()
       .min_h(0)
       .bg(t.background)
@@ -1283,10 +1394,26 @@ export default class FileEditor extends View {
               )
           : this.isImage
             ? this.renderImageView(t)
-            : !isCodeView
-              ? isMarkdown
-                ? this.renderMarkdownView(t)
-                : this.renderSvgView(t)
+            : hasPreview
+              ? div()
+                  .size_full()
+                  .flex_1()
+                  .min_h(0)
+                  .relative()
+                  .child(
+                    div()
+                      .size_full()
+                      .min_h(0)
+                      .when(isCodeView, (e) => e.hidden())
+                      .child(isMarkdown ? this.renderMarkdownView(t) : this.renderSvgView(t))
+                  )
+                  .child(
+                    div()
+                      .size_full()
+                      .min_h(0)
+                      .when(!isCodeView, (e) => e.hidden())
+                      .child(this.renderCodeView(t))
+                  )
               : this.renderCodeView(t)
       );
   }
@@ -1394,8 +1521,9 @@ export default class FileEditor extends View {
         .justify_center()
         .child(div().max_w(620).text_size(12).text_color(t.dim).child("Image preview works only for files on this machine."));
     }
+    const imgId = fileElementId("file-editor-image", this.fileKey);
     return v_flex()
-      .id("file-editor-image")
+      .id(imgId)
       .flex_1()
       .min_h(0)
       .bg(t.background)
@@ -1433,8 +1561,9 @@ export default class FileEditor extends View {
         .justify_center()
         .child(div().max_w(620).text_size(12).text_color(t.dim).child("Image preview works only for files on this machine."));
     }
+    const svgId = fileElementId("file-editor-svg", this.fileKey);
     return v_flex()
-      .id("file-editor-svg")
+      .id(svgId)
       .flex_1()
       .min_h(0)
       .bg(t.background)
@@ -1468,20 +1597,21 @@ export default class FileEditor extends View {
     const whiteCanvas = options.whiteCanvas === true;
     const size = this.imageSize;
     const viewport = this.pictureViewport;
+    const picId = fileElementId("file-editor-picture", this.fileKey);
 
-    const container = v_flex()
-      .id("file-editor-picture")
-      .flex_1()
-      .min_h(0)
-      .overflow_scrollbar()
+    const scrollArea = v_flex()
+      .id(picId)
+      .size_full()
+      .overflow_scroll()
       .bg(t.background)
       .on_scroll_wheel((event, cx) => this.handlePictureWheel(event, cx));
 
+    let content;
     if (!size || !viewport || viewport.width <= 0 || viewport.height <= 0) {
       if (!size) {
         // Dimensions unknown (an unsupported header): fall back to the host's
         // natural-size rendering inside the pane.
-        return container.items_center().justify_center().child(
+        content = scrollArea.items_center().justify_center().child(
           v_flex()
             .flex_none()
             .p(PICTURE_PADDING)
@@ -1490,47 +1620,56 @@ export default class FileEditor extends View {
             .when(whiteCanvas, (e) => e.bg("#ffffff").rounded(8).border(1).border_color(t.border))
             .child(image(this.imageSrc).max_w_full().max_h_full())
         );
+      } else {
+        // Before the pane has been measured, fit by width using a percentage
+        // aspect box: the padding-top resolves against the box's own width, so
+        // the picture keeps its ratio without knowing the pane in pixels.
+        const aspect = size.height > 0 ? size.width / size.height : 1;
+        const aspectPadding = Math.min(4000, 100 / aspect);
+        content = scrollArea.items_center().child(
+          v_flex()
+            .w(percent)
+            .flex_none()
+            .m_auto()
+            .p(PICTURE_PADDING)
+            .when(zoom === 1, (e) => e.max_w(size.width + PICTURE_PADDING * 2))
+            .when(whiteCanvas, (e) => e.bg("#ffffff").rounded(8).border(1).border_color(t.border))
+            .child(
+              v_flex()
+                .relative()
+                .w_full()
+                .pt(`${Math.round(aspectPadding * 10000) / 10000}%`)
+                .child(image(this.imageSrc).absolute().inset_0().w_full().h_full())
+            )
+        );
       }
-      // Before the pane has been measured, fit by width using a percentage
-      // aspect box: the padding-top resolves against the box's own width, so
-      // the picture keeps its ratio without knowing the pane in pixels.
-      const aspect = size.height > 0 ? size.width / size.height : 1;
-      const aspectPadding = Math.min(4000, 100 / aspect);
-      return container.items_center().child(
-        v_flex()
-          .w(percent)
-          .flex_none()
-          .m_auto()
-          .p(PICTURE_PADDING)
-          .when(zoom === 1, (e) => e.max_w(size.width + PICTURE_PADDING * 2))
-          .when(whiteCanvas, (e) => e.bg("#ffffff").rounded(8).border(1).border_color(t.border))
-          .child(
-            v_flex()
-              .relative()
-              .w_full()
-              .pt(`${Math.round(aspectPadding * 10000) / 10000}%`)
-              .child(image(this.imageSrc).absolute().inset_0().w_full().h_full())
-          )
-      );
+    } else {
+      // Fit the whole picture inside the pane at 100%, never enlarging it.
+      const availableWidth = Math.max(1, viewport.width - PICTURE_PADDING * 2);
+      const availableHeight = Math.max(1, viewport.height - PICTURE_PADDING * 2);
+      const fitScale = Math.min(1, availableWidth / size.width, availableHeight / size.height);
+      const width = Math.max(1, Math.round(size.width * fitScale * zoom));
+      const height = Math.max(1, Math.round(size.height * fitScale * zoom));
+
+      content = scrollArea
+        .when(zoom <= 1, (e) => e.items_center().justify_center())
+        .when(zoom > 1, (e) => e.items_start())
+        .child(
+          v_flex()
+            .flex_none()
+            .p(PICTURE_PADDING)
+            .when(whiteCanvas, (e) => e.bg("#ffffff").rounded(8).border(1).border_color(t.border))
+            .child(image(this.imageSrc).w(width).h(height))
+        );
     }
 
-    // Fit the whole picture inside the pane at 100%, never enlarging it.
-    const availableWidth = Math.max(1, viewport.width - PICTURE_PADDING * 2);
-    const availableHeight = Math.max(1, viewport.height - PICTURE_PADDING * 2);
-    const fitScale = Math.min(1, availableWidth / size.width, availableHeight / size.height);
-    const width = Math.max(1, Math.round(size.width * fitScale * zoom));
-    const height = Math.max(1, Math.round(size.height * fitScale * zoom));
-
-    return container
-      .when(zoom <= 1, (e) => e.items_center().justify_center())
-      .when(zoom > 1, (e) => e.items_start())
-      .child(
-        v_flex()
-          .flex_none()
-          .p(PICTURE_PADDING)
-          .when(whiteCanvas, (e) => e.bg("#ffffff").rounded(8).border(1).border_color(t.border))
-          .child(image(this.imageSrc).w(width).h(height))
-      );
+    return div()
+      .relative()
+      .size_full()
+      .flex_1()
+      .min_h(0)
+      .child(content)
+      .child(Scrollbar.new(picId).absolute().inset_0());
   }
 
   /**
@@ -1541,25 +1680,33 @@ export default class FileEditor extends View {
    */
   renderMarkdownView(t) {
     const codeFont = settings()?.font_family ?? null;
-    return v_flex()
-      .id("file-editor-markdown")
+    const mdId = fileElementId("file-editor-markdown", this.fileKey);
+    return div()
+      .relative()
+      .size_full()
       .flex_1()
       .min_h(0)
-      .overflow_y_scrollbar()
-      .bg(t.background)
-      .px(32)
-      .py(24)
       .child(
         v_flex()
-          .w_full()
-          .items_center()
+          .id(mdId)
+          .size_full()
+          .overflow_y_scroll()
+          .bg(t.background)
+          .px(32)
+          .py(24)
           .child(
-            div()
+            v_flex()
               .w_full()
-              .max_w(880)
-              .child(renderMarkdownDocument(this.preparedText ?? "", { t, codeFont, idPrefix: `md-${this.file}` }))
+              .items_center()
+              .child(
+                div()
+                  .w_full()
+                  .max_w(880)
+                  .child(renderMarkdownDocument(this.preparedText ?? "", { t, codeFont, idPrefix: `md-${mdId}` }))
+              )
           )
-      );
+      )
+      .child(Scrollbar.vertical(mdId).absolute().inset_0());
   }
 
   /**
@@ -1570,9 +1717,12 @@ export default class FileEditor extends View {
    */
   renderCodeView(t) {
     if (this.code) {
-      return Editor.new(this.code).flex_1().min_h(0);
+      const codeId = fileElementId("file-editor-code", this.fileKey);
+      return Editor.new(this.code).id(codeId).flex_1().min_h(0);
     }
+    const emptyId = fileElementId("file-editor-code-empty", this.fileKey);
     return v_flex()
+      .id(emptyId)
       .flex_1()
       .min_h(0)
       .p(24)

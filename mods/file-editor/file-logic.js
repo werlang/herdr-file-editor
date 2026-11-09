@@ -1724,3 +1724,127 @@ export function resolveActiveOpenedFile({
 
   return null;
 }
+/**
+ * Normalizes root and file into a canonical file key.
+ *
+ * @param {string | null | undefined} root
+ * @param {string | null | undefined} file
+ * @returns {string}
+ */
+export function toFileKey(root, file) {
+  let normRoot = typeof root === "string" ? root.replace(/\\/g, "/").replace(/\/+$/, "") : "";
+  let normFile = typeof file === "string" ? file.replace(/\\/g, "/") : "";
+
+  if (normRoot && normFile.startsWith(normRoot + "/")) {
+    return normFile;
+  }
+  normFile = normFile.replace(/^\/+/, "");
+  if (normRoot && normFile) {
+    if (normRoot.replace(/^\/+/, "") && normFile.startsWith(normRoot.replace(/^\/+/, "") + "/")) {
+      return normRoot.startsWith("/") ? `/${normFile}` : normFile;
+    }
+    return `${normRoot}/${normFile}`;
+  }
+  return normFile || normRoot;
+}
+
+/**
+ * Constructs a safe, deterministic GPUI element identifier for a given file.
+ * Replaces non-alphanumeric characters with hyphens to guarantee valid element naming.
+ *
+ * @param {string} prefix - Component namespace (e.g. "editor-code", "editor-markdown")
+ * @param {string} fileKey - Canonical file key or path
+ * @returns {string}
+ */
+export function fileElementId(prefix, fileKey) {
+  const cleanKey = String(fileKey || "")
+    .replace(/[^a-zA-Z0-9_-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  return `${prefix}-${cleanKey || "default"}`;
+}
+
+/**
+ * Prunes the file tab state cache down to maxEntries using LRU (least recently accessed first).
+ * Never prunes the currently active file tab.
+ * Returns an array of evicted entries so callers can release resources (e.g. EditorState handles).
+ *
+ * @param {Map<string, any>} statesMap
+ * @param {number} [maxEntries=15]
+ * @param {string | null} [activeKey=null]
+ * @returns {Array<{ key: string, entry: any }>}
+ */
+export function pruneFileTabStates(statesMap, maxEntries = 15, activeKey = null) {
+  if (!statesMap || statesMap.size <= maxEntries) return [];
+
+  const candidates = [];
+  for (const [key, entry] of statesMap.entries()) {
+    if (key !== activeKey) {
+      candidates.push({ key, entry, lastAccess: entry?.lastAccess ?? 0 });
+    }
+  }
+
+  candidates.sort((a, b) => a.lastAccess - b.lastAccess);
+
+  const evicted = [];
+  while (statesMap.size > maxEntries && candidates.length > 0) {
+    const item = candidates.shift();
+    if (item && statesMap.has(item.key)) {
+      statesMap.delete(item.key);
+      evicted.push({ key: item.key, entry: item.entry });
+    }
+  }
+
+  return evicted;
+}
+
+/**
+ * Remaps file state cache keys when a file or directory is renamed.
+ *
+ * @param {Map<string, any>} statesMap
+ * @param {string} oldPath
+ * @param {string} newPath
+ * @param {string} [root=""]
+ * @returns {Map<string, any>}
+ */
+export function remapRenamedFileStates(statesMap, oldPath, newPath, root = "") {
+  if (!statesMap) return statesMap;
+  const oldKey = toFileKey(root, oldPath);
+  const newKey = toFileKey(root, newPath);
+  const oldPrefix = oldKey + "/";
+
+  for (const [key, entry] of [...statesMap.entries()]) {
+    if (key === oldKey) {
+      statesMap.delete(key);
+      statesMap.set(newKey, entry);
+    } else if (key.startsWith(oldPrefix)) {
+      statesMap.delete(key);
+      statesMap.set(newKey + key.slice(oldKey.length), entry);
+    }
+  }
+  return statesMap;
+}
+
+/**
+ * Removes file states for a deleted file or folder from the cache.
+ * Returns array of removed entries so callers can release resources.
+ *
+ * @param {Map<string, any>} statesMap
+ * @param {string} deletedPath
+ * @param {string} [root=""]
+ * @returns {Array<{ key: string, entry: any }>}
+ */
+export function removeDeletedFileStates(statesMap, deletedPath, root = "") {
+  if (!statesMap) return [];
+  const targetKey = toFileKey(root, deletedPath);
+  const prefix = targetKey + "/";
+  const removed = [];
+
+  for (const [key, entry] of [...statesMap.entries()]) {
+    if (key === targetKey || key.startsWith(prefix)) {
+      statesMap.delete(key);
+      removed.push({ key, entry });
+    }
+  }
+  return removed;
+}
