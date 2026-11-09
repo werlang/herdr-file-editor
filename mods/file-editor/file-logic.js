@@ -1354,3 +1354,291 @@ export function stepImageZoom(current, direction) {
 export function imageZoomPercent(zoom) {
   return /** @type {`${number}%`} */ (`${Math.round(normalizeImageZoom(zoom) * 100)}%`);
 }
+
+/**
+ * Splits a relative file path into an ordered list of its ancestor directory paths.
+ * E.g. "a/b/c/file.txt" -> ["a", "a/b", "a/b/c"]
+ *
+ * @param {string} [filePath]
+ * @returns {string[]}
+ */
+export function getAncestorFolders(filePath) {
+  if (typeof filePath !== "string" || !filePath.trim()) return [];
+  const normalized = filePath.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  const parts = normalized.split("/");
+  if (parts.length <= 1) return [];
+
+  const ancestors = [];
+  let current = "";
+  for (let i = 0; i < parts.length - 1; i += 1) {
+    current = current ? `${current}/${parts[i]}` : parts[i];
+    ancestors.push(current);
+  }
+  return ancestors;
+}
+
+/**
+ * Normalizes a file and its root relative to a target workspace root.
+ * Returns the relative file path if it resides within currentRoot, or null if outside.
+ * Handles macOS symlinks and path aliases (e.g. /Documents/Workspaces vs /workspaces).
+ *
+ * @param {string | null} file
+ * @param {string | null} [fileRoot]
+ * @param {string | null} [currentRoot]
+ * @returns {string | null}
+ */
+export function normalizeFileToRoot(file, fileRoot, currentRoot) {
+  if (typeof file !== "string" || !file.trim()) return null;
+  const normFile = file.replace(/\\/g, "/").trim();
+  const normFileRoot = typeof fileRoot === "string" ? fileRoot.replace(/\\/g, "/").replace(/\/+$/, "").trim() : null;
+  const normCurrentRoot =
+    typeof currentRoot === "string" ? currentRoot.replace(/\\/g, "/").replace(/\/+$/, "").trim() : null;
+
+  const isAbsolute = normFile.startsWith("/") || /^[a-zA-Z]:\//.test(normFile);
+
+  // If already relative without escaping "../"
+  if (!isAbsolute && !normFile.startsWith("../")) {
+    const cleanRel = normFile.replace(/^\/+/, "");
+    if (!normFileRoot || !normCurrentRoot || normFileRoot === normCurrentRoot) {
+      return cleanRel;
+    }
+    const currentBase = normCurrentRoot.split("/").filter(Boolean).pop();
+    const fileRootBase = normFileRoot.split("/").filter(Boolean).pop();
+    if (currentBase && fileRootBase && currentBase === fileRootBase) {
+      return cleanRel;
+    }
+  }
+
+  // Handle absolute path
+  const fullPath = isAbsolute
+    ? normFile
+    : normFileRoot
+      ? `${normFileRoot}/${normFile.replace(/^\/+/, "")}`
+      : null;
+
+  if (normCurrentRoot && fullPath) {
+    if (fullPath === normCurrentRoot) return null;
+    if (fullPath.startsWith(normCurrentRoot + "/")) {
+      return fullPath.slice(normCurrentRoot.length + 1);
+    }
+    // Handle symlink / path alias where currentRoot's repo folder name matches
+    const currentBase = normCurrentRoot.split("/").filter(Boolean).pop();
+    if (currentBase) {
+      const marker = `/${currentBase}/`;
+      const idx = fullPath.lastIndexOf(marker);
+      if (idx >= 0) {
+        return fullPath.slice(idx + marker.length);
+      }
+    }
+    return null;
+  }
+
+  if (fullPath) return fullPath;
+  return !isAbsolute && !normFile.startsWith("../") ? normFile.replace(/^\/+/, "") : null;
+}
+
+/**
+ * Attempts to parse a candidate file name or relative path from a tab name.
+ * Handles patterns such as:
+ * - "Diff · AGENTS.md"
+ * - "Diff · AGENTS.md (working tree)"
+ * - "Diff · AGENTS.md (9f3c2a1)"
+ * - "Diff - AGENTS.md"
+ * - "Diff: AGENTS.md"
+ * - "main.js (mods/file-editor)"
+ * - "AGENTS.md"
+ *
+ * @param {string} [tabName]
+ * @returns {string | null}
+ */
+export function parseTabFileName(tabName) {
+  if (typeof tabName !== "string" || !tabName.trim()) return null;
+  let raw = tabName.trim();
+
+  // Strip diff prefixes like "Diff · ", "Diff - ", "Diff: "
+  raw = raw.replace(/^Diff\s*[\u00B7\-\:]\s*/i, "").trim();
+  if (!raw) return null;
+
+  // Check for trailing parentheses like "(working tree)", "(9f3c2a1)", "(mods/file-editor)", or "(2)"
+  const parenMatch = /\s*\(([^)]+)\)$/.exec(raw);
+  if (parenMatch) {
+    const inner = parenMatch[1].trim();
+    const beforeParen = raw.slice(0, parenMatch.index).trim();
+
+    // If inner contains slashes, it's a directory disambiguator (e.g. "main.js (mods/file-editor)")
+    if (inner.includes("/")) {
+      const normInner = inner.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+      return beforeParen ? `${normInner}/${beforeParen}` : normInner;
+    }
+
+    // If inner is just a counter, commit hash, or "working tree", the filename is beforeParen
+    if (beforeParen) {
+      raw = beforeParen;
+    }
+  }
+
+  return raw || null;
+}
+
+/**
+ * Resolves a candidate filename or relative path against the current workspace tree, open tabs, and git marks.
+ * Returns the matched relative path if verified, or null if the candidate does not represent a file.
+ *
+ * @param {string | null} candidate
+ * @param {string | null} currentRoot
+ * @param {Map<string, Array<{ name: string, dir: boolean }>>} [entries]
+ * @param {Record<string, string>} [marks]
+ * @param {Record<string, any>} [openTabs]
+ * @param {{ root?: string | null, file?: string | null }} [activeFile]
+ * @returns {string | null}
+ */
+export function matchCandidateFile(candidate, currentRoot, entries, marks, openTabs, activeFile) {
+  if (!candidate || typeof candidate !== "string") return null;
+  const clean = candidate.trim().replace(/\\/g, "/");
+  if (!clean) return null;
+
+  // 1. Explicit path with slashes (e.g. "mods/file-editor/main.js")
+  if (clean.includes("/")) {
+    return normalizeFileToRoot(clean, currentRoot, currentRoot);
+  }
+
+  // 2. Direct match in root directory entries
+  const rootList = entries?.get?.("") || [];
+  if (rootList.some((e) => !e.dir && e.name === clean)) {
+    return clean;
+  }
+
+  // 3. Match from activeFile if its base matches candidate
+  if (activeFile && typeof activeFile === "object" && activeFile.file) {
+    const { base } = splitPathInfo(activeFile.file);
+    if (base === clean || activeFile.file === clean) {
+      const norm = normalizeFileToRoot(activeFile.file, activeFile.root, currentRoot);
+      if (norm) return norm;
+    }
+  }
+
+  // 4. Match from openTabs map if an entry's base matches candidate
+  if (openTabs && typeof openTabs === "object") {
+    for (const entry of Object.values(openTabs)) {
+      if (!entry || typeof entry !== "object" || !entry.file) continue;
+      const { base } = splitPathInfo(entry.file);
+      if (base === clean || entry.tabName === clean || entry.file === clean) {
+        const norm = normalizeFileToRoot(entry.file, entry.root, currentRoot);
+        if (norm) return norm;
+      }
+    }
+  }
+
+  // 5. Match in git status marks (modified/staged/untracked files in repo)
+  if (marks && typeof marks === "object") {
+    for (const markPath of Object.keys(marks)) {
+      if (markPath.endsWith(`/${clean}`) || markPath === clean) {
+        const norm = normalizeFileToRoot(markPath, null, currentRoot);
+        if (norm) return norm;
+      }
+    }
+  }
+
+  // 6. Match in any loaded subfolder in entries
+  if (entries && typeof entries.entries === "function") {
+    for (const [folder, list] of entries.entries()) {
+      if (Array.isArray(list) && list.some((e) => !e.dir && e.name === clean)) {
+        return folder ? `${folder}/${clean}` : clean;
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Resolves the active opened file relative to the current workspace root.
+ * Checks focused tab/pane, active tab in active space (including diff and file tabs),
+ * openTabs map, and shared activeFile.
+ *
+ * @param {{
+ *   spaces?: Array<Record<string, any>>,
+ *   focused?: Record<string, any>,
+ *   panes?: Array<Record<string, any>>,
+ *   openTabs?: Record<string, any>,
+ *   activeFile?: { root?: string | null, file?: string | null },
+ *   currentRoot?: string | null,
+ *   entries?: Map<string, Array<{ name: string, dir: boolean }>>,
+ *   marks?: Record<string, string>,
+ * }} options
+ * @returns {string | null}
+ */
+export function resolveActiveOpenedFile({
+  spaces,
+  focused,
+  panes,
+  openTabs,
+  activeFile,
+  currentRoot,
+  entries,
+  marks,
+}) {
+  const spaceList = Array.isArray(spaces) ? spaces : [];
+  const paneList = Array.isArray(panes) ? panes : [];
+  const activeSpace = spaceList.find((s) => s.active) || null;
+  const activeTabs = activeSpace?.tabs || [];
+  const focusedTabId = focused?.tab || null;
+  const activeTab = activeTabs.find((t) => t.id === focusedTabId) || activeTabs.find((t) => t.active) || null;
+
+  // 1. Check focused pane props if any
+  if (focused?.pane) {
+    const fp = paneList.find((p) => p.pane === focused.pane);
+    if (fp?.props) {
+      const file = fp.props.file || fp.props.diffFile;
+      if (file) {
+        const norm = normalizeFileToRoot(file, fp.props.folder || fp.props.cwd, currentRoot);
+        if (norm) return norm;
+      }
+    }
+  }
+
+  // 2. Check active tab
+  if (activeTab) {
+    // 2a. Panes in active tab
+    const activeTabPanes = paneList.filter((p) => p.tab === activeTab.id);
+    for (const p of activeTabPanes) {
+      if (p.props) {
+        const file = p.props.file || p.props.diffFile;
+        if (file) {
+          const norm = normalizeFileToRoot(file, p.props.folder || p.props.cwd, currentRoot);
+          if (norm) return norm;
+        }
+      }
+    }
+
+    // 2b. Match active tab against openTabs map
+    if (openTabs && typeof openTabs === "object") {
+      for (const entry of Object.values(openTabs)) {
+        if (!entry || typeof entry !== "object" || !entry.file) continue;
+        const matchesId = entry.tabId && entry.tabId === activeTab.id;
+        const matchesName = entry.tabName && entry.tabName === activeTab.name;
+        if (matchesId || matchesName) {
+          const norm = normalizeFileToRoot(entry.file, entry.root, currentRoot);
+          if (norm) return norm;
+        }
+      }
+    }
+
+    // 2c. Check active tab name (handles Diff tabs, direct file tabs, etc.)
+    if (activeTab.name) {
+      const candidate = parseTabFileName(activeTab.name);
+      if (candidate) {
+        const matched = matchCandidateFile(candidate, currentRoot, entries, marks, openTabs, activeFile);
+        if (matched) return matched;
+      }
+    }
+  }
+
+  // 3. Check shared activeFile (fallback when active tab is not a file/diff)
+  if (activeFile && typeof activeFile === "object" && activeFile.file) {
+    const norm = normalizeFileToRoot(activeFile.file, activeFile.root, currentRoot);
+    if (norm) return norm;
+  }
+
+  return null;
+}

@@ -35,6 +35,11 @@ import {
   normalizeImageZoom,
   stepImageZoom,
   imageZoomPercent,
+  getAncestorFolders,
+  normalizeFileToRoot,
+  parseTabFileName,
+  matchCandidateFile,
+  resolveActiveOpenedFile,
   FILE_ICON_DEFAULT,
   FILE_ICON_BY_EXT,
   FILE_ICON_BY_NAME,
@@ -936,4 +941,249 @@ test("imageZoomPercent - formats a canvas width and toolbar label", () => {
   assert.equal(imageZoomPercent(4), "400%");
   assert.equal(imageZoomPercent(99), "400%");
   assert.equal(imageZoomPercent(Number.NaN), "100%");
+});
+
+test("getAncestorFolders - generates ordered list of ancestor folders", () => {
+  assert.deepEqual(getAncestorFolders("README.md"), []);
+  assert.deepEqual(getAncestorFolders("src/index.js"), ["src"]);
+  assert.deepEqual(getAncestorFolders("mods/file-editor/main.js"), ["mods", "mods/file-editor"]);
+  assert.deepEqual(getAncestorFolders("a/b/c/d/e.txt"), ["a", "a/b", "a/b/c", "a/b/c/d"]);
+  assert.deepEqual(getAncestorFolders(""), []);
+  assert.deepEqual(getAncestorFolders(null), []);
+  assert.deepEqual(getAncestorFolders(undefined), []);
+  assert.deepEqual(getAncestorFolders("   "), []);
+  assert.deepEqual(getAncestorFolders("src\\components\\Button.tsx"), ["src", "src/components"]);
+});
+
+test("normalizeFileToRoot - resolves files within target root and rejects outside paths", () => {
+  // Matching relative file with fileRoot
+  assert.equal(
+    normalizeFileToRoot("src/index.js", "/Users/me/project", "/Users/me/project"),
+    "src/index.js"
+  );
+  // Matching absolute file
+  assert.equal(
+    normalizeFileToRoot("/Users/me/project/README.md", null, "/Users/me/project"),
+    "README.md"
+  );
+  // Matching nested absolute file
+  assert.equal(
+    normalizeFileToRoot("/Users/me/project/mods/file-editor/main.js", null, "/Users/me/project"),
+    "mods/file-editor/main.js"
+  );
+  // File outside target root
+  assert.equal(
+    normalizeFileToRoot("/Users/me/other-project/src/index.js", null, "/Users/me/project"),
+    null
+  );
+  assert.equal(
+    normalizeFileToRoot("src/index.js", "/Users/me/other-project", "/Users/me/project"),
+    null
+  );
+  // Target root equals file path exactly (directory, not file)
+  assert.equal(
+    normalizeFileToRoot("/Users/me/project", null, "/Users/me/project"),
+    null
+  );
+  // Relative file without fileRoot inside currentRoot
+  assert.equal(
+    normalizeFileToRoot("package.json", null, "/Users/me/project"),
+    "package.json"
+  );
+  // Escaping relative path
+  assert.equal(
+    normalizeFileToRoot("../other/file.js", null, "/Users/me/project"),
+    null
+  );
+  // Windows-style paths
+  assert.equal(
+    normalizeFileToRoot("C:\\Users\\me\\project\\src\\App.tsx", null, "C:/Users/me/project"),
+    "src/App.tsx"
+  );
+  // macOS symlinked path alias (e.g. /Documents/Workspaces vs /workspaces)
+  assert.equal(
+    normalizeFileToRoot(
+      "mods/file-editor/file-logic.js",
+      "/Users/me/workspaces/herdr/herdr-file-editor",
+      "/Users/me/Documents/Workspaces/herdr/herdr-file-editor"
+    ),
+    "mods/file-editor/file-logic.js"
+  );
+  assert.equal(
+    normalizeFileToRoot(
+      "/Users/me/workspaces/herdr/herdr-file-editor/mods/file-editor/file-logic.js",
+      null,
+      "/Users/me/Documents/Workspaces/herdr/herdr-file-editor"
+    ),
+    "mods/file-editor/file-logic.js"
+  );
+  // Empty or invalid input
+  assert.equal(normalizeFileToRoot("", "/repo", "/repo"), null);
+  assert.equal(normalizeFileToRoot(null, "/repo", "/repo"), null);
+});
+
+test("resolveActiveOpenedFile - detects active file from focused pane, active tab, openTabs, and activeFile", () => {
+  const currentRoot = "/Users/me/project";
+
+  // 1. Matches from focused pane
+  const focusedPaneResult = resolveActiveOpenedFile({
+    focused: { pane: "p1", tab: "t1" },
+    panes: [{ pane: "p1", tab: "t1", mod: "file-editor", props: { folder: currentRoot, file: "src/main.js" } }],
+    currentRoot,
+  });
+  assert.equal(focusedPaneResult, "src/main.js");
+
+  // 2. Matches from active tab in active space via pane
+  const activeTabPaneResult = resolveActiveOpenedFile({
+    spaces: [{ id: "s1", active: true, tabs: [{ id: "t2", active: true, name: "README.md" }] }],
+    panes: [{ pane: "p2", tab: "t2", mod: "file-editor", props: { folder: currentRoot, file: "README.md" } }],
+    currentRoot,
+  });
+  assert.equal(activeTabPaneResult, "README.md");
+
+  // 3. Matches from active tab via openTabs map by tabId
+  const openTabsIdResult = resolveActiveOpenedFile({
+    spaces: [{ id: "s1", active: true, tabs: [{ id: "t3", active: true, name: "tab-custom" }] }],
+    openTabs: {
+      "key-1": { tabId: "t3", root: currentRoot, file: "mods/file-editor/main.js" },
+    },
+    currentRoot,
+  });
+  assert.equal(openTabsIdResult, "mods/file-editor/main.js");
+
+  // 4. Matches from active tab via openTabs map by tabName
+  const openTabsNameResult = resolveActiveOpenedFile({
+    spaces: [{ id: "s1", active: true, tabs: [{ id: "t4", active: true, name: "file-logic.js" }] }],
+    openTabs: {
+      "key-2": { tabName: "file-logic.js", root: currentRoot, file: "mods/file-editor/file-logic.js" },
+    },
+    currentRoot,
+  });
+  assert.equal(openTabsNameResult, "mods/file-editor/file-logic.js");
+
+  // 5. Matches from shared activeFile
+  const activeFileResult = resolveActiveOpenedFile({
+    activeFile: { root: currentRoot, file: "package.json" },
+    currentRoot,
+  });
+  assert.equal(activeFileResult, "package.json");
+
+  // 6. Active file from a different root returns null
+  const otherRootResult = resolveActiveOpenedFile({
+    activeFile: { root: "/Users/me/other-repo", file: "package.json" },
+    currentRoot,
+  });
+  assert.equal(otherRootResult, null);
+
+  // 7. Nothing open or matching returns null
+  const noneResult = resolveActiveOpenedFile({
+    spaces: [{ id: "s1", active: true, tabs: [{ id: "t_term", active: true, name: "Terminal" }] }],
+    panes: [{ pane: "p_term", tab: "t_term", terminal: "term_1" }],
+    currentRoot,
+  });
+  assert.equal(noneResult, null);
+
+  // 8. Matches from active Diff tab (e.g. "Diff · AGENTS.md" in git-graph or changes)
+  const diffTabResult = resolveActiveOpenedFile({
+    spaces: [{ id: "s1", active: true, tabs: [{ id: "t_diff", active: true, name: "Diff · AGENTS.md" }] }],
+    entries: new Map([["", [{ name: "AGENTS.md", dir: false }, { name: "README.md", dir: false }]]]),
+    currentRoot,
+  });
+  assert.equal(diffTabResult, "AGENTS.md");
+
+  // 9. Matches from active Diff tab with git working-tree marks for nested file
+  const diffNestedResult = resolveActiveOpenedFile({
+    spaces: [{ id: "s1", active: true, tabs: [{ id: "t_diff2", active: true, name: "Diff · file-logic.js" }] }],
+    marks: {
+      [`${currentRoot}/mods/file-editor/file-logic.js`]: "M",
+    },
+    currentRoot,
+  });
+  assert.equal(diffNestedResult, "mods/file-editor/file-logic.js");
+
+  // 10. Active tab wins over background shared activeFile
+  const activeTabPrecedenceResult = resolveActiveOpenedFile({
+    spaces: [{ id: "s1", active: true, tabs: [{ id: "t_diff3", active: true, name: "Diff · AGENTS.md" }] }],
+    activeFile: { root: currentRoot, file: "stale-background-file.js" },
+    entries: new Map([["", [{ name: "AGENTS.md", dir: false }]]]),
+    currentRoot,
+  });
+  assert.equal(activeTabPrecedenceResult, "AGENTS.md");
+
+  // 11. Active tab "file-logic.js" resolves to subfolder via openTabs entry
+  const subfolderFromOpenTabsResult = resolveActiveOpenedFile({
+    spaces: [{ id: "s1", active: true, tabs: [{ id: "t_fl", active: true, name: "file-logic.js" }] }],
+    openTabs: {
+      "key_fl": {
+        root: "/Users/me/workspaces/herdr/herdr-file-editor",
+        file: "mods/file-editor/file-logic.js",
+        tabName: "file-logic.js",
+      },
+    },
+    entries: new Map([["", [{ name: "AGENTS.md", dir: false }]]]),
+    currentRoot: "/Users/me/Documents/Workspaces/herdr/herdr-file-editor",
+  });
+  assert.equal(subfolderFromOpenTabsResult, "mods/file-editor/file-logic.js");
+
+  // 12. Active Diff tab "Diff · file-logic.js" resolves to subfolder via activeFile
+  const diffSubfolderFromActiveFileResult = resolveActiveOpenedFile({
+    spaces: [{ id: "s1", active: true, tabs: [{ id: "t_diff_fl", active: true, name: "Diff · file-logic.js" }] }],
+    activeFile: {
+      root: "/Users/me/workspaces/herdr/herdr-file-editor",
+      file: "mods/file-editor/file-logic.js",
+    },
+    entries: new Map([["", [{ name: "AGENTS.md", dir: false }]]]),
+    currentRoot: "/Users/me/Documents/Workspaces/herdr/herdr-file-editor",
+  });
+  assert.equal(diffSubfolderFromActiveFileResult, "mods/file-editor/file-logic.js");
+});
+
+test("parseTabFileName - extracts candidate filename from various tab titles", () => {
+  assert.equal(parseTabFileName("Diff · AGENTS.md"), "AGENTS.md");
+  assert.equal(parseTabFileName("Diff · AGENTS.md (working tree)"), "AGENTS.md");
+  assert.equal(parseTabFileName("Diff · AGENTS.md (9f3c2a1)"), "AGENTS.md");
+  assert.equal(parseTabFileName("Diff - AGENTS.md"), "AGENTS.md");
+  assert.equal(parseTabFileName("Diff: AGENTS.md"), "AGENTS.md");
+  assert.equal(parseTabFileName("AGENTS.md"), "AGENTS.md");
+  assert.equal(parseTabFileName("main.js (mods/file-editor)"), "mods/file-editor/main.js");
+  assert.equal(parseTabFileName("Diff · main.js (mods/file-editor)"), "mods/file-editor/main.js");
+  assert.equal(parseTabFileName("file-logic.js (2)"), "file-logic.js");
+  assert.equal(parseTabFileName("Terminal"), "Terminal");
+  assert.equal(parseTabFileName(""), null);
+  assert.equal(parseTabFileName(null), null);
+});
+
+test("matchCandidateFile - verifies candidate against root entries, marks, and paths", () => {
+  const root = "/Users/me/project";
+  const entries = new Map([
+    ["", [{ name: "AGENTS.md", dir: false }, { name: "mods", dir: true }]],
+    ["mods", [{ name: "file-editor", dir: true }]],
+    ["mods/file-editor", [{ name: "main.js", dir: false }]],
+  ]);
+  const marks = {
+    [`${root}/mods/file-editor/file-logic.js`]: "M",
+  };
+
+  // Direct root match
+  assert.equal(matchCandidateFile("AGENTS.md", root, entries, marks), "AGENTS.md");
+
+  // Explicit relative path
+  assert.equal(matchCandidateFile("mods/file-editor/main.js", root, entries, marks), "mods/file-editor/main.js");
+
+  // Match in marks
+  assert.equal(matchCandidateFile("file-logic.js", root, entries, marks), "mods/file-editor/file-logic.js");
+
+  // Match in openTabs
+  const openTabs = {
+    key1: { file: "mods/file-editor/file-logic.js", tabName: "file-logic.js", root },
+  };
+  assert.equal(matchCandidateFile("file-logic.js", root, entries, {}, openTabs), "mods/file-editor/file-logic.js");
+
+  // Match in activeFile
+  const activeFile = { file: "mods/file-editor/file-logic.js", root };
+  assert.equal(matchCandidateFile("file-logic.js", root, entries, {}, {}, activeFile), "mods/file-editor/file-logic.js");
+
+  // Non-file label without extension
+  assert.equal(matchCandidateFile("Terminal", root, entries, marks), null);
+  assert.equal(matchCandidateFile("Git Graph", root, entries, marks), null);
 });
