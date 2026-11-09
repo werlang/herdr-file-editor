@@ -62,6 +62,9 @@ import {
   normalizeImageZoom,
   stepImageZoom,
   imageZoomPercent,
+  getAncestorFolders,
+  parseTabFileName,
+  resolveActiveOpenedFile,
   FOLDER_ICON_PATH,
 } from "./file-logic.js";
 import { renderMarkdownDocument } from "./markdown-view.js";
@@ -213,6 +216,19 @@ export default class FileEditor extends View {
       this.code.release();
       this.code = null;
     }
+    const active = shared("file-editor.activeFile");
+    if (active && active.file === this.file && active.root === this.root) {
+      setShared("file-editor.activeFile", null);
+    }
+    const openTabsMap = shared("file-editor.openTabs");
+    if (openTabsMap && this.file) {
+      const fileKey = this.root ? `${this.root}/${this.file}` : this.file;
+      if (openTabsMap[fileKey]) {
+        const next = { ...openTabsMap };
+        delete next[fileKey];
+        setShared("file-editor.openTabs", next);
+      }
+    }
   }
 
   /* ========================================================================
@@ -299,6 +315,29 @@ export default class FileEditor extends View {
       }
     }
 
+    if (!tabId) {
+      const f = focused();
+      if (f?.tab) {
+        tabId = f.tab;
+        for (const sp of spaces() || []) {
+          const foundTab = (sp.tabs || []).find((t) => t.id === tabId);
+          if (foundTab?.name) {
+            tabName = foundTab.name;
+            break;
+          }
+        }
+      }
+    }
+
+    if (!tabId) {
+      const activeSpace = (spaces() || []).find((s) => s.active);
+      const activeTab = activeSpace?.tabs?.find((t) => t.active);
+      if (activeTab) {
+        tabId = activeTab.id;
+        tabName = activeTab.name;
+      }
+    }
+
     const updatedOpenTabs = {
       ...openTabsMap,
       [fileKey]: mergeOpenTabEntry(openTabsMap[fileKey], {
@@ -309,6 +348,7 @@ export default class FileEditor extends View {
       }),
     };
     setShared("file-editor.openTabs", updatedOpenTabs);
+    setShared("file-editor.activeFile", { root: this.root, file: this.file });
   }
 
   /**
@@ -960,7 +1000,10 @@ export default class FileEditor extends View {
       .track_focus(this.focusHandle)
       .on_key_down((event, cx) => this.handleKeyDown(event, cx))
       .on_mouse_move((event, cx) => this.rememberViewport(event?.bounds, cx))
-      .on_mouse_down("left", (event, cx) => this.rememberViewport(event?.bounds, cx))
+      .on_mouse_down("left", (event, cx) => {
+        this.rememberViewport(event?.bounds, cx);
+        setShared("file-editor.activeFile", { root: this.root, file: this.file });
+      })
       .child(
         h_flex()
           .h(HEADER_HEIGHT)
@@ -1541,6 +1584,113 @@ export default class FileEditor extends View {
   checkLocation(cx) {
     if (this.key() !== this.context?.key) {
       this.refresh(cx);
+    } else {
+      this.syncActiveFileSelection(cx);
+    }
+  }
+
+  /**
+   * Applies active file selection and ensures all ancestor folders are expanded and loaded.
+   *
+   * @param {string} filePath
+   * @param {import("gpui-kit").ViewContext} cx
+   * @param {boolean} [triggerNotify=true]
+   */
+  applyActiveFileSelection(filePath, cx, triggerNotify = true) {
+    const isNewSelection = this.selectedFile !== filePath;
+    this.selectedFile = filePath;
+
+    const ancestors = getAncestorFolders(filePath);
+    let folderLoaded = false;
+    for (const folder of ancestors) {
+      if (!this.folders.has(folder)) {
+        this.folders.add(folder);
+        if (!this.entries.has(folder) && !this.pending.has(folder)) {
+          const context = this.context;
+          this.pending.add(folder);
+          folderLoaded = true;
+          cx.spawn(async (cx) => {
+            try {
+              await this.loadFolder(folder, context);
+            } catch (e) {
+              if (this.current(context)) this.error = String(e);
+            } finally {
+              if (this.context === context) this.pending.delete(folder);
+              cx.notify();
+            }
+          });
+        }
+      }
+    }
+
+    if (isNewSelection && triggerNotify && !folderLoaded) {
+      cx.notify();
+    }
+  }
+
+  /**
+   * Synchronizes active file selection with currently active or focused tab/pane.
+   * Automatically expands and loads ancestor folders so the selected file is visible.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   * @param {boolean} [triggerNotify=true]
+   */
+  syncActiveFileSelection(cx, triggerNotify = true) {
+    if (!this.root || this.closed) return;
+    const activeOpenedFile = resolveActiveOpenedFile({
+      spaces: spaces(),
+      focused: focused(),
+      panes: panes(),
+      openTabs: shared("file-editor.openTabs"),
+      activeFile: shared("file-editor.activeFile"),
+      currentRoot: this.root,
+      entries: this.entries,
+      marks: this.marks,
+    });
+
+    if (activeOpenedFile) {
+      this.applyActiveFileSelection(activeOpenedFile, cx, triggerNotify);
+      return;
+    }
+
+    // If candidate tab name was not directly resolved, try looking it up via git ls-files
+    const activeSpace = (spaces() || []).find((s) => s.active);
+    const activeTab =
+      activeSpace?.tabs?.find((t) => t.id === focused()?.tab) || activeSpace?.tabs?.find((t) => t.active);
+    if (activeTab?.name) {
+      const candidate = parseTabFileName(activeTab.name);
+      if (candidate && !candidate.includes("/")) {
+        if (this.fileLookupCache?.has(candidate)) {
+          const cachedRel = this.fileLookupCache.get(candidate);
+          if (cachedRel) {
+            this.applyActiveFileSelection(cachedRel, cx, triggerNotify);
+            return;
+          }
+        } else if (!this.fileLookupPending?.has(candidate)) {
+          this.fileLookupPending = this.fileLookupPending || new Set();
+          this.fileLookupCache = this.fileLookupCache || new Map();
+          this.fileLookupPending.add(candidate);
+          const context = this.context;
+          cx.spawn(async (cx) => {
+            try {
+              const r = await exec("git", ["ls-files", "-co", "--exclude-standard", `*${candidate}`], {
+                cwd: this.root,
+                on: this.on,
+              }).catch(() => null);
+              if (r?.code === 0 && r.stdout) {
+                const lines = r.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+                const matched = lines.find((l) => l.endsWith(`/${candidate}`) || l === candidate);
+                if (matched && this.current(context)) {
+                  this.fileLookupCache.set(candidate, matched);
+                  this.applyActiveFileSelection(matched, cx, true);
+                }
+              }
+            } finally {
+              this.fileLookupPending?.delete(candidate);
+            }
+          });
+        }
+      }
     }
   }
 
@@ -1681,8 +1831,13 @@ export default class FileEditor extends View {
           if (status?.code === 0) {
             for (const entry of status.stdout.split("\0").filter(Boolean).slice(0, TOTAL)) {
               const xy = entry.slice(0, 2);
-              marks[`${top.stdout.trim()}/${entry.slice(3)}`] =
-                xy === "??" || xy.includes("A") ? "A" : xy.includes("U") ? "U" : xy.includes("D") ? "D" : "M";
+              const rel = entry.slice(3).trim();
+              const val = xy === "??" || xy.includes("A") ? "A" : xy.includes("U") ? "U" : xy.includes("D") ? "D" : "M";
+              marks[rel] = val;
+              marks[`${cwd}/${rel}`] = val;
+              if (top?.stdout) {
+                marks[`${top.stdout.trim()}/${rel}`] = val;
+              }
             }
           }
         }
@@ -1748,6 +1903,7 @@ export default class FileEditor extends View {
    */
   openFileTab(path, cx) {
     this.selectedFile = path;
+    setShared("file-editor.activeFile", { root: this.root, file: path });
     const activeSpace = spaces().find((s) => s.active);
     const activeTabs = activeSpace?.tabs ?? [];
     const openTabsMap = shared("file-editor.openTabs") || {};
@@ -1890,7 +2046,7 @@ export default class FileEditor extends View {
       if (out.length >= TOTAL) break;
       const path = prefix ? `${prefix}/${entry.name}` : entry.name;
       const open = this.folders.has(path);
-      const mark = this.marks[`${this.root}/${path}`];
+      const mark = this.marks[`${this.root}/${path}`] || this.marks[path];
       const isSelected = this.selectedFile === path;
       const isHovered = this.hoveredPath === path;
 
@@ -1967,10 +2123,11 @@ export default class FileEditor extends View {
   /**
    * Renders the Files pane browser tree and its right-click menu overlay.
    *
-   * @param {import("gpui-kit").ViewContext} _cx
+   * @param {import("gpui-kit").ViewContext} cx
    * @returns {import("gpui-kit").Element}
    */
-  renderFilesPane(_cx) {
+  renderFilesPane(cx) {
+    this.syncActiveFileSelection(cx, false);
     const t = theme();
 
     return v_flex()
