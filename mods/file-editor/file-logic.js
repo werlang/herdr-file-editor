@@ -712,8 +712,9 @@ export function estimateMarkdownHeight(source, viewportWidth = 800) {
     total += estimateBlockHeight(blocks[i], contentWidth);
   }
 
-  // 120px bottom clearance buffer so the last lines are never glued to the edge
-  return total + 120;
+  // 1.35x safety multiplier to absorb UI zoom (e.g. 1.1x zoom + font variations)
+  // plus 160px clearance buffer so trailing content can always be scrolled fully into view
+  return Math.round(total * 1.35) + 160;
 }
 
 /**
@@ -728,12 +729,12 @@ function estimateBlockHeight(block, width) {
   switch (block.type) {
     case "heading": {
       const headingSizes = {
-        1: { sz: 32, lh: 40, extra: 7 }, // size 32, line 40, pb 6 + border 1
-        2: { sz: 24, lh: 30, extra: 7 }, // size 24, line 30, pb 6 + border 1
-        3: { sz: 20, lh: 25, extra: 0 },
-        4: { sz: 16, lh: 20, extra: 0 },
-        5: { sz: 14, lh: 18, extra: 0 },
-        6: { sz: 13.6, lh: 17, extra: 0 },
+        1: { sz: 32, lh: 42, extra: 10 }, // size 32, line 42, pb 6 + border 1
+        2: { sz: 24, lh: 32, extra: 10 }, // size 24, line 32, pb 6 + border 1
+        3: { sz: 20, lh: 26, extra: 4 },
+        4: { sz: 16, lh: 22, extra: 2 },
+        5: { sz: 14, lh: 20, extra: 0 },
+        6: { sz: 13.6, lh: 18, extra: 0 },
       };
       const s = headingSizes[block.level] || headingSizes[6];
       const charsPerLine = Math.max(10, Math.floor(width / (s.sz * 0.55)));
@@ -741,50 +742,50 @@ function estimateBlockHeight(block, width) {
       return lines * s.lh + s.extra;
     }
     case "paragraph": {
-      // 16px body font: chars average ~8.0px in proportional sans fonts
-      const charsPerLine = Math.max(15, Math.floor(width / 8.0));
+      // 16px body font: chars average ~7.8px in proportional sans fonts
+      const charsPerLine = Math.max(12, Math.floor(width / 7.8));
       const lines = Math.max(1, Math.ceil((block.text || "").length / charsPerLine));
-      return lines * 24; // line_height: 24px
+      return lines * 26; // line_height: 24px + inter-paragraph spacing margin
     }
     case "code": {
       const lines = (block.text || "").split("\n").length;
-      return lines * 20 + 32; // line_height 20px + p(16) top/bottom
+      return lines * 22 + 36; // line_height 20px + p(16) top/bottom
     }
     case "hr":
-      return 4;
+      return 12;
     case "quote": {
       // 4px bar + 16px gap
-      const innerWidth = Math.max(100, width - 20);
+      const innerWidth = Math.max(100, width - 24);
       let h = 0;
       const sub = block.blocks || [];
       for (let i = 0; i < sub.length; i++) {
         if (i > 0) h += 16;
         h += estimateBlockHeight(sub[i], innerWidth);
       }
-      return h;
+      return h + 8;
     }
     case "list": {
       // 8px list padding + marker width (12-24) + 8px gap
-      const innerWidth = Math.max(100, width - 36);
+      const innerWidth = Math.max(100, width - 40);
       let h = 0;
       const items = block.items || [];
       for (let i = 0; i < items.length; i++) {
-        if (i > 0) h += 4; // gap(4) between list items
+        if (i > 0) h += 6; // gap(4) between list items + item padding
         let itemH = 0;
         const sub = items[i].blocks || [];
         for (let j = 0; j < sub.length; j++) {
-          if (j > 0) itemH += 8; // gap(8) between blocks within a list item
+          if (j > 0) itemH += 10; // gap(8) between blocks within a list item
           itemH += estimateBlockHeight(sub[j], innerWidth);
         }
-        h += Math.max(24, itemH);
+        h += Math.max(26, itemH);
       }
       return h;
     }
     case "table": {
       const cols = Math.max(1, block.header?.length || 1);
-      const colWidth = Math.max(80, Math.floor(width / cols));
-      // Cell padding: px(13) = 26px total. Font size 14px -> chars average ~7.0px
-      const charsPerLine = Math.max(10, Math.floor((colWidth - 26) / 7.0));
+      const colWidth = Math.max(70, Math.floor(width / cols));
+      // Cell padding: px(13) = 26px total. Font size 14px -> chars average ~7.2px
+      const charsPerLine = Math.max(6, Math.floor((colWidth - 26) / 7.2));
       let h = 0;
       // Header row
       let headerLines = 1;
@@ -792,7 +793,7 @@ function estimateBlockHeight(block, width) {
         const l = Math.max(1, Math.ceil((cell || "").length / charsPerLine));
         if (l > headerLines) headerLines = l;
       }
-      h += headerLines * 20 + 12; // line 20px + py(6)*2
+      h += headerLines * 24 + 16; // line 24px + py(6)*2 + border
 
       // Data rows
       for (const row of (block.rows || [])) {
@@ -801,12 +802,12 @@ function estimateBlockHeight(block, width) {
           const l = Math.max(1, Math.ceil((cell || "").length / charsPerLine));
           if (l > rowLines) rowLines = l;
         }
-        h += rowLines * 20 + 12;
+        h += rowLines * 24 + 16;
       }
-      return h + 2; // Outer border 2px
+      return h + 4; // Outer border
     }
     default:
-      return 24;
+      return 26;
   }
 }
 

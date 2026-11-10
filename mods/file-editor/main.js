@@ -2015,12 +2015,15 @@ export default class FileEditor extends View {
     const mdId = fileElementId("file-editor-markdown", this.fileKey);
     const viewportHeight = this.tabViewport?.height || 600;
     const viewportWidth = this.tabViewport?.width || 800;
+    const bottomPadding = Math.max(160, Math.round(viewportHeight * 0.4));
     const estContentHeight = Math.max(
       viewportHeight,
-      estimateMarkdownHeight(this.preparedText ?? "", viewportWidth)
+      estimateMarkdownHeight(this.preparedText ?? "", viewportWidth) + bottomPadding
     );
     const maxScroll = Math.max(0, estContentHeight - viewportHeight);
-    this.mdScrollY = Math.max(0, Math.min(maxScroll, this.mdScrollY || 0));
+    if (this.preparedText && !this.loading) {
+      this.mdScrollY = Math.max(0, Math.min(maxScroll, this.mdScrollY || 0));
+    }
 
     return div()
       .relative()
@@ -2029,10 +2032,13 @@ export default class FileEditor extends View {
       .min_h(0)
       .overflow_hidden()
       .on_scroll_wheel((event, cx) => {
-        if (event.bounds) {
-          this.rememberViewport(event.bounds, cx);
-        }
-        const delta = event.delta?.y || 0;
+        const delta =
+          event.delta?.y !== 0 && event.delta?.y !== undefined
+            ? event.delta.y
+            : event.delta_lines?.y
+              ? event.delta_lines.y * 24
+              : 0;
+        if (delta === 0) return;
         const next = Math.max(0, Math.min(maxScroll, (this.mdScrollY || 0) - delta));
         if (next !== this.mdScrollY) {
           this.mdScrollY = next;
@@ -2048,7 +2054,7 @@ export default class FileEditor extends View {
           .bg(t.background)
           .px(32)
           .pt(24)
-          .pb(120)
+          .pb(bottomPadding)
           .child(
             v_flex()
               .w_full()
