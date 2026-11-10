@@ -975,6 +975,22 @@ export function setOpenTabPreview(openTabs, fileKey, preview) {
 }
 
 /**
+ * Promotes one file's preview entry to permanent. Kept separate from the view
+ * so the promotion write can be tested without a GPUI harness.
+ *
+ * @param {Record<string, any>} openTabs
+ * @param {string} fileKey
+ * @returns {{ next: Record<string, any>, promoted: boolean }}
+ */
+export function promotePreviewEntry(openTabs, fileKey) {
+  const map = openTabs && typeof openTabs === "object" ? openTabs : {};
+  if (!isPreviewOpenTab(map[fileKey])) {
+    return { next: { ...map }, promoted: false };
+  }
+  return { next: setOpenTabPreview(map, fileKey, false), promoted: true };
+}
+
+/**
  * Collects live preview tabs in a space, resolving each to its real tab id.
  * Used to replace the previous temporary tab when another file is opened in
  * preview mode, and to italicize the file in the Files pane.

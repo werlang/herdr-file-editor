@@ -28,6 +28,7 @@ import {
   mergeOpenTabEntry,
   isPreviewOpenTab,
   setOpenTabPreview,
+  promotePreviewEntry,
   collectPreviewTabs,
   planPreviewOpen,
   fileIconPath,
@@ -781,6 +782,25 @@ test("isPreviewOpenTab - only true for an explicit preview flag", () => {
   assert.equal(isPreviewOpenTab({}), false);
   assert.equal(isPreviewOpenTab(null), false);
   assert.equal(isPreviewOpenTab(undefined), false);
+});
+
+test("promotePreviewEntry - clears the preview flag in a copy", () => {
+  const openTabs = {
+    "/r/a.js": { root: "/r", file: "a.js", tabName: "a.js", tabId: "tab-1", preview: true },
+    "/r/b.js": { root: "/r", file: "b.js", tabName: "b.js", preview: true },
+  };
+  const { next, promoted } = promotePreviewEntry(openTabs, "/r/a.js");
+  assert.equal(promoted, true);
+  assert.equal("preview" in next["/r/a.js"], false);
+  assert.equal(next["/r/a.js"].tabId, "tab-1");
+  assert.equal(openTabs["/r/a.js"].preview, true);
+  assert.equal(next["/r/b.js"].preview, true);
+
+  const already = promotePreviewEntry(openTabs, "/r/b.js");
+  assert.equal(already.promoted, true);
+  const permanent = promotePreviewEntry(already.next, "/r/b.js");
+  assert.equal(permanent.promoted, false);
+  assert.equal("preview" in permanent.next["/r/b.js"], false);
 });
 
 test("collectPreviewTabs - finds live previews for one root and preserves the tab id", () => {

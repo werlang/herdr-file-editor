@@ -56,6 +56,7 @@ import {
   mergeOpenTabEntry,
   isPreviewOpenTab,
   setOpenTabPreview,
+  promotePreviewEntry,
   collectPreviewTabs,
   planPreviewOpen,
   fileIconPath,
@@ -597,6 +598,21 @@ export default class FileEditor extends View {
   }
 
   /**
+   * Whether another pane was split into this file's tab. A preview with a
+   * split terminal or a second editor must become permanent: closing the tab
+   * would take that unrelated work with it.
+   *
+   * @returns {boolean}
+   */
+  hasExtraPanes() {
+    if (!this.tabId) return false;
+    const tab = (spaces() || [])
+      .flatMap((space) => space.tabs || [])
+      .find((candidate) => candidate.id === this.tabId);
+    return typeof tab?.panes === "number" && tab.panes > 1;
+  }
+
+  /**
    * Makes this tab permanent. Called as soon as the file gains edits, matching
    * VS Code: a preview tab never holds unsaved work that another preview could
    * replace.
@@ -604,8 +620,8 @@ export default class FileEditor extends View {
   promotePreviewTab() {
     if (!this.fileKey) return;
     const openTabsMap = shared("file-editor.openTabs") || {};
-    if (!isPreviewOpenTab(openTabsMap[this.fileKey])) return;
-    setShared("file-editor.openTabs", setOpenTabPreview(openTabsMap, this.fileKey, false));
+    const { next, promoted } = promotePreviewEntry(openTabsMap, this.fileKey);
+    if (promoted) setShared("file-editor.openTabs", next);
   }
 
   /**
@@ -688,6 +704,11 @@ export default class FileEditor extends View {
 
     // A preview tab with unsaved edits must survive the next preview open.
     if (this.dirty && this.isPreviewTab()) {
+      this.promotePreviewTab();
+      changed = true;
+    }
+    // Splitting another pane into the preview makes the tab a real workspace.
+    if (this.isPreviewTab() && this.hasExtraPanes()) {
       this.promotePreviewTab();
       changed = true;
     }
