@@ -66,6 +66,7 @@ import {
   findTargetEmptyPane,
   planFilePlacement,
   estimateMarkdownHeight,
+  buildSplitPaneRequest,
 } from "../mods/file-editor/file-logic.js";
 
 test("splitPathInfo - extracts base, dir, and ext correctly", () => {
@@ -1929,4 +1930,45 @@ test("estimateMarkdownHeight - handles empty, basic, tables, and prevents clippi
 `;
   const tableH = estimateMarkdownHeight(tableMd, 800);
   assert.ok(tableH > 1400, `Estimated height (${tableH}) should exceed 1400px`);
+});
+
+test("buildSplitPaneRequest - creates split request for new-pane or terminal", () => {
+  // With chooser (default when installed)
+  const reqRight = buildSplitPaneRequest("right", "p-current", "sp-1", "/work/repo", true);
+  assert.deepEqual(reqRight, {
+    direction: "right",
+    pane: "p-current",
+    mod: "new-pane",
+    props: {
+      direction: "right",
+      space: "sp-1",
+      folder: "/work/repo",
+    },
+  });
+
+  // Down direction
+  const reqDown = buildSplitPaneRequest("down", "p-current", "sp-1", "/work/repo", true);
+  assert.deepEqual(reqDown, {
+    direction: "down",
+    pane: "p-current",
+    mod: "new-pane",
+    props: {
+      direction: "down",
+      space: "sp-1",
+      folder: "/work/repo",
+    },
+  });
+
+  // Without chooser (standard terminal split)
+  const reqNoChooser = buildSplitPaneRequest("right", "p-current", "sp-1", "/work/repo", false);
+  assert.deepEqual(reqNoChooser, {
+    direction: "right",
+    pane: "p-current",
+  });
+
+  // Defaults
+  const reqDefaults = buildSplitPaneRequest();
+  assert.deepEqual(reqDefaults, {
+    direction: "right",
+  });
 });

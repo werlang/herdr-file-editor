@@ -47,6 +47,7 @@ Instead of opening raw code files inside the narrow Files panel, `file-editor` o
     - `Preview` / `Code` segmented icon switcher (`eye.svg` and `code.svg`) for Markdown and SVG files.
     - `Zoom Controls`: `−` / percentage / `+` for raster images and SVG previews; the percentage resets to fit.
     - `Wrap Toggle`: `wrap.svg` icon button toggling soft line wrapping on and off (via button or `Alt+Z` / `Opt+Z`), remembered in shared settings (`file-editor.wrap`).
+    - `Split Actions`: `split-right.svg` and `split-down.svg` icon buttons splitting the editor right (also `Cmd+\` / `Ctrl+\`) or down, opening the `new-pane` chooser.
     - `Copy Button`: `copy.svg` button copying file text to the clipboard with an instant toast notification.
     - `Refresh Button`: `refresh.svg` button reloading file contents directly from disk.
 - **Live Disk Watching & Polling**:

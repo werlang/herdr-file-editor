@@ -89,6 +89,7 @@ import {
   findTargetEmptyPane,
   planFilePlacement,
   estimateMarkdownHeight,
+  buildSplitPaneRequest,
 } from "./file-logic.js";
 import { renderMarkdownDocument } from "./markdown-view.js";
 
@@ -475,6 +476,9 @@ export default class FileEditor extends View {
     this.registerOpenTab(p);
     if (this.dirty) this.promotePreviewTab();
 
+    this.withChooser = false;
+    this.probeChooser(cx);
+
     this.loadFile(cx);
     this.watchTab(this.root, cx);
 
@@ -482,6 +486,8 @@ export default class FileEditor extends View {
     cx.timer.every(500, (cx) => this.syncTabConfig(cx));
     // Poll for external file modifications as a safety net (e.g. agent edits, remote SSH, missed watcher events)
     cx.timer.every(1500, (cx) => this.checkDiskChanges(cx));
+    // Probe optional new-pane mod periodically
+    cx.timer.every(15000, (cx) => this.probeChooser(cx));
   }
 
   /**
@@ -943,8 +949,59 @@ export default class FileEditor extends View {
   }
 
   /**
-   * Keyboard shortcut listener on the tab container for saving with Cmd+S / Ctrl+S
-   * and toggling soft wrap with Alt+Z / Opt+Z.
+   * Probes whether the optional new-pane chooser mod is installed in Herdr.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  probeChooser(cx) {
+    cx.spawn(async (cx) => {
+      try {
+        const text = await readTextFile(`${appHome()}/mods/new-pane/mod.json`);
+        this.withChooser = typeof text === "string";
+      } catch {
+        this.withChooser = false;
+      }
+      cx.notify();
+    });
+  }
+
+  /**
+   * Resolves the pane ID that hosts this file editor instance.
+   *
+   * @returns {string | null}
+   */
+  findCurrentPaneId() {
+    const pId = props()?.pane;
+    if (pId) return pId;
+    const activeSpace = (spaces() || []).find((s) => s.active);
+    const activeTab = activeSpace?.tabs?.find((t) => t.active);
+    const allPanes = panes() || [];
+    const found = allPanes.find((p) => {
+      if (p.mod !== "file-editor") return false;
+      if (activeTab && p.tab !== activeTab.id) return false;
+      return p.props?.file === this.file || p.title === splitPathInfo(this.file).base;
+    });
+    return found?.pane ?? null;
+  }
+
+  /**
+   * Splits this file editor pane to the right or down.
+   *
+   * @param {"right" | "down"} [direction="right"]
+   * @param {import("gpui-kit").ViewContext} [cx]
+   */
+  splitPane(direction = "right", cx) {
+    const paneId = this.findCurrentPaneId();
+    const activeSpace = (spaces() || []).find((s) => s.active);
+    const req = buildSplitPaneRequest(direction, paneId, activeSpace?.id, this.root, this.withChooser);
+    run("pane.split", req);
+    this.promotePreviewTab();
+    if (cx) cx.notify();
+  }
+
+  /**
+   * Keyboard shortcut listener on the tab container for saving with Cmd+S / Ctrl+S,
+   * splitting with Cmd+\ / Ctrl+\, and toggling soft wrap with Alt+Z / Opt+Z.
    *
    * @param {import("gpui-kit").KeyEvent} event
    * @param {import("gpui-kit").ViewContext} cx
@@ -958,6 +1015,17 @@ export default class FileEditor extends View {
     if (isSave && !event.is_held) {
       cx.stop_propagation();
       this.saveFile(cx);
+      return;
+    }
+
+    const isSplit =
+      event.keystroke === "cmd-\\" ||
+      event.keystroke === "ctrl-\\" ||
+      ((event.modifiers?.platform || event.modifiers?.control) && (event.key === "\\" || event.key === "|"));
+
+    if (isSplit && !event.is_held) {
+      cx.stop_propagation();
+      this.splitPane("right", cx);
       return;
     }
 
@@ -1406,6 +1474,8 @@ export default class FileEditor extends View {
       .on_mouse_down("left", (event, cx) => {
         this.rememberViewport(event?.bounds, cx);
         setShared("file-editor.activeFile", { root: this.root, file: this.file });
+        const paneId = this.findCurrentPaneId();
+        if (paneId) run("pane.focus", { pane: paneId });
       })
       .child(
         h_flex()
@@ -1599,6 +1669,38 @@ export default class FileEditor extends View {
                 .on_click((_e, cx) => this.setWrap(!this.wrap, cx))
                 .child(svg("mods/file-editor/wrap.svg").size(12))
             )
+          )
+          .child(
+            h_flex()
+              .id("file-editor-split-right")
+              .flex_none()
+              .w(24)
+              .h(24)
+              .items_center()
+              .justify_center()
+              .rounded(4)
+              .cursor_pointer()
+              .hover((s) => s.bg(t.hover))
+              .text_color(t.dim)
+              .tooltip("Split right (Cmd+\\)")
+              .on_click((_e, cx) => this.splitPane("right", cx))
+              .child(svg("mods/file-editor/split-right.svg").size(13))
+          )
+          .child(
+            h_flex()
+              .id("file-editor-split-down")
+              .flex_none()
+              .w(24)
+              .h(24)
+              .items_center()
+              .justify_center()
+              .rounded(4)
+              .cursor_pointer()
+              .hover((s) => s.bg(t.hover))
+              .text_color(t.dim)
+              .tooltip("Split down")
+              .on_click((_e, cx) => this.splitPane("down", cx))
+              .child(svg("mods/file-editor/split-down.svg").size(13))
           )
           .child(
             h_flex()
