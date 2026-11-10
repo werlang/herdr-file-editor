@@ -654,31 +654,43 @@ export default class FileEditor extends View {
     // Resolve tabId if not discovered at mount time
     if (!this.tabId) {
       const allTabs = (spaces() || []).flatMap((sp) => sp.tabs || []);
-      const focusedTabId = focused()?.tab;
-      const focusedTab = focusedTabId ? allTabs.find((t) => t.id === focusedTabId) : null;
-      let matchedTab = null;
-      if (focusedTab && isTabMatchingFile(focusedTab.name, this.file, this.root)) {
-        matchedTab = focusedTab;
-      } else {
-        const activeSpace = (spaces() || []).find((s) => s.active);
-        const activeTab = activeSpace?.tabs?.find((t) => t.active);
-        if (activeTab && isTabMatchingFile(activeTab.name, this.file, this.root)) {
-          matchedTab = activeTab;
-        }
+      const activeSpace = (spaces() || []).find((s) => s.active);
+      const activeSpaceTabs = activeSpace?.tabs ?? [];
+      const openTabsMap = shared("file-editor.openTabs") || {};
+      // The parent pane records the id a moment after tab.new; recovering it
+      // here matters when this view mounts before spaces() lists the tab and
+      // the user has already switched away. Restrict the recovery to the
+      // active space so a same-file entry owned by another space cannot bind
+      // this view to the wrong tab.
+      const recordedTabId = openTabsMap[this.fileKey]?.tabId;
+      if (recordedTabId && activeSpaceTabs.some((tab) => tab.id === recordedTabId)) {
+        this.tabId = recordedTabId;
       }
-      if (matchedTab) {
-        this.tabId = matchedTab.id;
-        const fileKey = this.fileKey;
-        const openTabsMap = shared("file-editor.openTabs") || {};
-        if (openTabsMap[fileKey] && openTabsMap[fileKey].tabId !== this.tabId) {
-          setShared("file-editor.openTabs", {
-            ...openTabsMap,
-            [fileKey]: {
-              ...openTabsMap[fileKey],
-              tabId: this.tabId,
-              tabName: matchedTab.name,
-            },
-          });
+
+      if (!this.tabId) {
+        const focusedTabId = focused()?.tab;
+        const focusedTab = focusedTabId ? allTabs.find((t) => t.id === focusedTabId) : null;
+        let matchedTab = null;
+        if (focusedTab && isTabMatchingFile(focusedTab.name, this.file, this.root)) {
+          matchedTab = focusedTab;
+        } else {
+          const activeTab = activeSpaceTabs.find((t) => t.active);
+          if (activeTab && isTabMatchingFile(activeTab.name, this.file, this.root)) {
+            matchedTab = activeTab;
+          }
+        }
+        if (matchedTab) {
+          this.tabId = matchedTab.id;
+          if (openTabsMap[this.fileKey] && openTabsMap[this.fileKey].tabId !== this.tabId) {
+            setShared("file-editor.openTabs", {
+              ...openTabsMap,
+              [this.fileKey]: {
+                ...openTabsMap[this.fileKey],
+                tabId: this.tabId,
+                tabName: matchedTab.name,
+              },
+            });
+          }
         }
       }
     }
