@@ -54,6 +54,10 @@ import {
   resolveFileTab,
   isTabMatchingFile,
   mergeOpenTabEntry,
+  isPreviewOpenTab,
+  setOpenTabPreview,
+  collectPreviewTabs,
+  planPreviewOpen,
   fileIconPath,
   isLightColor,
   isImageFile,
@@ -462,6 +466,7 @@ export default class FileEditor extends View {
 
     // Register this open tab in shared state
     this.registerOpenTab(p);
+    if (this.dirty) this.promotePreviewTab();
 
     this.loadFile(cx);
     this.watchTab(this.root, cx);
@@ -578,6 +583,32 @@ export default class FileEditor extends View {
   }
 
   /**
+   * Whether this file tab is currently a disposable preview tab.
+   *
+   * The flag lives in shared("file-editor.openTabs") so the tab bar and the
+   * Files pane can style the same state. Reading it on demand keeps this view
+   * correct when the tab bar promotes the tab.
+   *
+   * @returns {boolean}
+   */
+  isPreviewTab() {
+    if (!this.fileKey) return false;
+    return isPreviewOpenTab((shared("file-editor.openTabs") || {})[this.fileKey]);
+  }
+
+  /**
+   * Makes this tab permanent. Called as soon as the file gains edits, matching
+   * VS Code: a preview tab never holds unsaved work that another preview could
+   * replace.
+   */
+  promotePreviewTab() {
+    if (!this.fileKey) return;
+    const openTabsMap = shared("file-editor.openTabs") || {};
+    if (!isPreviewOpenTab(openTabsMap[this.fileKey])) return;
+    setShared("file-editor.openTabs", setOpenTabPreview(openTabsMap, this.fileKey, false));
+  }
+
+  /**
    * Synchronizes active EditorState with theme, font settings, and shared wrap.
    *
    * @param {import("gpui-kit").ViewContext} cx
@@ -655,6 +686,12 @@ export default class FileEditor extends View {
       }
     }
 
+    // A preview tab with unsaved edits must survive the next preview open.
+    if (this.dirty && this.isPreviewTab()) {
+      this.promotePreviewTab();
+      changed = true;
+    }
+
     if (changed) {
       cx.notify();
     }
@@ -698,6 +735,7 @@ export default class FileEditor extends View {
         if (!hadUnsavedEdits) {
           this.dirty = false;
         }
+        if (this.dirty) this.promotePreviewTab();
 
         if (this.isSvg) this.loadImage(cx);
 
@@ -851,6 +889,7 @@ export default class FileEditor extends View {
     let notifyNeeded = false;
     if (this.dirty !== newDirty) {
       this.dirty = newDirty;
+      if (newDirty) this.promotePreviewTab();
       notifyNeeded = true;
     }
     if (this.lineCount !== newLineCount) {
@@ -1312,6 +1351,7 @@ export default class FileEditor extends View {
       ? `Image · ${(base.split(".").pop() || "").toUpperCase()}`
       : `${this.lineCount} line${this.lineCount === 1 ? "" : "s"} · ${langLabel}`;
     const isCodeView = !this.isImage && (!hasPreview || this.viewMode === "code");
+    const preview = this.isPreviewTab();
     const tabId = fileElementId("file-editor-tab", this.fileKey);
 
     return v_flex()
@@ -1344,7 +1384,16 @@ export default class FileEditor extends View {
               .items_center()
               .gap(6)
               .min_w(0)
-              .child(div().min_w(0).font_semibold().text_size(12.5).truncate().child(base))
+              .child(
+                div()
+                  .min_w(0)
+                  .font_semibold()
+                  .text_size(12.5)
+                  .truncate()
+                  .when(preview, (el) => el.italic())
+                  .when(preview, (el) => el.tooltip("Preview tab — double-click the file in the Explorer to keep it open"))
+                  .child(base)
+              )
               .when(this.dirty, (el) =>
                 el.child(
                   div()
@@ -1924,6 +1973,8 @@ export default class FileEditor extends View {
     this.marks = {};
     this.selectedFile = null;
     this.hoveredPath = null;
+    this.previewFiles = new Set();
+    this.pendingFileOpen = null;
     this.contextMenu = null;
     this.renameDialog = null;
     this.deleteDialog = null;
@@ -2312,35 +2363,99 @@ export default class FileEditor extends View {
   /**
    * Opens a file in its own Herdr tab, reusing an existing tab or creating a new one.
    *
+   * A single click opens the file as a disposable preview tab. An explicit open
+   * (double-clicking the file or its tab, or the context menu action) promotes
+   * it to a permanent tab. Opening another preview replaces the previous
+   * temporary tab in the same space, matching VS Code's preview tabs.
+   *
    * @param {string} path
    * @param {import("gpui-kit").ViewContext} cx
+   * @param {{ permanent?: boolean }} [options={}]
    */
-  openFileTab(path, cx) {
-    this.selectedFile = path;
-    setShared("file-editor.activeFile", { root: this.root, file: path });
+  openFileTab(path, cx, options = {}) {
+    const permanent = options?.permanent === true;
     const activeSpace = spaces().find((s) => s.active);
     const activeTabs = activeSpace?.tabs ?? [];
+    const allTabs = (spaces() || []).flatMap((space) => space.tabs || []);
     const openTabsMap = shared("file-editor.openTabs") || {};
+    const fileKey = toFileKey(this.root, path);
 
-    const { existingTabId, tabName, updatedOpenTabs } = resolveFileTab(path, this.root, activeTabs, openTabsMap);
-    setShared("file-editor.openTabs", updatedOpenTabs);
+    this.selectedFile = path;
+    setShared("file-editor.activeFile", { root: this.root, file: path });
+
+    // The two click events of a double-click arrive while the first tab is
+    // still being created. Promote that pending preview instead of opening a
+    // second tab.
+    const pending = this.pendingFileOpen;
+    if (pending && pending.fileKey === fileKey && Date.now() - pending.at < 600) {
+      if (permanent) {
+        setShared("file-editor.openTabs", setOpenTabPreview(openTabsMap, fileKey, false));
+      }
+      cx.notify();
+      return;
+    }
+
+    const { existingTabId, tabName, updatedOpenTabs } = resolveFileTab(
+      path,
+      this.root,
+      activeTabs,
+      openTabsMap,
+      allTabs
+    );
 
     if (existingTabId) {
+      const nextOpenTabs = permanent
+        ? setOpenTabPreview(updatedOpenTabs, fileKey, false)
+        : updatedOpenTabs;
+      setShared("file-editor.openTabs", nextOpenTabs);
       run("tab.select", { id: existingTabId });
       cx.notify();
       return;
     }
 
+    let nextOpenTabs = { ...updatedOpenTabs };
+    let closeTabIds = [];
+    let deferredCloseTabIds = [];
+    let replaceIndex = null;
+
+    if (!permanent) {
+      const editorTabIds = new Set(
+        (panes() || []).filter((pane) => pane.mod === "file-editor").map((pane) => pane.tab)
+      );
+      const plan = planPreviewOpen(
+        updatedOpenTabs,
+        activeTabs,
+        this.root,
+        fileKey,
+        shared("tabs.pinned") ?? [],
+        editorTabIds
+      );
+      nextOpenTabs = plan.nextOpenTabs;
+      closeTabIds = plan.closeTabIds;
+      deferredCloseTabIds = plan.deferredCloseTabIds;
+      replaceIndex = plan.replaceIndex;
+      for (const tabId of closeTabIds) run("tab.close", { id: tabId });
+    }
+
+    nextOpenTabs = setOpenTabPreview(nextOpenTabs, fileKey, !permanent);
+    setShared("file-editor.openTabs", nextOpenTabs);
+    this.pendingFileOpen = { fileKey, at: Date.now() };
+
     const tabProps = { folder: this.root, file: path };
     if (this.on) tabProps.on = this.on;
     run("tab.new", { name: tabName, mod: "file-editor", props: tabProps });
 
+    // The replacement now exists, so closing the old preview cannot take the
+    // whole space with it.
+    for (const tabId of deferredCloseTabIds) run("tab.close", { id: tabId });
+
     cx.timer?.after?.(60, () => {
+      if (this.closed) return;
+      if (this.pendingFileOpen?.fileKey === fileKey) this.pendingFileOpen = null;
       const activeSp = (spaces() || []).find((s) => s.active);
       const activeTab = (activeSp?.tabs || []).find((t) => t.active);
       if (activeTab?.id && isTabMatchingFile(activeTab.name, path, this.root)) {
         const currentTabs = shared("file-editor.openTabs") || {};
-        const fileKey = this.root ? `${this.root}/${path}` : path;
         if (currentTabs[fileKey]) {
           setShared("file-editor.openTabs", {
             ...currentTabs,
@@ -2350,6 +2465,15 @@ export default class FileEditor extends View {
               tabName: activeTab.name || tabName,
             },
           });
+        }
+        // Reuse the replaced preview's position instead of appending the new
+        // tab at the end of the strip.
+        if (replaceIndex !== null && typeof activeTab.index === "number") {
+          const lastIndex = Math.max(1, activeSp?.tabs?.length ?? 1);
+          const targetIndex = Math.max(1, Math.min(replaceIndex, lastIndex));
+          if (activeTab.index !== targetIndex) {
+            run("tab.move", { id: activeTab.id, index: targetIndex });
+          }
         }
       }
     });
@@ -3013,7 +3137,7 @@ export default class FileEditor extends View {
           .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
           .on_mouse_down("right", (_e, cx) => cx.stop_propagation())
           .when(!menu.dir, (el) =>
-            el.child(item("files-menu-open", "Open file", "mods/file-editor/file.svg", (cx) => this.openFileTab(menu.path, cx)))
+            el.child(item("files-menu-open", "Open file", "mods/file-editor/file.svg", (cx) => this.openFileTab(menu.path, cx, { permanent: true })))
           )
           .child(item("files-menu-copy", "Copy path", "mods/file-editor/copy.svg", (cx) => this.copyPathToClipboard(menu.path, menu.dir, cx)))
           .child(item("files-menu-rename", "Rename", "mods/file-editor/rename.svg", (cx) => this.openRenameDialog(menu.path, menu.dir, cx)))
@@ -3043,6 +3167,7 @@ export default class FileEditor extends View {
       const mark = this.marks[`${this.root}/${path}`] || this.marks[path];
       const isSelected = this.selectedFile === path;
       const isHovered = this.hoveredPath === path;
+      const isPreview = !entry.dir && this.previewFiles?.has(path);
 
       out.push(
         h_flex()
@@ -3067,7 +3192,10 @@ export default class FileEditor extends View {
             }
             cx.notify();
           })
-          .on_click((_e, cx) => (entry.dir ? this.toggle(path, cx) : this.openFileTab(path, cx)))
+          .on_click((event, cx) => {
+            if (entry.dir) this.toggle(path, cx);
+            else this.openFileTab(path, cx, { permanent: event.click_count >= 2 });
+          })
           .child(
             entry.dir
               ? svg(`mods/file-editor/chevron-${open ? "down" : "right"}.svg`).size(12).flex_none().text_color(t.dim)
@@ -3079,7 +3207,14 @@ export default class FileEditor extends View {
               .min_w(0)
               .gap(6)
               .items_center()
-              .child(div().min_w(0).truncate().child(entry.name))
+              .child(
+                div()
+                  .min_w(0)
+                  .truncate()
+                  .when(isPreview, (el) => el.italic())
+                  .when(isPreview, (el) => el.tooltip("Preview — double-click to keep this file open"))
+                  .child(entry.name)
+              )
               .when(isHovered, (el) =>
                 el.child(
                   h_flex()
@@ -3123,6 +3258,15 @@ export default class FileEditor extends View {
   renderFilesPane(cx) {
     this.syncActiveFileSelection(cx, false);
     const t = theme();
+    const activeTabs = (spaces() || []).find((s) => s.active)?.tabs ?? [];
+    const editorTabIds = new Set(
+      (panes() || []).filter((pane) => pane.mod === "file-editor").map((pane) => pane.tab)
+    );
+    this.previewFiles = new Set(
+      collectPreviewTabs(shared("file-editor.openTabs"), activeTabs, this.root, null, { editorTabIds })
+        .map((preview) => preview.entry?.file)
+        .filter((file) => typeof file === "string" && file.length > 0)
+    );
 
     return v_flex()
       .id("files")

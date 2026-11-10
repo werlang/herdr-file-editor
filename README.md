@@ -14,6 +14,10 @@ Instead of opening raw code files inside the narrow Files panel, `file-editor` o
 - **Tab Deduplication & Disambiguation**:
   - Clicking a file reuses an existing open tab for that file instead of creating duplicate tabs.
   - Automatically disambiguates files with identical names from different directories (`dir/base`).
+- **VS Code-style Preview Tabs**:
+  - A single click in the Explorer opens a temporary preview tab, shown with an italic name in the file tree and editor header; with the optional `tabs-ref` tab bar, the tab label is italic too.
+  - Double-clicking the file in the Explorer promotes it to a permanent tab (normal name). With `tabs-ref`, double-clicking the tab also promotes it instead of renaming.
+  - Opening another file in preview mode replaces the previous temporary tab. Editing a preview, pinning it, or splitting another pane into its tab promotes it automatically, so unsaved work and terminals are never replaced.
 - **Interactive File Editing & Saving**:
   - Full-featured in-place editing for code, configuration, Markdown, and SVG files in Code view.
   - Real-time dirty state tracking with an accent unsaved-changes indicator (`●`) beside the filename and updated line counts as you type.
@@ -75,7 +79,7 @@ In your personal Herdr layout clone (e.g. `~/.config/herdr-app/layouts/my-layout
 }
 ```
 
-This replaces the default `files` panel with `file-editor`. The directory tree behaves identically, but clicking any file opens it in a dedicated tab rather than taking over the sidebar.
+This replaces the default `files` panel with `file-editor`. The directory tree behaves identically, but clicking any file opens it in a dedicated tab rather than taking over the sidebar. Single-click opens a temporary preview tab (italic); double-click the file or its tab keeps it open permanently.
 
 ### Open Files Browser in a Split Pane
 

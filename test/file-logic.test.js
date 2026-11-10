@@ -26,6 +26,10 @@ import {
   resolveFileTab,
   isTabMatchingFile,
   mergeOpenTabEntry,
+  isPreviewOpenTab,
+  setOpenTabPreview,
+  collectPreviewTabs,
+  planPreviewOpen,
   fileIconPath,
   isLightColor,
   isImageFile,
@@ -681,6 +685,25 @@ test("resolveFileTab - manages cross-space tabs, strict tabId matching, and iter
   assert.equal(rOffByOne.tabName, "README.md");
 });
 
+test("resolveFileTab - preserves same-root entries whose tab is live in another space", () => {
+  const root = "/repo";
+  const openTabs = {
+    "/repo/a.js": { root, file: "a.js", tabName: "a.js", tabId: "tab-a", preview: true },
+  };
+  const spaceOneTabs = [{ id: "tab-a", name: "a.js", settled: false, active: true }];
+  const spaceTwoTabs = [{ id: "tab-b", name: "b.js", settled: false, active: true }];
+
+  // Opening b.js in space 2 must not prune a.js, whose tab is alive in space 1.
+  const result = resolveFileTab("b.js", root, spaceTwoTabs, openTabs, [...spaceOneTabs, ...spaceTwoTabs]);
+  assert.equal(result.updatedOpenTabs["/repo/a.js"].tabId, "tab-a");
+  assert.equal(result.updatedOpenTabs["/repo/a.js"].preview, true);
+  assert.equal(Boolean(result.updatedOpenTabs["/repo/b.js"]), true);
+
+  // Once the tab in the other space is gone, the entry is pruned normally.
+  const pruned = resolveFileTab("b.js", root, spaceTwoTabs, result.updatedOpenTabs, spaceTwoTabs);
+  assert.equal("/repo/a.js" in pruned.updatedOpenTabs, false);
+});
+
 test("isTabMatchingFile - accurately validates tab names against file paths", () => {
   const root = "/Users/pablowerlang/myrepo";
   assert.equal(isTabMatchingFile("README.md", "README.md", root), true);
@@ -719,6 +742,149 @@ test("mergeOpenTabEntry - falls back to basename and omits tabId when nothing is
   const merged = mergeOpenTabEntry(undefined, { root: "/r", file: "src/main.js", tabName: null, tabId: null });
   assert.deepEqual(merged, { root: "/r", file: "src/main.js", tabName: "main.js" });
   assert.equal("tabId" in merged, false);
+});
+
+test("mergeOpenTabEntry - preserves a preview flag until the tab is promoted", () => {
+  const existing = { root: "/r", file: "a.js", tabName: "a.js", tabId: "tab-1", preview: true };
+  const kept = mergeOpenTabEntry(existing, { root: "/r", file: "a.js", tabName: "a.js", tabId: "tab-1" });
+  assert.equal(kept.preview, true);
+
+  const promoted = mergeOpenTabEntry(existing, { root: "/r", file: "a.js", tabName: "a.js", tabId: "tab-1", preview: false });
+  assert.equal("preview" in promoted, false);
+});
+
+test("setOpenTabPreview - sets and clears the temporary flag without touching other entries", () => {
+  const openTabs = {
+    "/r/a.js": { root: "/r", file: "a.js", tabName: "a.js", tabId: "tab-1" },
+    "/r/b.js": { root: "/r", file: "b.js", tabName: "b.js", tabId: "tab-2", preview: true },
+  };
+
+  const marked = setOpenTabPreview(openTabs, "/r/a.js", true);
+  assert.equal(marked["/r/a.js"].preview, true);
+  assert.equal(marked["/r/a.js"].tabId, "tab-1");
+  assert.equal(marked["/r/b.js"].preview, true);
+  // The source map is not mutated.
+  assert.equal("preview" in openTabs["/r/a.js"], false);
+
+  const cleared = setOpenTabPreview(marked, "/r/b.js", false);
+  assert.equal("preview" in cleared["/r/b.js"], false);
+  assert.equal(cleared["/r/b.js"].tabId, "tab-2");
+
+  // Missing keys are left alone rather than creating partial entries.
+  const missing = setOpenTabPreview(openTabs, "/r/missing.js", true);
+  assert.equal("/r/missing.js" in missing, false);
+});
+
+test("isPreviewOpenTab - only true for an explicit preview flag", () => {
+  assert.equal(isPreviewOpenTab({ preview: true }), true);
+  assert.equal(isPreviewOpenTab({ preview: false }), false);
+  assert.equal(isPreviewOpenTab({}), false);
+  assert.equal(isPreviewOpenTab(null), false);
+  assert.equal(isPreviewOpenTab(undefined), false);
+});
+
+test("collectPreviewTabs - finds live previews for one root and preserves the tab id", () => {
+  const openTabs = {
+    "/r/a.js": { root: "/r", file: "a.js", tabName: "a.js", tabId: "tab-1", preview: true },
+    "/r/b.js": { root: "/r", file: "b.js", tabName: "b.js", preview: true },
+    "/r/c.js": { root: "/r", file: "c.js", tabName: "c.js", tabId: "tab-3" },
+    "/other/d.js": { root: "/other", file: "d.js", tabName: "d.js", tabId: "tab-4", preview: true },
+    "/r/e.js": { root: "/r", file: "e.js", tabName: "e.js", tabId: "tab-closed", preview: true },
+  };
+  const activeTabs = [
+    { id: "tab-1", name: "a.js", index: 1, settled: false },
+    { id: "tab-2", name: "b.js", index: 2, settled: false },
+    { id: "tab-3", name: "c.js", index: 3, settled: false },
+    { id: "tab-4", name: "d.js", index: 4, settled: false },
+    { id: "tab-settled", name: "f.js", index: 5, settled: true },
+  ];
+
+  const found = collectPreviewTabs(openTabs, activeTabs, "/r/");
+  assert.deepEqual(
+    found.map((preview) => [preview.key, preview.tabId, preview.tabName]),
+    [
+      ["/r/a.js", "tab-1", "a.js"],
+      ["/r/b.js", "tab-2", "b.js"],
+    ]
+  );
+
+  const withoutA = collectPreviewTabs(openTabs, activeTabs, "/r", "/r/a.js");
+  assert.deepEqual(withoutA.map((preview) => preview.key), ["/r/b.js"]);
+
+  // Settled tabs and closed ids never count as replaceable live previews.
+  assert.deepEqual(collectPreviewTabs({ "/r/f.js": { root: "/r", file: "f.js", tabName: "f.js", tabId: "tab-settled", preview: true } }, activeTabs, "/r"), []);
+  assert.deepEqual(collectPreviewTabs({ "/r/e.js": openTabs["/r/e.js"] }, activeTabs, "/r"), []);
+});
+
+test("collectPreviewTabs - stale ids never fall back to a colliding name", () => {
+  const openTabs = {
+    "/r/a.js": { root: "/r", file: "a.js", tabName: "a.js", tabId: "closed-id", preview: true },
+  };
+  // A terminal (or any other tab) happens to own the old name now.
+  const activeTabs = [{ id: "term-1", name: "a.js", index: 1, settled: false }];
+  assert.deepEqual(collectPreviewTabs(openTabs, activeTabs, "/r"), []);
+
+  // The name fallback only runs while the id has not been recorded yet.
+  const fresh = { "/r/a.js": { root: "/r", file: "a.js", tabName: "a.js", preview: true } };
+  const found = collectPreviewTabs(fresh, activeTabs, "/r");
+  assert.deepEqual(found.map((preview) => preview.tabId), ["term-1"]);
+});
+
+test("collectPreviewTabs - name fallback requires a live file-editor pane", () => {
+  const openTabs = {
+    "/r/a.js": { root: "/r", file: "a.js", tabName: "a.js", preview: true },
+  };
+  const activeTabs = [
+    { id: "tab-editor", name: "a.js", index: 1, settled: false },
+    { id: "tab-term", name: "a.js (2)", index: 2, settled: false },
+  ];
+  const editorOnly = collectPreviewTabs(openTabs, activeTabs, "/r", null, {
+    editorTabIds: ["tab-editor"],
+  });
+  assert.deepEqual(editorOnly.map((preview) => preview.tabId), ["tab-editor"]);
+
+  // A matching name on a terminal tab must not be treated as a preview.
+  const termSelected = collectPreviewTabs(openTabs, [{ ...activeTabs[0], id: "tab-term" }], "/r", null, {
+    editorTabIds: ["tab-editor"],
+  });
+  assert.deepEqual(termSelected, []);
+});
+
+test("planPreviewOpen - closes the previous preview, promotes pinned/split tabs, and defers the last live tab", () => {
+  const openTabs = {
+    "/r/a.js": { root: "/r", file: "a.js", tabName: "a.js", tabId: "tab-a", preview: true },
+    "/r/p.js": { root: "/r", file: "p.js", tabName: "p.js", tabId: "tab-p", preview: true },
+    "/r/s.js": { root: "/r", file: "s.js", tabName: "s.js", tabId: "tab-s", preview: true },
+    "/other/b.js": { root: "/other", file: "b.js", tabName: "b.js", tabId: "tab-b", preview: true },
+  };
+  const tabs = [
+    { id: "tab-a", name: "a.js", index: 1, settled: false, panes: 1 },
+    { id: "tab-p", name: "p.js", index: 2, settled: false, panes: 1 },
+    { id: "tab-s", name: "s.js", index: 3, settled: false, panes: 2 },
+    { id: "tab-b", name: "b.js", index: 4, settled: false, panes: 1 },
+  ];
+
+  const plan = planPreviewOpen(openTabs, tabs, "/r", "/r/new.js", ["tab-p"], ["tab-a", "tab-p", "tab-s", "tab-b"]);
+  assert.deepEqual(plan.closeTabIds, ["tab-a", "tab-b"]);
+  assert.deepEqual(plan.deferredCloseTabIds, []);
+  assert.equal(plan.replaceIndex, 1);
+  // Different root in the same space still counts as the one preview to replace.
+  assert.equal(plan.nextOpenTabs["/other/b.js"], undefined);
+  assert.equal("preview" in plan.nextOpenTabs["/r/p.js"], false);
+  assert.equal("preview" in plan.nextOpenTabs["/r/s.js"], false);
+
+  // Only previews left: create first, then close, so the space does not close.
+  const onlyPreview = {
+    "/r/a.js": { root: "/r", file: "a.js", tabName: "a.js", tabId: "tab-a", preview: true },
+  };
+  const deferred = planPreviewOpen(onlyPreview, [tabs[0]], "/r", "/r/new.js");
+  assert.deepEqual(deferred.closeTabIds, []);
+  assert.deepEqual(deferred.deferredCloseTabIds, ["tab-a"]);
+  assert.equal(deferred.replaceIndex, 1);
+
+  // The new file's own entry is never a replacement target.
+  const excluded = planPreviewOpen(openTabs, tabs, "/r", "/r/a.js");
+  assert.deepEqual(excluded.closeTabIds, ["tab-p", "tab-b"]);
 });
 
 test("resolveLocationState - focusing a mod pane does not borrow its cwd (new-space regression)", () => {

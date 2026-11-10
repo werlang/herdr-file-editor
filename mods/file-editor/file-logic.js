@@ -792,21 +792,24 @@ export function resolveLocationState({
  * @param {string | null} root
  * @param {Array<{ id: string, name: string, settled?: boolean }>} activeTabs
  * @param {Record<string, { tabId?: string, tabName?: string, root?: string | null, file?: string }>} [openTabsMap={}]
+ * @param {Array<{ id: string, name: string, settled?: boolean }>} [allTabs=activeTabs] - Tabs from every space, used only to preserve entries that are still alive elsewhere.
  * @returns {{
  *   existingTabId: string | null,
  *   tabName: string,
  *   updatedOpenTabs: Record<string, { tabId?: string, tabName?: string, root?: string | null, file?: string }>
  * }}
  */
-export function resolveFileTab(filePath, root, activeTabs, openTabsMap = {}) {
+export function resolveFileTab(filePath, root, activeTabs, openTabsMap = {}, allTabs = activeTabs) {
   const normFile = typeof filePath === "string" ? filePath.replace(/\\/g, "/") : "";
   const normRoot = typeof root === "string" ? root.replace(/\\/g, "/").replace(/\/+$/, "") : null;
   const fileKey = normRoot ? `${normRoot}/${normFile}` : normFile;
 
   const tabs = Array.isArray(activeTabs) ? activeTabs : [];
   const liveTabs = tabs.filter((t) => t && !t.settled);
+  const everyTab = Array.isArray(allTabs) ? allTabs : tabs;
+  const everyLiveTab = everyTab.filter((t) => t && !t.settled);
 
-  // Prune openTabsMap entries whose tab is no longer active and non-settled.
+  // Prune openTabsMap entries whose tab is no longer live in any space.
   // Preserve entries from other roots/spaces untouched!
   const updatedOpenTabs = {};
   if (openTabsMap && typeof openTabsMap === "object") {
@@ -828,7 +831,7 @@ export function resolveFileTab(filePath, root, activeTabs, openTabsMap = {}) {
         }
 
         // Strict tabId matching when tabId is known
-        const isStillLive = liveTabs.some((t) => {
+        const isStillLive = everyLiveTab.some((t) => {
           if (typeof cleanTabId === "string" && cleanTabId.length > 0) {
             return t.id === cleanTabId && (!val.file || isTabMatchingFile(t.name, val.file, valRoot || normRoot));
           }
@@ -938,25 +941,189 @@ export function resolveFileTab(filePath, root, activeTabs, openTabsMap = {}) {
 }
 
 /**
+ * Whether a recorded open tab is a VS Code-style preview (temporary) tab.
+ *
+ * @param {{ preview?: boolean } | null | undefined} entry
+ * @returns {boolean}
+ */
+export function isPreviewOpenTab(entry) {
+  return Boolean(entry && typeof entry === "object" && entry.preview === true);
+}
+
+/**
+ * Returns a copy of the openTabs map with one file's preview flag set or
+ * cleared. Clearing removes the field instead of storing `false`, so permanent
+ * tabs keep the same shape they had before preview tabs existed.
+ *
+ * @param {Record<string, any>} openTabs
+ * @param {string} fileKey
+ * @param {boolean} preview
+ * @returns {Record<string, any>}
+ */
+export function setOpenTabPreview(openTabs, fileKey, preview) {
+  const map = openTabs && typeof openTabs === "object" ? openTabs : {};
+  const entry = map[fileKey];
+  if (!entry || typeof entry !== "object") return { ...map };
+  const updated = { ...map };
+  if (preview) {
+    updated[fileKey] = { ...entry, preview: true };
+  } else {
+    const { preview: _preview, ...rest } = entry;
+    updated[fileKey] = rest;
+  }
+  return updated;
+}
+
+/**
+ * Collects live preview tabs in a space, resolving each to its real tab id.
+ * Used to replace the previous temporary tab when another file is opened in
+ * preview mode, and to italicize the file in the Files pane.
+ *
+ * A recorded tab id is authoritative: when it is present but stale, the entry
+ * is never matched by name (a different tab could own that name). The name
+ * fallback exists only for the first frames of a freshly created tab, before
+ * its view has registered the id.
+ *
+ * @param {Record<string, any>} openTabs
+ * @param {Array<{ id: string, name: string, settled?: boolean, panes?: number, index?: number }>} activeTabs
+ * @param {string | null} root
+ * @param {string | null} [excludeKey=null]
+ * @param {{ matchRoot?: boolean, editorTabIds?: Set<string> | string[] | null }} [options={}]
+ * @returns {Array<{ key: string, tabId: string, tabName: string, entry: Record<string, any> }>}
+ */
+export function collectPreviewTabs(openTabs, activeTabs, root, excludeKey = null, options = {}) {
+  const map = openTabs && typeof openTabs === "object" ? openTabs : {};
+  const tabs = (Array.isArray(activeTabs) ? activeTabs : []).filter((tab) => tab && !tab.settled);
+  const normRoot = typeof root === "string" ? root.replace(/\\/g, "/").replace(/\/+$/, "") : null;
+  const matchRoot = options?.matchRoot !== false;
+  const hasEditorFilter = options?.editorTabIds !== undefined && options?.editorTabIds !== null;
+  const editorTabIds =
+    options?.editorTabIds instanceof Set
+      ? options.editorTabIds
+      : new Set(Array.isArray(options?.editorTabIds) ? options.editorTabIds : []);
+  const found = [];
+
+  for (const [key, entry] of Object.entries(map)) {
+    if (excludeKey && key === excludeKey) continue;
+    if (!isPreviewOpenTab(entry)) continue;
+
+    const entryRoot = typeof entry.root === "string" ? entry.root.replace(/\\/g, "/").replace(/\/+$/, "") : null;
+    if (matchRoot && normRoot && entryRoot && entryRoot !== normRoot) continue;
+
+    const hasId = typeof entry.tabId === "string" && entry.tabId.length > 0;
+    const byId = hasId ? tabs.find((tab) => tab.id === entry.tabId) : null;
+    const byName = hasId
+      ? null
+      : tabs.find(
+          (tab) =>
+            entry.tabName &&
+            tab.name === entry.tabName &&
+            (!entry.file || isTabMatchingFile(tab.name, entry.file, entry.root || normRoot))
+        );
+    const tab = byId || byName;
+    if (!tab) continue;
+    if (hasEditorFilter && !editorTabIds.has(tab.id)) continue;
+
+    found.push({ key, tabId: tab.id, tabName: tab.name, entry });
+  }
+
+  return found;
+}
+
+/**
+ * Plans the replacement of the previous preview tab when another file is opened
+ * as a preview in the same space. Pinned previews and previews whose tab has
+ * extra panes (a split terminal or another file) are promoted instead of
+ * closed: closing those would destroy unrelated work, which VS Code never does
+ * for a preview editor.
+ *
+ * The returned `nextOpenTabs` already drops the entries that will be closed and
+ * clears the flag of the ones promoted, so the caller writes it once.
+ *
+ * @param {Record<string, any>} openTabs
+ * @param {Array<{ id: string, name: string, settled?: boolean, panes?: number, index?: number }>} activeTabs
+ * @param {string | null} root
+ * @param {string} fileKey
+ * @param {Set<string> | string[]} [pinnedTabIds=[]]
+ * @param {Set<string> | string[] | null} [editorTabIds=null]
+ * @returns {{
+ *   nextOpenTabs: Record<string, any>,
+ *   closeTabIds: string[],
+ *   deferredCloseTabIds: string[],
+ *   replaceIndex: number | null,
+ * }}
+ */
+export function planPreviewOpen(
+  openTabs,
+  activeTabs,
+  root,
+  fileKey,
+  pinnedTabIds = [],
+  editorTabIds = null
+) {
+  const tabs = Array.isArray(activeTabs) ? activeTabs : [];
+  const pinned = pinnedTabIds instanceof Set ? pinnedTabIds : new Set(pinnedTabIds ?? []);
+  let nextOpenTabs = openTabs && typeof openTabs === "object" ? { ...openTabs } : {};
+  const replaceable = [];
+
+  // One preview per space, regardless of which folder the Explorer is showing.
+  const previews = collectPreviewTabs(openTabs, tabs, root, fileKey, {
+    matchRoot: false,
+    editorTabIds,
+  });
+
+  for (const preview of previews) {
+    const tab = tabs.find((candidate) => candidate.id === preview.tabId);
+    const hasExtraPanes = typeof tab?.panes === "number" && tab.panes > 1;
+    if (pinned.has(preview.tabId) || hasExtraPanes) {
+      nextOpenTabs = setOpenTabPreview(nextOpenTabs, preview.key, false);
+    } else {
+      replaceable.push(preview);
+    }
+  }
+
+  let replaceIndex = null;
+  if (replaceable.length > 0) {
+    const first = tabs.find((tab) => tab.id === replaceable[0].tabId);
+    replaceIndex = typeof first?.index === "number" ? first.index : null;
+  }
+
+  const closeTabIds = [];
+  const deferredCloseTabIds = [];
+  const liveTabCount = tabs.filter((tab) => tab && !tab.settled).length;
+  // Closing every live tab before the replacement exists would close the whole
+  // space (Herdr asks for confirmation when the last tab goes).
+  const deferred = replaceable.length > 0 && liveTabCount <= replaceable.length;
+  for (const preview of replaceable) {
+    delete nextOpenTabs[preview.key];
+    (deferred ? deferredCloseTabIds : closeTabIds).push(preview.tabId);
+  }
+
+  return { nextOpenTabs, closeTabIds, deferredCloseTabIds, replaceIndex };
+}
+
+/**
  * Builds the shared openTabs entry for a file tab being registered.
  * Keeps a previously recorded tabName/tabId unless the incoming values supply
  * a fresher one, so a tab opened without a pane (e.g. via `tab.new`) cannot
  * overwrite a disambiguated name such as "lib/index.js" with its basename.
  *
- * @param {{ tabId?: string, tabName?: string } | null | undefined} existing - Current entry for this file, if any.
- * @param {{ root: string | null, file: string, tabName?: string | null, tabId?: string | null }} incoming - Values known for this open.
- * @returns {{ root: string | null, file: string, tabName: string, tabId?: string }}
+ * @param {{ tabId?: string, tabName?: string, preview?: boolean } | null | undefined} existing - Current entry for this file, if any.
+ * @param {{ root: string | null, file: string, tabName?: string | null, tabId?: string | null, preview?: boolean }} incoming - Values known for this open.
+ * @returns {{ root: string | null, file: string, tabName: string, tabId?: string, preview?: boolean }}
  */
 export function mergeOpenTabEntry(existing, incoming) {
   const prev = existing && typeof existing === "object" ? existing : {};
   const tabId = incoming.tabId || prev.tabId;
   const tabName = incoming.tabName || prev.tabName || splitPathInfo(incoming.file).base || "File";
+  const preview = incoming.preview === undefined ? prev.preview === true : incoming.preview === true;
 
   return {
     root: incoming.root,
     file: incoming.file,
     tabName,
     ...(tabId ? { tabId } : {}),
+    ...(preview ? { preview: true } : {}),
   };
 }
 
