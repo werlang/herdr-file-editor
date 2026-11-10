@@ -15,7 +15,7 @@ Instead of opening raw code files inside the narrow Files panel, `file-editor` o
   - Clicking a file reuses an existing open tab for that file instead of creating duplicate tabs.
   - Automatically disambiguates files with identical names from different directories (`dir/base`).
 - **VS Code-style Preview Tabs**:
-  - A single click in the Explorer opens a temporary preview tab, shown with an italic name in the file tree and editor header; with the optional `tabs-ref` tab bar, the tab label is italic too.
+  - A single click in the Explorer opens a temporary preview tab. Its name is italic and dimmed in the file tree and editor header; with the optional `tabs-ref` tab bar it is also dimmed and carries a hollow preview dot.
   - Double-clicking the file in the Explorer promotes it to a permanent tab (normal name). With `tabs-ref`, double-clicking the tab also promotes it instead of renaming.
   - Opening another file in preview mode replaces the previous temporary tab. Editing a preview, pinning it, or splitting another pane into its tab promotes it automatically, so unsaved work and terminals are never replaced.
 - **Interactive File Editing & Saving**:
