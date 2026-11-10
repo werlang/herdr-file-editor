@@ -690,6 +690,127 @@ function parseBlocks(lines) {
 }
 
 /**
+ * Estimates the rendered vertical height of a Markdown document in pixels,
+ * based on its parsed block structure, column width, and typography metrics.
+ * Prevents bottom clipping in offset-scrolled preview containers.
+ *
+ * @param {string | null | undefined} source - Markdown source text.
+ * @param {number} [viewportWidth=800] - Available viewport width in pixels.
+ * @returns {number} Estimated content height in pixels.
+ */
+export function estimateMarkdownHeight(source, viewportWidth = 800) {
+  if (typeof source !== "string" || !source.trim()) return 0;
+  const blocks = parseMarkdownBlocks(source);
+  if (!blocks.length) return 0;
+
+  // Max readable column width is 880px; subtract horizontal container padding (32 * 2 = 64px)
+  const contentWidth = Math.min(880, Math.max(280, (viewportWidth || 800) - 64));
+  let total = 48; // Base container padding: pt(24) + pb(24)
+
+  for (let i = 0; i < blocks.length; i++) {
+    if (i > 0) total += 16; // Block vertical gap: gap(16)
+    total += estimateBlockHeight(blocks[i], contentWidth);
+  }
+
+  // 10% safety margin for font metrics variance + 120px bottom clearance buffer
+  return Math.round(total * 1.1) + 120;
+}
+
+/**
+ * Estimates the rendered pixel height of a single Markdown block.
+ *
+ * @param {MarkdownBlock} block
+ * @param {number} width - Available content width for text wrapping.
+ * @returns {number}
+ */
+function estimateBlockHeight(block, width) {
+  if (!block) return 0;
+  switch (block.type) {
+    case "heading": {
+      const headingSizes = {
+        1: { sz: 32, lh: 40, extra: 7 }, // size 32, line 40, pb 6 + border 1
+        2: { sz: 24, lh: 30, extra: 7 }, // size 24, line 30, pb 6 + border 1
+        3: { sz: 20, lh: 25, extra: 0 },
+        4: { sz: 16, lh: 20, extra: 0 },
+        5: { sz: 14, lh: 18, extra: 0 },
+        6: { sz: 13.6, lh: 17, extra: 0 },
+      };
+      const s = headingSizes[block.level] || headingSizes[6];
+      const charsPerLine = Math.max(10, Math.floor(width / (s.sz * 0.55)));
+      const lines = Math.max(1, Math.ceil((block.text || "").length / charsPerLine));
+      return lines * s.lh + s.extra;
+    }
+    case "paragraph": {
+      // 16px body font: chars average ~8.5px in proportional sans fonts
+      const charsPerLine = Math.max(15, Math.floor(width / 8.5));
+      const lines = Math.max(1, Math.ceil((block.text || "").length / charsPerLine));
+      return lines * 24; // line_height: 24px
+    }
+    case "code": {
+      const lines = (block.text || "").split("\n").length;
+      return lines * 20 + 32; // line_height 20px + p(16) top/bottom
+    }
+    case "hr":
+      return 4;
+    case "quote": {
+      // 4px bar + 16px gap
+      const innerWidth = Math.max(100, width - 20);
+      let h = 0;
+      const sub = block.blocks || [];
+      for (let i = 0; i < sub.length; i++) {
+        if (i > 0) h += 16;
+        h += estimateBlockHeight(sub[i], innerWidth);
+      }
+      return h;
+    }
+    case "list": {
+      // 8px list padding + marker width (12-24) + 8px gap
+      const innerWidth = Math.max(100, width - 36);
+      let h = 0;
+      const items = block.items || [];
+      for (let i = 0; i < items.length; i++) {
+        if (i > 0) h += 4; // gap(4) between list items
+        let itemH = 0;
+        const sub = items[i].blocks || [];
+        for (let j = 0; j < sub.length; j++) {
+          if (j > 0) itemH += 8; // gap(8) between blocks within a list item
+          itemH += estimateBlockHeight(sub[j], innerWidth);
+        }
+        h += Math.max(24, itemH);
+      }
+      return h;
+    }
+    case "table": {
+      const cols = Math.max(1, block.header?.length || 1);
+      const colWidth = Math.max(80, Math.floor(width / cols));
+      // Cell padding: px(13) = 26px total. Font size 14px -> chars average ~7.5px
+      const charsPerLine = Math.max(8, Math.floor((colWidth - 26) / 7.5));
+      let h = 0;
+      // Header row
+      let headerLines = 1;
+      for (const cell of (block.header || [])) {
+        const l = Math.max(1, Math.ceil((cell || "").length / charsPerLine));
+        if (l > headerLines) headerLines = l;
+      }
+      h += headerLines * 24 + 13; // line 24px + py(6)*2 + 1px border
+
+      // Data rows
+      for (const row of (block.rows || [])) {
+        let rowLines = 1;
+        for (const cell of row) {
+          const l = Math.max(1, Math.ceil((cell || "").length / charsPerLine));
+          if (l > rowLines) rowLines = l;
+        }
+        h += rowLines * 24 + 13;
+      }
+      return h + 2; // Outer border 2px
+    }
+    default:
+      return 24;
+  }
+}
+
+/**
  * Maps Herdr theme ANSI and semantic colors to EditorState syntax theme tokens.
  *
  * @param {Record<string, string>} [themeObj={}]

@@ -65,6 +65,7 @@ import {
   isEmptyPane,
   findTargetEmptyPane,
   planFilePlacement,
+  estimateMarkdownHeight,
 } from "../mods/file-editor/file-logic.js";
 
 test("splitPathInfo - extracts base, dir, and ext correctly", () => {
@@ -1881,4 +1882,52 @@ test("planFilePlacement - replaces empty pane or placeholder tab when present", 
   assert.deepEqual(resNewTab, {
     action: "new-tab",
   });
+});
+
+test("estimateMarkdownHeight - handles empty, basic, tables, and prevents clipping", () => {
+  // Empty or invalid inputs
+  assert.equal(estimateMarkdownHeight(null), 0);
+  assert.equal(estimateMarkdownHeight(""), 0);
+  assert.equal(estimateMarkdownHeight("   \n\n  "), 0);
+
+  // Short markdown produces minimum sensible document height with padding
+  const shortMd = "# Title\n\nShort paragraph.";
+  const shortH = estimateMarkdownHeight(shortMd, 800);
+  assert.ok(shortH > 150);
+
+  // Narrow viewport increases wrapped height for long paragraphs
+  const longParagraph = "# Heading\n\n" + "This is a long sentence that wraps across multiple lines in narrow viewports. ".repeat(10);
+  const wideH = estimateMarkdownHeight(longParagraph, 900);
+  const narrowH = estimateMarkdownHeight(longParagraph, 400);
+  assert.ok(narrowH > wideH, `Narrow height (${narrowH}) should be greater than wide height (${wideH})`);
+
+  // Multi-row table with rich descriptions (like solution/README.md)
+  const tableMd = `
+# Solution
+
+| Q | File | Defect | Fix |
+| --- | --- | --- | --- |
+| 1 | api/session.php | session_start, check session user_id with exit, int user_id, session_destroy on logout | Use session user_id |
+| 2 | api/auth/login.php | Prepare email, user null -> not found, password_verify -> wrong password, session_start + user_id/user_name | Validate empty fields and return response |
+| 3 | api/appointments/list.php | INNER JOIN with pets + p.user_id = ?; optional status filter with prepared parameter; ORDER BY scheduled_at | Correct join condition |
+| 4 | search.php | User value concatenated in SQL with q (quotes break query; SQL injection) | prepare with ? and like |
+| 5 | period.php | scheduled_at BETWEEN compares datetime with date, excluding appointments on the last day | DATE(a.scheduled_at) BETWEEN ? AND ? |
+| 6 | by-pet.php | Does not check if pet belongs to the user | Check pets with id = ? AND user_id = ? before query |
+| 7 | summary.php | Queries without user filter. faturado without (float): DECIMAL returns as string | JOIN with pets and WHERE p.user_id = ?; (float) on faturado |
+| 8 | update.php | After UPDATE, rowCount === 0 treated as not found. MySQL returns 0 affected rows when value is unchanged | Remove rowCount check; ownership already validated |
+| 9 | delete.php | DELETE without JOIN with pets, without owner filter and without checking rowCount | DELETE a FROM appointments a INNER JOIN pets p ... WHERE a.id = ? AND p.user_id = ? |
+| 10 | pets/add.php | user_id comes from POST which front does not send; INSERT fails with user_id cannot be null | Use session user_id |
+
+## Notes
+
+- Note 1: Acceptance criteria for Q1
+- Note 2: Acceptance criteria for Q2
+- Note 3: Acceptance criteria for Q3
+- Note 4: Acceptance criteria for Q4
+- Note 5: Acceptance criteria for Q5
+- Note 6: Acceptance criteria for Q6
+`;
+  const tableH = estimateMarkdownHeight(tableMd, 800);
+  // The table and notes should estimate > 1800px, preventing the old 44*32=1408px clipping bug
+  assert.ok(tableH > 1800, `Estimated height (${tableH}) should comfortably exceed 1800px`);
 });

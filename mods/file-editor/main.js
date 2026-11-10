@@ -88,6 +88,7 @@ import {
   isEmptyPane,
   findTargetEmptyPane,
   planFilePlacement,
+  estimateMarkdownHeight,
 } from "./file-logic.js";
 import { renderMarkdownDocument } from "./markdown-view.js";
 
@@ -1221,7 +1222,7 @@ export default class FileEditor extends View {
       this.pictureViewport = { width, height };
     }
     this.updateCachedTabState({ tabViewport: this.tabViewport, pictureViewport: this.pictureViewport });
-    if (this.showsPicturePreview()) {
+    if (this.showsPicturePreview() || this.isMarkdown) {
       cx.notify();
     }
   }
@@ -1910,7 +1911,11 @@ export default class FileEditor extends View {
     const codeFont = settings()?.font_family ?? null;
     const mdId = fileElementId("file-editor-markdown", this.fileKey);
     const viewportHeight = this.tabViewport?.height || 600;
-    const estContentHeight = Math.max(viewportHeight, (this.lineCount || 100) * 32);
+    const viewportWidth = this.tabViewport?.width || 800;
+    const estContentHeight = Math.max(
+      viewportHeight,
+      estimateMarkdownHeight(this.preparedText ?? "", viewportWidth)
+    );
     const maxScroll = Math.max(0, estContentHeight - viewportHeight);
     this.mdScrollY = Math.max(0, Math.min(maxScroll, this.mdScrollY || 0));
 
@@ -1921,6 +1926,9 @@ export default class FileEditor extends View {
       .min_h(0)
       .overflow_hidden()
       .on_scroll_wheel((event, cx) => {
+        if (event.bounds) {
+          this.rememberViewport(event.bounds, cx);
+        }
         const delta = event.delta?.y || 0;
         const next = Math.max(0, Math.min(maxScroll, (this.mdScrollY || 0) - delta));
         if (next !== this.mdScrollY) {
@@ -1936,7 +1944,8 @@ export default class FileEditor extends View {
           .w_full()
           .bg(t.background)
           .px(32)
-          .py(24)
+          .pt(24)
+          .pb(120)
           .child(
             v_flex()
               .w_full()
