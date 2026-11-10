@@ -793,13 +793,21 @@ export function resolveLocationState({
  * @param {Array<{ id: string, name: string, settled?: boolean }>} activeTabs
  * @param {Record<string, { tabId?: string, tabName?: string, root?: string | null, file?: string }>} [openTabsMap={}]
  * @param {Array<{ id: string, name: string, settled?: boolean }>} [allTabs=activeTabs] - Tabs from every space, used only to preserve entries that are still alive elsewhere.
+ * @param {Set<string> | string[] | null} [editorTabIds=null] - Live tabs hosting the file-editor mod, used to avoid reusing a renamed terminal.
  * @returns {{
  *   existingTabId: string | null,
  *   tabName: string,
  *   updatedOpenTabs: Record<string, { tabId?: string, tabName?: string, root?: string | null, file?: string }>
  * }}
  */
-export function resolveFileTab(filePath, root, activeTabs, openTabsMap = {}, allTabs = activeTabs) {
+export function resolveFileTab(
+  filePath,
+  root,
+  activeTabs,
+  openTabsMap = {},
+  allTabs = activeTabs,
+  editorTabIds = null
+) {
   const normFile = typeof filePath === "string" ? filePath.replace(/\\/g, "/") : "";
   const normRoot = typeof root === "string" ? root.replace(/\\/g, "/").replace(/\/+$/, "") : null;
   const fileKey = normRoot ? `${normRoot}/${normFile}` : normFile;
@@ -808,6 +816,10 @@ export function resolveFileTab(filePath, root, activeTabs, openTabsMap = {}, all
   const liveTabs = tabs.filter((t) => t && !t.settled);
   const everyTab = Array.isArray(allTabs) ? allTabs : tabs;
   const everyLiveTab = everyTab.filter((t) => t && !t.settled);
+  const hasEditorFilter = editorTabIds !== null && editorTabIds !== undefined;
+  const editorIds =
+    editorTabIds instanceof Set ? editorTabIds : new Set(Array.isArray(editorTabIds) ? editorTabIds : []);
+  const isEditorTab = (tab) => !hasEditorFilter || editorIds.has(tab.id);
 
   // Prune openTabsMap entries whose tab is no longer live in any space.
   // Preserve entries from other roots/spaces untouched!
@@ -868,6 +880,7 @@ export function resolveFileTab(filePath, root, activeTabs, openTabsMap = {}, all
   const recorded = updatedOpenTabs[fileKey];
   if (recorded) {
     const matchedLiveTab = liveTabs.find((t) => {
+      if (!isEditorTab(t)) return false;
       if (typeof recorded.tabId === "string" && recorded.tabId.length > 0) {
         return t.id === recorded.tabId && isTabMatchingFile(t.name, normFile, normRoot);
       }
@@ -897,7 +910,9 @@ export function resolveFileTab(filePath, root, activeTabs, openTabsMap = {}, all
     }
   }
 
-  // Deduce tab title
+  // Deduce tab title. openTabs is keyed by file, so when the same file is open
+  // in another space the single entry points there; this space then opens its
+  // own tab instead of guessing identity from a basename.
   const { base, dir } = splitPathInfo(normFile);
   const defaultTitle = base || "File";
 
@@ -1048,18 +1063,18 @@ export function collectPreviewTabs(openTabs, activeTabs, root, excludeKey = null
     if (matchRoot && normRoot && entryRoot && entryRoot !== normRoot) continue;
 
     const hasId = typeof entry.tabId === "string" && entry.tabId.length > 0;
-    const byId = hasId ? tabs.find((tab) => tab.id === entry.tabId) : null;
-    const byName = hasId
-      ? null
-      : tabs.find(
+    const candidates = hasId
+      ? tabs.filter((tab) => tab.id === entry.tabId)
+      : tabs.filter(
           (tab) =>
             entry.tabName &&
             tab.name === entry.tabName &&
             (!entry.file || isTabMatchingFile(tab.name, entry.file, entry.root || normRoot))
         );
-    const tab = byId || byName;
+    const tab = hasEditorFilter
+      ? candidates.find((candidate) => editorTabIds.has(candidate.id))
+      : candidates[0];
     if (!tab) continue;
-    if (hasEditorFilter && !editorTabIds.has(tab.id)) continue;
 
     found.push({ key, tabId: tab.id, tabName: tab.name, entry });
   }

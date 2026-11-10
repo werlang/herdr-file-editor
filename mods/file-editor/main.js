@@ -2430,12 +2430,17 @@ export default class FileEditor extends View {
       return;
     }
 
+    const editorTabIds = new Set(
+      (panes() || []).filter((pane) => pane.mod === "file-editor").map((pane) => pane.tab)
+    );
+
     const { existingTabId, tabName, updatedOpenTabs } = resolveFileTab(
       path,
       this.root,
       activeTabs,
       openTabsMap,
-      allTabs
+      allTabs,
+      editorTabIds
     );
 
     if (existingTabId) {
@@ -2454,9 +2459,6 @@ export default class FileEditor extends View {
     let replaceIndex = null;
 
     if (!permanent) {
-      const editorTabIds = new Set(
-        (panes() || []).filter((pane) => pane.mod === "file-editor").map((pane) => pane.tab)
-      );
       const plan = planPreviewOpen(
         updatedOpenTabs,
         activeTabs,

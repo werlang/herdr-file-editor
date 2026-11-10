@@ -706,6 +706,50 @@ test("resolveFileTab - preserves same-root entries whose tab is live in another 
   assert.equal("/repo/a.js" in pruned.updatedOpenTabs, false);
 });
 
+test("resolveFileTab - a foreign-space entry never reuses a same-basename local tab", () => {
+  const root = "/repo";
+  const openTabs = {
+    "/repo/a.js": { root, file: "a.js", tabName: "a.js", tabId: "tab-other-space", preview: true },
+  };
+  const activeTabs = [{ id: "tab-here", name: "index.js", settled: false, active: true }];
+  const allTabs = [...activeTabs, { id: "tab-other-space", name: "a.js", settled: false }];
+
+  // The shared entry points at the other space and the local tab has a
+  // different basename: open a new tab instead of focusing the wrong file.
+  const different = resolveFileTab("a.js", root, activeTabs, openTabs, allTabs, ["tab-here", "tab-other-space"]);
+  assert.equal(different.existingTabId, null);
+
+  // Even the same basename must not be reused by name: src/index.js and
+  // lib/index.js are different files.
+  const indexTabs = [{ id: "tab-index", name: "index.js", settled: false }];
+  const indexOpenTabs = {
+    "/repo/src/index.js": { root, file: "src/index.js", tabName: "index.js", tabId: "tab-other-space", preview: true },
+  };
+  const index = resolveFileTab(
+    "lib/index.js",
+    root,
+    indexTabs,
+    indexOpenTabs,
+    [...indexTabs, { id: "tab-other-space", name: "index.js", settled: false }],
+    ["tab-index"]
+  );
+  assert.equal(index.existingTabId, null);
+  assert.notEqual(index.tabName, "index.js");
+});
+
+test("resolveFileTab - a renamed terminal is not reused as the file tab", () => {
+  const root = "/repo";
+  const openTabs = {
+    "/repo/a.js": { root, file: "a.js", tabName: "a.js", preview: true },
+  };
+  const activeTabs = [
+    { id: "tab-term", name: "a.js", settled: false },
+    { id: "tab-editor", name: "a.js", settled: false },
+  ];
+  const result = resolveFileTab("a.js", root, activeTabs, openTabs, activeTabs, ["tab-editor"]);
+  assert.equal(result.existingTabId, "tab-editor");
+});
+
 test("isTabMatchingFile - accurately validates tab names against file paths", () => {
   const root = "/Users/pablowerlang/myrepo";
   assert.equal(isTabMatchingFile("README.md", "README.md", root), true);
@@ -879,6 +923,24 @@ test("collectPreviewTabs - name fallback requires a live file-editor pane", () =
     editorTabIds: ["tab-editor"],
   });
   assert.deepEqual(termSelected, []);
+
+  // An empty editor set means "no live file-editor tab", not "no filter".
+  assert.deepEqual(
+    collectPreviewTabs(openTabs, activeTabs, "/r", null, { editorTabIds: [] }),
+    []
+  );
+});
+
+test("collectPreviewTabs - skips same-named tabs without an editor pane before finding the real one", () => {
+  const openTabs = {
+    "/r/a.js": { root: "/r", file: "a.js", tabName: "a.js", preview: true },
+  };
+  const activeTabs = [
+    { id: "tab-term", name: "a.js", index: 1, settled: false },
+    { id: "tab-editor", name: "a.js", index: 2, settled: false },
+  ];
+  const found = collectPreviewTabs(openTabs, activeTabs, "/r", null, { editorTabIds: ["tab-editor"] });
+  assert.deepEqual(found.map((preview) => preview.tabId), ["tab-editor"]);
 });
 
 test("planPreviewOpen - closes the previous preview, promotes pinned/split tabs, and defers the last live tab", () => {
