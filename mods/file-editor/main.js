@@ -2703,7 +2703,7 @@ export default class FileEditor extends View {
       : dialog.oldName;
     const showPreview = previewName && previewName !== currentVal.trim();
 
-    return div()
+    return v_flex()
       .id("files-rename-backdrop")
       .absolute()
       .inset_0()
@@ -2839,7 +2839,7 @@ export default class FileEditor extends View {
       ? `Are you sure you want to delete "${dialog.name}" and all its contents?`
       : `Are you sure you want to delete "${dialog.name}"?`;
 
-    return div()
+    return v_flex()
       .id("files-delete-backdrop")
       .absolute()
       .inset_0()
