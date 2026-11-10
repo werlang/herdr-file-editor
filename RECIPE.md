@@ -1,15 +1,15 @@
-# File Editor
+# File Explorer & Editor
 
-A native, dual-mode file browser panel and tabbed file viewer for Herdr with syntax highlighting, Markdown and SVG previews, picture zoom, and live filesystem watching powered directly by GPUI.
+A native, dual-mode file explorer panel and tabbed file editor for Herdr with syntax highlighting, Markdown and SVG previews, picture zoom, and live filesystem watching powered directly by GPUI.
 
-![File Editor](preview.png)
+![File Explorer & Editor](preview.png)
 
 ## What you see
 
 Inside any Herdr sidebar, split pane, or dedicated tab:
 
 - **Files Browser Pane (`#files`)**:
-  - **Header**: Clean panel header displaying "Files" and the current workspace folder name.
+  - **Header**: Clean panel header displaying "Explorer" and the current workspace folder name.
   - **Directory Tree (`#files-tree`)**: Collapsible folder hierarchy with vector chevrons (`chevron-down.svg`, `chevron-right.svg`), folder icons (`folder.svg`), file icons (`file.svg`), Git status porcelain marks (`A` in green, `M` in yellow/blocked, `D`/`U` in red), selection highlighting when a file's tab is active, a hover copy-path button beside the name, and a right-click menu (`Open file`, `Copy path`).
 - **Dedicated File Editor Tab (`#file-editor-tab`)**:
   - **Toolbar (`h(38)`)**: Matches Herdr diff tab craft with vector file icon, bold filename with an accent dot indicator (`●`) on unsaved edits, truncated directory path, metadata pill showing line count and language name (e.g., `142 lines · JavaScript` or `85 lines · Markdown`), dynamic `Save` button (or `Read-only` badge on protected files), and copy/refresh buttons.

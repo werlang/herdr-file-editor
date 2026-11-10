@@ -1,5 +1,5 @@
 /**
- * Herdr File Editor Mod (Dual-Mode: Files Pane Tree & Dedicated File Viewer Tab).
+ * Herdr File Explorer & Editor Mod (Dual-Mode: Files Pane Tree & Dedicated File Viewer Tab).
  *
  * Mode 1 (Files Pane): When props().file is not set, renders the directory browser tree.
  * Clicking a file opens it in its own Herdr tab via run("tab.new", { mod: "file-editor", ... }).
@@ -3297,7 +3297,7 @@ export default class FileEditor extends View {
           .items_center()
           .border_b(1)
           .border_color(t.border)
-          .child(div().font_semibold().child("Files"))
+          .child(div().font_semibold().child("Explorer"))
           .child(
             div()
               .flex_1()

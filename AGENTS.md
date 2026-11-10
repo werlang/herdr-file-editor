@@ -1,6 +1,6 @@
 # herdr-file-editor
 
-Source of truth for the `file-editor` Herdr app mod (`mods/file-editor/`): a dual-mode file browser panel and tabbed file editor with syntax highlighting, Markdown and SVG previews, picture zoom, and live filesystem watching built natively with GPUI.
+Source of truth for the `file-editor` Herdr app mod (`mods/file-editor/`), published as **File Explorer & Editor**: a dual-mode file explorer panel and tabbed file editor with syntax highlighting, Markdown and SVG previews, picture zoom, and live filesystem watching built natively with GPUI.
 
 ## Rule: Always Update the Herdr Live Folder
 

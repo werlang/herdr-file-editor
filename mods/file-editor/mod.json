@@ -1,7 +1,7 @@
 {
   "name": "file-editor",
-  "version": "0.1.0",
-  "title": "File Editor",
-  "description": "Dual-mode file browser and tabbed viewer with syntax highlighting, Markdown and SVG previews, image zoom, and live reload",
+  "version": "0.1.1",
+  "title": "File Explorer & Editor",
+  "description": "File explorer tree and tabbed file editor with syntax highlighting, Markdown and SVG previews, image zoom, and live reload",
   "place": "none"
 }

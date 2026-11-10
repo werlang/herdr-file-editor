@@ -1,6 +1,6 @@
-# Herdr File Editor
+# Herdr File Explorer & Editor
 
-A native, dual-mode **File Browser & Editor Tab** mod for Herdr featuring directory tree navigation, Git status porcelain badges, dedicated tabbed file viewing, theme-aware syntax highlighting, and rich Markdown and SVG previews powered directly by GPUI.
+A native, dual-mode **File Explorer & Editor** mod for Herdr featuring directory tree navigation, Git status porcelain badges, dedicated tabbed file viewing, theme-aware syntax highlighting, and rich Markdown and SVG previews powered directly by GPUI.
 
 Instead of opening raw code files inside the narrow Files panel, `file-editor` opens files into their own dedicated Herdr tabs with full-pane syntax highlighting and Markdown or SVG rendering, keeping your directory tree accessible and intact.
 
