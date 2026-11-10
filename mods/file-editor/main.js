@@ -454,7 +454,8 @@ export default class FileEditor extends View {
     this.reloadPending = false;
     this.code = cached?.code ?? null;
     this.editorInputs = cached?.editorInputs ?? null;
-    this.mdScrollY = cached?.mdScrollY ?? 0;
+    const initialScrollY = typeof p.scrollY === "number" ? p.scrollY : (cached?.mdScrollY ?? 0);
+    this.mdScrollY = initialScrollY;
     this.pictureScrollX = cached?.pictureScrollX ?? 0;
     this.pictureScrollY = cached?.pictureScrollY ?? 0;
     this.watched = null;

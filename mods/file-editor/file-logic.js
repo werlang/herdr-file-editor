@@ -712,8 +712,8 @@ export function estimateMarkdownHeight(source, viewportWidth = 800) {
     total += estimateBlockHeight(blocks[i], contentWidth);
   }
 
-  // 10% safety margin for font metrics variance + 120px bottom clearance buffer
-  return Math.round(total * 1.1) + 120;
+  // 120px bottom clearance buffer so the last lines are never glued to the edge
+  return total + 120;
 }
 
 /**
@@ -741,8 +741,8 @@ function estimateBlockHeight(block, width) {
       return lines * s.lh + s.extra;
     }
     case "paragraph": {
-      // 16px body font: chars average ~8.5px in proportional sans fonts
-      const charsPerLine = Math.max(15, Math.floor(width / 8.5));
+      // 16px body font: chars average ~8.0px in proportional sans fonts
+      const charsPerLine = Math.max(15, Math.floor(width / 8.0));
       const lines = Math.max(1, Math.ceil((block.text || "").length / charsPerLine));
       return lines * 24; // line_height: 24px
     }
@@ -783,8 +783,8 @@ function estimateBlockHeight(block, width) {
     case "table": {
       const cols = Math.max(1, block.header?.length || 1);
       const colWidth = Math.max(80, Math.floor(width / cols));
-      // Cell padding: px(13) = 26px total. Font size 14px -> chars average ~7.5px
-      const charsPerLine = Math.max(8, Math.floor((colWidth - 26) / 7.5));
+      // Cell padding: px(13) = 26px total. Font size 14px -> chars average ~7.0px
+      const charsPerLine = Math.max(10, Math.floor((colWidth - 26) / 7.0));
       let h = 0;
       // Header row
       let headerLines = 1;
@@ -792,7 +792,7 @@ function estimateBlockHeight(block, width) {
         const l = Math.max(1, Math.ceil((cell || "").length / charsPerLine));
         if (l > headerLines) headerLines = l;
       }
-      h += headerLines * 24 + 13; // line 24px + py(6)*2 + 1px border
+      h += headerLines * 20 + 12; // line 20px + py(6)*2
 
       // Data rows
       for (const row of (block.rows || [])) {
@@ -801,7 +801,7 @@ function estimateBlockHeight(block, width) {
           const l = Math.max(1, Math.ceil((cell || "").length / charsPerLine));
           if (l > rowLines) rowLines = l;
         }
-        h += rowLines * 24 + 13;
+        h += rowLines * 20 + 12;
       }
       return h + 2; // Outer border 2px
     }
@@ -2455,4 +2455,28 @@ export function planFilePlacement({
 
   // 4. Default: open in a new tab
   return { action: "new-tab" };
+}
+
+/**
+ * Builds the `pane.split` command arguments for splitting an editor pane.
+ * With `new-pane` installed, opens the chooser in the split; otherwise opens a terminal.
+ *
+ * @param {string} [direction="right"] - "right" or "down"
+ * @param {string | null} [paneId=null] - The pane being split
+ * @param {string | null} [spaceId=null] - Active space id
+ * @param {string | null} [rootFolder=null] - Folder root for the new pane
+ * @param {boolean} [withChooser=false] - Whether new-pane chooser mod is available
+ * @returns {Record<string, unknown>}
+ */
+export function buildSplitPaneRequest(direction = "right", paneId = null, spaceId = null, rootFolder = null, withChooser = false) {
+  const normDir = direction === "down" ? "down" : "right";
+  const req = { direction: normDir };
+  if (paneId) req.pane = paneId;
+  if (!withChooser) return req;
+  const props = { direction: normDir };
+  if (spaceId) props.space = spaceId;
+  if (rootFolder) props.folder = rootFolder;
+  req.mod = "new-pane";
+  req.props = props;
+  return req;
 }
