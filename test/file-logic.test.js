@@ -62,6 +62,9 @@ import {
   pruneFileTabStates,
   remapRenamedFileStates,
   removeDeletedFileStates,
+  isEmptyPane,
+  findTargetEmptyPane,
+  planFilePlacement,
 } from "../mods/file-editor/file-logic.js";
 
 test("splitPathInfo - extracts base, dir, and ext correctly", () => {
@@ -1752,4 +1755,130 @@ test("resolveFileTab - claimedTabIds prevents matching tabs owned by other files
   assert.notEqual(resB.existingTabId, "tab-src-main");
   // And disambiguates to dist/main.js or matches tab-dist-main
   assert.ok(resB.tabName.includes("dist/main.js"));
+});
+
+test("isEmptyPane - accurately identifies empty and placeholder panes", () => {
+  assert.equal(isEmptyPane(null), false);
+  assert.equal(isEmptyPane(undefined), false);
+  assert.equal(isEmptyPane({}), false);
+  assert.equal(isEmptyPane({ terminal: "t1", title: "Terminal" }), false);
+  assert.equal(isEmptyPane({ terminal: null, mod: "file-editor", title: "main.js" }), false);
+
+  assert.equal(isEmptyPane({ mod: "new-pane" }), true);
+  assert.equal(isEmptyPane({ mod: "space-pin" }), true);
+  assert.equal(isEmptyPane({ terminal: null, title: "New pane" }), true);
+  assert.equal(isEmptyPane({ terminal: null, title: "New tab" }), true);
+  assert.equal(isEmptyPane({ pane: "p1", mod: "new-pane", tab: "tab-1" }), true);
+});
+
+test("findTargetEmptyPane - selects focused empty pane or first available empty pane", () => {
+  assert.equal(findTargetEmptyPane(null), null);
+  assert.equal(findTargetEmptyPane([]), null);
+
+  const termPane = { pane: "p-term", tab: "tab-1", terminal: "t1", title: "Terminal" };
+  const newPane1 = { pane: "p-new-1", tab: "tab-1", mod: "new-pane", terminal: null, title: "New pane" };
+  const newPane2 = { pane: "p-new-2", tab: "tab-1", mod: "new-pane", terminal: null, title: "New pane" };
+
+  // Only normal panes
+  assert.equal(findTargetEmptyPane([termPane]), null);
+
+  // One empty pane available
+  assert.deepEqual(findTargetEmptyPane([termPane, newPane1]), newPane1);
+
+  // Multiple empty panes: prioritizes focused one
+  assert.deepEqual(findTargetEmptyPane([termPane, newPane1, newPane2], "p-new-2"), newPane2);
+  assert.deepEqual(findTargetEmptyPane([termPane, newPane1, newPane2], "p-new-1"), newPane1);
+
+  // When focused pane is not empty, returns first empty pane
+  assert.deepEqual(findTargetEmptyPane([termPane, newPane1, newPane2], "p-term"), newPane1);
+
+  // Space-pin placeholder
+  const pinPane = { pane: "p-pin", tab: "tab-placeholder", mod: "space-pin" };
+  assert.deepEqual(findTargetEmptyPane([pinPane]), pinPane);
+});
+
+test("planFilePlacement - replaces empty pane or placeholder tab when present", () => {
+  const root = "/work/repo";
+  const file = "src/main.js";
+  const activeTabId = "tab-active";
+  const termPane = { pane: "p-term", tab: activeTabId, terminal: "t1" };
+  const emptyPane = { pane: "p-empty", tab: activeTabId, mod: "new-pane" };
+
+  // 1. In a split tab with an empty pane: places file inside empty pane (replace-pane)
+  // Even if file is already open in another tab, placing in empty pane takes precedence
+  const resReplaceSplit = planFilePlacement({
+    currentTabPanes: [termPane, emptyPane],
+    targetEmptyPane: emptyPane,
+    existingTabId: "tab-other",
+    activeTabId,
+    file,
+    root,
+  });
+  assert.deepEqual(resReplaceSplit, {
+    action: "replace-pane",
+    targetPaneId: "p-empty",
+    tabId: activeTabId,
+  });
+
+  // 2. In a lone placeholder tab (e.g. space-pin): replaces the placeholder tab
+  const placeholderPane = { pane: "p-pin", tab: "tab-holder", mod: "space-pin" };
+  const resReplaceTab = planFilePlacement({
+    currentTabPanes: [placeholderPane],
+    targetEmptyPane: placeholderPane,
+    existingTabId: null,
+    activeTabId: "tab-holder",
+    file,
+    root,
+  });
+  assert.deepEqual(resReplaceTab, {
+    action: "replace-tab",
+    closeTabId: "tab-holder",
+  });
+
+  // 3. File is already open in a pane of the active tab: focus that pane
+  const editorPaneInActive = {
+    pane: "p-editor",
+    tab: activeTabId,
+    mod: "file-editor",
+    props: { folder: root, file: "src/main.js" },
+  };
+  const resFocus = planFilePlacement({
+    currentTabPanes: [termPane, editorPaneInActive],
+    targetEmptyPane: null,
+    existingTabId: activeTabId,
+    activeTabId,
+    file,
+    root,
+  });
+  assert.deepEqual(resFocus, {
+    action: "focus-pane",
+    paneId: "p-editor",
+  });
+
+  // 4. No empty pane, file already open in another tab: select that tab
+  const resSelect = planFilePlacement({
+    currentTabPanes: [termPane],
+    targetEmptyPane: null,
+    existingTabId: "tab-other",
+    activeTabId,
+    file,
+    root,
+  });
+  assert.deepEqual(resSelect, {
+    action: "select-tab",
+    tabId: "tab-other",
+  });
+
+  // 5. No empty pane, file not open anywhere: new tab
+  const resNewTab = planFilePlacement({
+    currentTabPanes: [termPane],
+    targetEmptyPane: null,
+    existingTabId: null,
+    activeTabId,
+    file,
+    root,
+  });
+  assert.deepEqual(resNewTab, {
+    action: "new-tab",
+  });
 });

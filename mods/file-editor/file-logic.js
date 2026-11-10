@@ -2232,3 +2232,106 @@ export function removeDeletedFileStates(statesMap, deletedPath, root = "") {
   }
   return removed;
 }
+
+/**
+ * Whether a pane is considered empty (e.g. the New pane split chooser or a
+ * placeholder tab pane).
+ *
+ * @param {Record<string, any> | null | undefined} pane
+ * @returns {boolean}
+ */
+export function isEmptyPane(pane) {
+  if (!pane || typeof pane !== "object") return false;
+  if (pane.mod === "new-pane" || pane.mod === "space-pin") return true;
+  if (!pane.terminal && (pane.title === "New pane" || pane.title === "New tab")) return true;
+  return false;
+}
+
+/**
+ * Finds an empty pane in the current tab that can host an opened file.
+ * Prioritizes the currently focused pane if it is empty.
+ *
+ * @param {Array<Record<string, any>> | null | undefined} tabPanes
+ * @param {string | null | undefined} [focusedPaneId]
+ * @returns {Record<string, any> | null}
+ */
+export function findTargetEmptyPane(tabPanes, focusedPaneId) {
+  if (!Array.isArray(tabPanes) || tabPanes.length === 0) return null;
+  const emptyPanes = tabPanes.filter(isEmptyPane);
+  if (emptyPanes.length === 0) return null;
+  if (focusedPaneId) {
+    const focusedEmpty = emptyPanes.find((p) => p.pane === focusedPaneId);
+    if (focusedEmpty) return focusedEmpty;
+  }
+  return emptyPanes[0];
+}
+
+/**
+ * Plans how to place a file when opened. If an empty pane exists in the
+ * active tab, the file replaces that empty pane (or placeholder tab) instead
+ * of opening an unwanted new tab or switching away to another tab.
+ *
+ * @param {{
+ *   currentTabPanes?: Array<Record<string, any>>,
+ *   targetEmptyPane?: Record<string, any> | null,
+ *   existingTabId?: string | null,
+ *   activeTabId?: string | null,
+ *   file?: string,
+ *   root?: string,
+ * }} options
+ * @returns {{
+ *   action: "replace-pane" | "replace-tab" | "select-tab" | "new-tab" | "focus-pane",
+ *   targetPaneId?: string,
+ *   closeTabId?: string,
+ *   tabId?: string,
+ *   paneId?: string,
+ * }}
+ */
+export function planFilePlacement({
+  currentTabPanes = [],
+  targetEmptyPane = null,
+  existingTabId = null,
+  activeTabId = null,
+  file = "",
+  root = "",
+} = {}) {
+  const normFile = file ? file.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "") : "";
+  const fileKey = toFileKey(root, normFile);
+
+  // 1. If the file is already open in a pane of the active tab, focus that pane
+  const alreadyInActiveTab = (currentTabPanes || []).find((p) => {
+    if (p.mod !== "file-editor") return false;
+    const pFile = p.props?.file;
+    if (!pFile) return false;
+    const pKey = toFileKey(p.props?.folder || root, pFile);
+    return pKey === fileKey || pFile === normFile;
+  });
+  if (alreadyInActiveTab) {
+    return { action: "focus-pane", paneId: alreadyInActiveTab.pane };
+  }
+
+  // 2. If there is an empty pane in the active tab:
+  if (targetEmptyPane) {
+    const paneCount = Array.isArray(currentTabPanes) ? currentTabPanes.length : 0;
+    if (paneCount > 1) {
+      return {
+        action: "replace-pane",
+        targetPaneId: targetEmptyPane.pane,
+        tabId: activeTabId || targetEmptyPane.tab,
+      };
+    }
+    // Lone placeholder pane in tab
+    return {
+      action: "replace-tab",
+      closeTabId: activeTabId || targetEmptyPane.tab,
+    };
+  }
+
+  // 3. If file is already open in a live tab, select that tab
+  if (existingTabId) {
+    return { action: "select-tab", tabId: existingTabId };
+  }
+
+  // 4. Default: open in a new tab
+  return { action: "new-tab" };
+}

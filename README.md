@@ -14,6 +14,9 @@ Instead of opening raw code files inside the narrow Files panel, `file-editor` o
 - **Tab Deduplication & Disambiguation**:
   - Clicking a file reuses an existing open tab for that file instead of creating duplicate tabs.
   - Automatically disambiguates files with identical names from different directories (`dir/base`).
+- **Empty Pane & Split Placement**:
+  - When an empty split pane (`new-pane`) is present in the active tab, opening a file (or choosing `Open file` / `Place in empty pane` in the context menu) places it directly into that empty split instead of creating an unwanted new tab or jumping away to another tab.
+  - When opening a file from a lone placeholder tab (`space-pin` / "New tab"), it cleanly replaces the placeholder tab with the opened file.
 - **VS Code-style Preview Tabs**:
   - A single click in the Explorer opens a temporary preview tab. Its name is italic and dimmed in the file tree and editor header; with the optional `tabs-ref` tab bar it is also dimmed and carries a hollow preview dot.
   - Double-clicking the file in the Explorer promotes it to a permanent tab (normal name). With `tabs-ref`, double-clicking the tab also promotes it instead of renaming.

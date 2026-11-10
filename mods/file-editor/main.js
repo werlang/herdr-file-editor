@@ -85,6 +85,9 @@ import {
   pruneFileTabStates,
   remapRenamedFileStates,
   removeDeletedFileStates,
+  isEmptyPane,
+  findTargetEmptyPane,
+  planFilePlacement,
 } from "./file-logic.js";
 import { renderMarkdownDocument } from "./markdown-view.js";
 
@@ -2456,12 +2459,76 @@ export default class FileEditor extends View {
       editorTabIds
     );
 
-    if (existingTabId) {
+    const activeTab = activeTabs.find((t) => t.active);
+    const allPanes = panes() || [];
+    const currentTabPanes = activeTab ? allPanes.filter((p) => p.tab === activeTab.id) : [];
+    const focusedPaneId = options?.pane || focused()?.pane;
+    const targetEmptyPane = findTargetEmptyPane(currentTabPanes, focusedPaneId);
+
+    const placement = planFilePlacement({
+      currentTabPanes,
+      targetEmptyPane,
+      existingTabId,
+      activeTabId: activeTab?.id,
+      file: path,
+      root: this.root,
+    });
+
+    if (placement.action === "focus-pane") {
+      run("pane.focus", { pane: placement.paneId });
+      cx.notify();
+      return;
+    }
+
+    if (placement.action === "replace-pane") {
+      const tabProps = { folder: this.root, file: path };
+      if (this.on) tabProps.on = this.on;
+      run("pane.split", {
+        direction: "right",
+        pane: placement.targetPaneId,
+        mod: "file-editor",
+        props: tabProps,
+      });
+      run("pane.close", { pane: placement.targetPaneId });
+
+      const nextOpenTabs = {
+        ...updatedOpenTabs,
+        [fileKey]: mergeOpenTabEntry(updatedOpenTabs[fileKey], {
+          root: this.root,
+          file: path,
+          tabName: activeTab?.name || tabName,
+          tabId: placement.tabId,
+          preview: false,
+        }),
+      };
+      setShared("file-editor.openTabs", nextOpenTabs);
+      cx.notify();
+      return;
+    }
+
+    if (placement.action === "replace-tab") {
+      const tabProps = { folder: this.root, file: path };
+      if (this.on) tabProps.on = this.on;
+      run("tab.new", { name: tabName, mod: "file-editor", props: tabProps });
+      if (placement.closeTabId) {
+        run("tab.close", { id: placement.closeTabId });
+      }
+      const nextOpenTabs = setOpenTabPreview(updatedOpenTabs, fileKey, !permanent);
+      setShared("file-editor.openTabs", nextOpenTabs);
+      this.pendingFileOpen = { fileKey, at: Date.now() };
+      cx.timer?.after?.(650, () => {
+        if (this.pendingFileOpen?.fileKey === fileKey) this.pendingFileOpen = null;
+      });
+      cx.notify();
+      return;
+    }
+
+    if (placement.action === "select-tab") {
       const nextOpenTabs = permanent
         ? setOpenTabPreview(updatedOpenTabs, fileKey, false)
         : updatedOpenTabs;
       setShared("file-editor.openTabs", nextOpenTabs);
-      run("tab.select", { id: existingTabId });
+      run("tab.select", { id: placement.tabId });
       cx.notify();
       return;
     }
@@ -3139,6 +3206,11 @@ export default class FileEditor extends View {
     const menu = this.contextMenu;
     if (!menu) return null;
 
+    const activeSpace = (spaces() || []).find((s) => s.active);
+    const activeTab = (activeSpace?.tabs ?? []).find((t) => t.active);
+    const tabPanes = activeTab ? (panes() || []).filter((p) => p.tab === activeTab.id) : [];
+    const hasEmptySplit = tabPanes.length > 1 && tabPanes.some(isEmptyPane);
+
     const item = (id, label, iconPath, action, options = {}) =>
       h_flex()
         .id(id)
@@ -3193,6 +3265,9 @@ export default class FileEditor extends View {
           .on_mouse_down("right", (_e, cx) => cx.stop_propagation())
           .when(!menu.dir, (el) =>
             el.child(item("files-menu-open", "Open file", "mods/file-editor/file.svg", (cx) => this.openFileTab(menu.path, cx, { permanent: true })))
+          )
+          .when(!menu.dir && hasEmptySplit, (el) =>
+            el.child(item("files-menu-open-pane", "Place in empty pane", "mods/file-editor/file.svg", (cx) => this.openFileTab(menu.path, cx, { permanent: true })))
           )
           .child(item("files-menu-copy", "Copy path", "mods/file-editor/copy.svg", (cx) => this.copyPathToClipboard(menu.path, menu.dir, cx)))
           .child(item("files-menu-rename", "Rename", "mods/file-editor/rename.svg", (cx) => this.openRenameDialog(menu.path, menu.dir, cx)))
