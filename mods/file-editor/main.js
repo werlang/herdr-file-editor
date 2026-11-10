@@ -2433,11 +2433,24 @@ export default class FileEditor extends View {
     const editorTabIds = new Set(
       (panes() || []).filter((pane) => pane.mod === "file-editor").map((pane) => pane.tab)
     );
+    const pinnedTabIds = shared("tabs.pinned") ?? [];
+
+    // Plan the replacement before naming the new tab, so a preview that is
+    // about to be closed does not force a disambiguated title (e.g.
+    // dir/index.js instead of index.js).
+    let tabsForNaming = activeTabs;
+    if (!permanent) {
+      const prePlan = planPreviewOpen(openTabsMap, activeTabs, this.root, fileKey, pinnedTabIds, editorTabIds);
+      const closingIds = new Set([...prePlan.closeTabIds, ...prePlan.deferredCloseTabIds]);
+      if (closingIds.size > 0) {
+        tabsForNaming = activeTabs.filter((tab) => !closingIds.has(tab.id));
+      }
+    }
 
     const { existingTabId, tabName, updatedOpenTabs } = resolveFileTab(
       path,
       this.root,
-      activeTabs,
+      tabsForNaming,
       openTabsMap,
       allTabs,
       editorTabIds
@@ -2464,7 +2477,7 @@ export default class FileEditor extends View {
         activeTabs,
         this.root,
         fileKey,
-        shared("tabs.pinned") ?? [],
+        pinnedTabIds,
         editorTabIds
       );
       nextOpenTabs = plan.nextOpenTabs;

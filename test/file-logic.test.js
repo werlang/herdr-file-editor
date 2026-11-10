@@ -750,6 +750,20 @@ test("resolveFileTab - a renamed terminal is not reused as the file tab", () => 
   assert.equal(result.existingTabId, "tab-editor");
 });
 
+test("resolveFileTab - a preview about to be closed does not force a disambiguated name", () => {
+  const root = "/repo";
+  const openTabs = {
+    "/repo/a/index.js": { root, file: "a/index.js", tabName: "index.js", tabId: "tab-old", preview: true },
+  };
+  const allTabs = [{ id: "tab-old", name: "index.js", settled: false }];
+
+  // The view passes the tabs left after the replacement plan closes the old
+  // preview; the old entry itself survives pruning because its tab is in allTabs.
+  const result = resolveFileTab("b/index.js", root, [], openTabs, allTabs, []);
+  assert.equal(result.tabName, "index.js");
+  assert.equal(result.updatedOpenTabs["/repo/a/index.js"].preview, true);
+});
+
 test("isTabMatchingFile - accurately validates tab names against file paths", () => {
   const root = "/Users/pablowerlang/myrepo";
   assert.equal(isTabMatchingFile("README.md", "README.md", root), true);
