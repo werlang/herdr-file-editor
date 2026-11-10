@@ -29,6 +29,7 @@ import {
   isPreviewOpenTab,
   setOpenTabPreview,
   promotePreviewEntry,
+  shouldCoalescePendingOpen,
   collectPreviewTabs,
   planPreviewOpen,
   fileIconPath,
@@ -801,6 +802,16 @@ test("promotePreviewEntry - clears the preview flag in a copy", () => {
   const permanent = promotePreviewEntry(already.next, "/r/b.js");
   assert.equal(permanent.promoted, false);
   assert.equal("preview" in permanent.next["/r/b.js"], false);
+});
+
+test("shouldCoalescePendingOpen - covers the double-click window but not a later open", () => {
+  const pending = { fileKey: "/r/a.js", at: 1000 };
+  assert.equal(shouldCoalescePendingOpen(pending, "/r/a.js", 1100), true);
+  assert.equal(shouldCoalescePendingOpen(pending, "/r/a.js", 1599), true);
+  assert.equal(shouldCoalescePendingOpen(pending, "/r/a.js", 1600), false);
+  assert.equal(shouldCoalescePendingOpen(pending, "/r/b.js", 1100), false);
+  assert.equal(shouldCoalescePendingOpen(null, "/r/a.js", 1100), false);
+  assert.equal(shouldCoalescePendingOpen({ fileKey: "/r/a.js" }, "/r/a.js", 1100), false);
 });
 
 test("collectPreviewTabs - finds live previews for one root and preserves the tab id", () => {

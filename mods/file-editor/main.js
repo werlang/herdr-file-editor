@@ -57,6 +57,7 @@ import {
   isPreviewOpenTab,
   setOpenTabPreview,
   promotePreviewEntry,
+  shouldCoalescePendingOpen,
   collectPreviewTabs,
   planPreviewOpen,
   fileIconPath,
@@ -2409,7 +2410,7 @@ export default class FileEditor extends View {
     // still being created. Promote that pending preview instead of opening a
     // second tab.
     const pending = this.pendingFileOpen;
-    if (pending && pending.fileKey === fileKey && Date.now() - pending.at < 600) {
+    if (shouldCoalescePendingOpen(pending, fileKey)) {
       if (permanent) {
         setShared("file-editor.openTabs", setOpenTabPreview(openTabsMap, fileKey, false));
       }
@@ -2471,9 +2472,14 @@ export default class FileEditor extends View {
     // whole space with it.
     for (const tabId of deferredCloseTabIds) run("tab.close", { id: tabId });
 
+    // Keep the coalescing window open long enough for a normal double-click
+    // (the 60 ms timer below only records the new tab id and position).
+    cx.timer?.after?.(650, () => {
+      if (this.pendingFileOpen?.fileKey === fileKey) this.pendingFileOpen = null;
+    });
+
     cx.timer?.after?.(60, () => {
       if (this.closed) return;
-      if (this.pendingFileOpen?.fileKey === fileKey) this.pendingFileOpen = null;
       const activeSp = (spaces() || []).find((s) => s.active);
       const activeTab = (activeSp?.tabs || []).find((t) => t.active);
       if (activeTab?.id && isTabMatchingFile(activeTab.name, path, this.root)) {

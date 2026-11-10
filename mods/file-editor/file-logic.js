@@ -991,6 +991,27 @@ export function promotePreviewEntry(openTabs, fileKey) {
 }
 
 /**
+ * Whether a second click belongs to the first click's still-settling tab.
+ * The window covers a normal double-click (typically 100–500 ms) while staying
+ * short enough that a deliberate second open is never swallowed.
+ *
+ * @param {{ fileKey?: string, at?: number } | null | undefined} pending
+ * @param {string} fileKey
+ * @param {number} [now=Date.now()]
+ * @param {number} [windowMs=600]
+ * @returns {boolean}
+ */
+export function shouldCoalescePendingOpen(pending, fileKey, now = Date.now(), windowMs = 600) {
+  return Boolean(
+    pending &&
+      pending.fileKey === fileKey &&
+      typeof pending.at === "number" &&
+      now - pending.at >= 0 &&
+      now - pending.at < windowMs
+  );
+}
+
+/**
  * Collects live preview tabs in a space, resolving each to its real tab id.
  * Used to replace the previous temporary tab when another file is opened in
  * preview mode, and to italicize the file in the Files pane.
