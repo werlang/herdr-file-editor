@@ -176,6 +176,7 @@ export function renderFindBar(view, t) {
     .border_1()
     .border_color(t.border)
     .shadow_lg()
+    .key_context("FileEditorFind")
     .on_key_down((event, cx) => view.handleFindWidgetKeyDown(event, cx))
     .on_mouse_down("left", (_event, cx) => cx.stop_propagation())
     .child(
@@ -273,10 +274,16 @@ export function renderFindBar(view, t) {
  * @param {boolean} isCurrentLine
  * @param {Record<string, string>} t
  * @param {string} codeFont
+ * @param {number} scrollColumn Character offset that keeps the current match visible.
  * @returns {import("gpui-kit").Element}
  */
-function renderFindLine(index, lineText, matches, current, isCurrentLine, t, codeFont) {
-  const segments = lineMatchSegments(lineText, matches, index, current);
+function renderFindLine(index, lineText, matches, current, isCurrentLine, t, codeFont, scrollColumn) {
+  const offset = Math.max(0, Math.min(lineText.length, scrollColumn || 0));
+  const visibleText = offset > 0 ? lineText.slice(offset) : lineText;
+  const lineMatches = (Array.isArray(matches) ? matches : [])
+    .filter((match) => match.line === index && match.column + match.length > offset)
+    .map((match) => ({ ...match, column: match.column - offset }));
+  const segments = lineMatchSegments(visibleText, lineMatches, index, current);
   return h_flex()
     .h(FIND_LINE_HEIGHT)
     .w_full()
@@ -303,6 +310,7 @@ function renderFindLine(index, lineText, matches, current, isCurrentLine, t, cod
         .font_family(codeFont)
         .text_size(12.5)
         .text_color(t.foreground)
+        .when(offset > 0, (el) => el.child(div().flex_none().text_color(t.dim).child("…")))
         .children(
           segments.map((segment) =>
             div()
@@ -337,6 +345,7 @@ export function renderFindCodeView(view, t, codeFont) {
   const matches = view.find?.matches ?? [];
   const current = view.find?.current ?? -1;
   const currentLine = matches[current]?.line ?? -1;
+  const scrollColumn = view.find?.scrollColumn ?? 0;
 
   return v_flex()
     .id("file-find-code")
@@ -354,7 +363,7 @@ export function renderFindCodeView(view, t, codeFont) {
           const out = [];
           for (let index = range.start; index < range.end; index += 1) {
             out.push(
-              renderFindLine(index, lines[index] ?? "", matches, current, index === currentLine, t, codeFont)
+              renderFindLine(index, lines[index] ?? "", matches, current, index === currentLine, t, codeFont, scrollColumn)
             );
           }
           return out;
@@ -502,7 +511,8 @@ export function renderSearchSection(view, t) {
     running: search?.running === true,
   });
   const rows = view.searchRows ?? [];
-  const invalid = (search?.query?.length ?? 0) > 0 && search?.valid === false;
+  const searchQueryEmpty = (search?.query?.trim().length ?? 0) === 0;
+  const invalid = !searchQueryEmpty && search?.valid === false;
 
   const body = v_flex()
     .flex_1()
@@ -607,6 +617,14 @@ export function renderSearchSection(view, t) {
           .child(summary)
       )
     )
+    .when(Boolean(search?.warning), (el) =>
+      el.child(
+        div()
+          .text_size(9.5)
+          .text_color(t.dim)
+          .child(search.warning)
+      )
+    )
     .when(rows.length > 0, (el) =>
       el.child(
         div()
@@ -627,7 +645,7 @@ export function renderSearchSection(view, t) {
           .child(Scrollbar.vertical("file-search-results").absolute().inset_0())
       )
     )
-    .when(rows.length === 0 && (search?.query?.length ?? 0) > 0 && search?.valid !== false && !search?.running, (el) =>
+    .when(rows.length === 0 && !searchQueryEmpty && search?.valid !== false && !search?.running, (el) =>
       el.child(
         div()
           .p(6)
@@ -636,7 +654,7 @@ export function renderSearchSection(view, t) {
           .child(search?.error || "No results found")
       )
     )
-    .when(rows.length === 0 && (search?.query?.length ?? 0) === 0, (el) =>
+    .when(rows.length === 0 && searchQueryEmpty, (el) =>
       el.child(
         div()
           .p(6)
