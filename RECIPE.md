@@ -41,7 +41,7 @@ Inside any Herdr sidebar, split pane, or dedicated tab:
   - Right-clicking a row opens a context menu with `Open file` (files) and `Copy path`; it is clamped to the panel and dismissed by any outside press.
   - Reuses an already open, non-settled tab for the same file using `run("tab.select")` instead of creating duplicate tabs.
   - Disambiguates identical file names across different folders by prepending their parent directory (`dir/base`).
-  - **SEARCH** runs as you type with a ~300ms debounce, off the UI thread, and discards stale scans with a token. `rg --json` is preferred (respecting `.gitignore`); without ripgrep it falls back to `grep -rn` plus a JS re-match pass. Results cap at 2,000 matches / 200 files and show `(limited)`.
+  - **SEARCH** runs as you type with a ~300ms debounce, off the UI thread, and discards stale scans with a token. `rg --json` is preferred (respecting `.gitignore`; bounded to 1,000 columns, 2 MiB per file and 200 matches per file); without ripgrep it falls back to `grep -rn --null` plus a JS re-match pass (binary skip, `.git`/`node_modules` exclusion, 200 matches per file). Include/exclude globs are applied before the match cap. Both use a 20s timeout; superseded scans are ignored because `exec` has no cancellation handle. Results cap at 2,000 matches / 200 files and show `(limited)`. Partial exit-2 runs keep their matches with a dim warning; unsupported regex dialects read `Regex not supported by search: …`.
   - Clicking a search match opens the file through the normal preview path and passes `find: { query, caseSensitive, wholeWord, regex, line }`; the opened tab shows the find widget with that match current. Double-clicking promotes the preview tab.
 
 - In File Editor tab mode:
@@ -53,6 +53,7 @@ Inside any Herdr sidebar, split pane, or dedicated tab:
   - Watches the workspace directory via `watchFolder` so external edits reload automatically without clobbering active unsaved work.
   - Persists line wrap preferences in `shared("file-editor.wrap")`.
   - Persists the last find query and toggles in `shared("file-editor.find")`; opening find on a Markdown/SVG preview switches to Code view, since the read-only match view is the only surface that can scroll a match into view.
+  - Regex anchors match every line, whole-word keeps alternation candidates (`foo|foobar`), and the read-only view slices long lines horizontally to keep the current match visible. A `find` prop is applied once per file, and Escape is scoped to the find widget's key context so it does not swallow Escape elsewhere.
   - `EditorState` has no selection, cursor, scroll-to-line or decoration API, so the find widget renders its own virtualised read-only text view and leaves the native editor state untouched. Editing pauses while find is open; unsaved edits survive.
 
   - Zooms raster images and SVG previews at 25%–400%; 100% fits the pane and higher levels scroll in both directions.

@@ -56,7 +56,7 @@ Instead of opening raw code files inside the narrow Files panel, `file-editor` o
 - **Find in File**:
   - `Cmd+F` / `Ctrl+F` (or the `search.svg` toolbar button) opens a VS Code-style find bar docked over the editor: focused query input, `Aa` match case, `ab` whole word, `.*` regex (also `Alt+C` / `Alt+W` / `Alt+R`), an `N of M` counter, previous/next, and close.
   - `Enter` / `Shift+Enter`, `F3` / `Shift+F3`, and `Cmd/Ctrl+G` / `Cmd/Ctrl+Shift+G` step through matches with wrap-around; `Esc` closes and returns to the native editor.
-  - Every match is highlighted and the current one is scrolled into view. Invalid regexes show `Invalid regex` with a red input border instead of throwing. Images disable find.
+  - Every match is highlighted and the current one is scrolled into view, horizontally too when it lies past the pane width. Regex `^`/`$` anchor at every line, whole-word matches backtrack through alternations (`foo|foobar`), and invalid regexes show `Invalid regex` with a red input border instead of throwing. Images disable find.
   - The widget renders a read-only, virtualised text view while open because GPUI's `EditorState` has no selection/cursor/decoration API; the native editor state is left untouched, so unsaved edits survive. Markdown and SVG previews switch to Code view when find opens.
   - The last query and toggles persist in `shared("file-editor.find")`.
 - **Find in Files (SEARCH sidebar)**:
@@ -64,7 +64,8 @@ Instead of opening raw code files inside the narrow Files panel, `file-editor` o
   - Search accepts `Aa` / `ab` / `.*` toggles and comma-separated `files to include` / `files to exclude` globs behind a `…` toggle (e.g. `src/**, *.js` and `dist/**`).
   - A summary line reports `N results in M files` (or `No results`, `Invalid regex`, `Searching…`), and results are grouped by file with a file icon, dim relative directory, match-count badge and per-file collapse.
   - Each match row shows its line number and trimmed context with the matched span highlighted. Clicking a result opens the file through the normal preview-tab path and jumps to that match; double-clicking promotes it to permanent.
-  - Searches are debounced (~300ms), run off the UI thread, and discard stale results with a token. `rg --json` is used when ripgrep exists (respecting `.gitignore`); otherwise the mod falls back to `grep -rn` and the pure JS match engine. Results cap at 2,000 matches / 200 files with a visible `(limited)` note.
+  - Searches are debounced (~300ms), run off the UI thread, and discard stale results with a token. `rg --json` is used when ripgrep exists (respecting `.gitignore`); otherwise the mod falls back to `grep -rn --null` and the pure JS match engine. Glob filtering happens before the match cap, so `*.md` cannot be starved by other files.
+  - rg is bounded to 1,000 columns, 2 MiB per file and 200 matches per file; grep skips binaries, `.git` and `node_modules` and caps each file. Both run with a 20s timeout; superseded scans are ignored rather than cancelled (the host `exec` API has no cancellation handle). Partial exit-2 runs keep their parsed matches and show a dim warning, and unsupported regex dialects are reported as `Regex not supported by search: …`. Results cap at 2,000 matches / 200 files with a visible `(limited)` note.
 
 - **Edge Case & Safety Protections**:
   - Friendly warnings for deleted or missing files (`"This file is no longer available"`).
