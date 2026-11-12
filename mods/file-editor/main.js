@@ -94,27 +94,39 @@ import {
 } from "./file-logic.js";
 import {
   FIND_MATCH_CAP,
+  REPLACE_MAX_BYTES,
   SEARCH_FILE_CAP,
   SEARCH_MATCH_CAP,
+  SEARCH_ROW_HEIGHT,
+  applyReplacements,
   buildFindRegExp,
   buildGrepArgs,
   buildRipgrepArgs,
+  classifyReplacementRead,
   classifySearchResult,
+  collectReplaceTargets,
   expandGrepRows,
+  expandSearchReplacement,
   filterSearchRowsByGlobs,
   findHorizontalOffset,
   findMatchIndexAtLine,
   findMatches,
   findPropSignature,
   flattenSearchRows,
+  formatReplaceAllConfirmation,
   formatSearchError,
   groupSearchRows,
+  isDirtyFileState,
   normalizeFindPrefs,
   normalizeFindProp,
+  normalizeReplacePrefs,
   normalizeSections,
   parseGlobList,
   parseGrepOutput,
   parseRgJson,
+  planFileReplacements,
+  replacementDiffSegments,
+  replaceSingleMatch,
   shouldConsumePendingFind,
   shouldPromoteSearchClick,
   stepMatchIndex,
@@ -130,6 +142,12 @@ import { renderMarkdownDocument } from "./markdown-view.js";
 
 /** In-memory cache for open and recent file tab states (scroll, cursor, text, view mode, EditorState). */
 const fileTabStates = new Map();
+
+/**
+ * File keys with unsaved editor edits. Kept outside the bounded LRU cache so
+ * a dirty tab cannot be evicted and then overwritten by a Files-pane replace.
+ */
+const dirtyFileKeys = new Set();
 
 /** Max number of file editor instances to retain in the LRU cache. */
 const MAX_CACHED_FILE_STATES = 15;
@@ -153,6 +171,8 @@ function ensureFileEditorKeyBindings(cx) {
       { keystroke: "ctrl-shift-g", action: "file-editor.find-prev", context: "FileEditor" },
       { keystroke: "f3", action: "file-editor.find-next", context: "FileEditor" },
       { keystroke: "shift-f3", action: "file-editor.find-prev", context: "FileEditor" },
+      { keystroke: "cmd-alt-f", action: "file-editor.replace", context: "FileEditor" },
+      { keystroke: "ctrl-h", action: "file-editor.replace", context: "FileEditor" },
       { keystroke: "escape", action: "file-editor.find-close", context: "FileEditorFind" },
       { keystroke: "cmd-shift-f", action: "file-editor.search", context: "FilesPane" },
       { keystroke: "ctrl-shift-f", action: "file-editor.search", context: "FilesPane" },
@@ -299,6 +319,39 @@ async function writeRemoteTextFile(fullPath, text, on, expected) {
 }
 
 /**
+ * Reads a file's size in bytes on the local machine or a remote one.
+ *
+ * `readTextFile` caps reads at 1 MiB, so a Files-pane replace must know the
+ * real size before trusting the text it read. Returns null when the size
+ * cannot be determined; callers skip the file rather than risk a truncated
+ * write.
+ *
+ * @param {string} fullPath
+ * @param {string | null} on
+ * @returns {Promise<number | null>}
+ */
+async function fileByteSize(fullPath, on) {
+  const parse = (value) => {
+    const size = Number(String(value ?? "").trim());
+    return Number.isFinite(size) && size >= 0 ? size : null;
+  };
+  const powershell = async () => {
+    const result = await exec(
+      "powershell",
+      ["-NoProfile", "-Command", "(Get-Item -LiteralPath $args[0]).Length", fullPath],
+      { on }
+    ).catch(() => null);
+    return result && result.code === 0 ? parse(result.stdout) : null;
+  };
+
+  if (!on && window()?.platform === "windows") return powershell();
+  const result = await exec("sh", ["-c", 'wc -c < "$1"', "size", fullPath], { on }).catch(() => null);
+  if (result && result.code === 0) return parse(result.stdout);
+  // A remote Windows machine or a shell without wc.
+  return powershell();
+}
+
+/**
  * Renames a file or directory on local or remote machine.
  *
  * @param {string | null} root - Workspace root.
@@ -434,15 +487,21 @@ export default class FileEditor extends View {
     } catch {}
     this.findInput = null;
     try {
+      this.replaceInput?.release();
+    } catch {}
+    this.replaceInput = null;
+    try {
       this.findScrollHandle?.release();
     } catch {}
     this.findScrollHandle = null;
-    for (const input of [this.searchInput, this.includeInput, this.excludeInput]) {
+    this.findUndo = [];
+    for (const input of [this.searchInput, this.searchReplaceInput, this.includeInput, this.excludeInput]) {
       try {
         input?.release();
       } catch {}
     }
     this.searchInput = null;
+    this.searchReplaceInput = null;
     this.includeInput = null;
     this.excludeInput = null;
 
@@ -551,6 +610,7 @@ export default class FileEditor extends View {
     // widget is open the tab renders a read-only, highlighted virtual list
     // instead of the native Editor (see find-view.js).
     const persistedFind = normalizeFindPrefs(shared("file-editor.find"));
+    const persistedReplace = normalizeReplacePrefs(shared("file-editor.find"));
     const propFind = normalizeFindProp(p.find);
     const propSignature = findPropSignature(p.find);
     const consumedFindSignature = cached?.findPropSignature ?? null;
@@ -567,6 +627,9 @@ export default class FileEditor extends View {
       caseSensitive: activePropFind?.caseSensitive ?? persistedFind.caseSensitive,
       wholeWord: activePropFind?.wholeWord ?? persistedFind.wholeWord,
       regex: activePropFind?.regex ?? persistedFind.regex,
+      replace: activePropFind?.replace ?? persistedReplace.replace,
+      replaceOpen: activePropFind?.replaceOpen ?? persistedReplace.replaceOpen,
+      preserveCase: activePropFind?.preserveCase ?? persistedReplace.preserveCase,
       valid: true,
       error: null,
       matches: [],
@@ -579,6 +642,21 @@ export default class FileEditor extends View {
     this.findInput = InputState.new({ placeholder: "Find", value: this.find.query });
     this.findInput.on("change", (_event, eventCx) => this.handleFindInputChange(eventCx));
     this.findInput.on("submit", (event, eventCx) => this.stepFind(event?.shift ? -1 : 1, eventCx));
+    this.findInput.on("focus", () => {
+      this.findFocusTarget = "find";
+    });
+    this.replaceInput = InputState.new({ placeholder: "Replace", value: this.find.replace });
+    this.replaceInput.on("change", (_event, eventCx) => this.handleReplaceInputChange(eventCx));
+    this.replaceInput.on("submit", (event, eventCx) => {
+      if (event?.secondary) this.replaceAllInEditor(eventCx);
+      else this.replaceCurrentMatch(eventCx);
+    });
+    this.replaceInput.on("focus", () => {
+      this.findFocusTarget = "replace";
+    });
+    this.findFocusTarget = "find";
+    this.findUndo = [];
+    this.lastReplaceActionAt = 0;
     this.lastPendingFindTimestamp = null;
     if (this.find.open) {
       // A find prop wins over the preview default: the read-only match view is
@@ -594,7 +672,10 @@ export default class FileEditor extends View {
     } else if (cached) {
       fileTabStates.set(this.fileKey, { ...cached, lastAccess: Date.now() });
     }
-    if (shouldOpenPropFind) this.updateCachedTabState();
+    if (shouldOpenPropFind) {
+      this.persistFindPrefs();
+      this.updateCachedTabState();
+    }
 
     // Register this open tab in shared state
     this.registerOpenTab(p);
@@ -647,6 +728,8 @@ export default class FileEditor extends View {
       ...patch,
     };
     fileTabStates.set(this.fileKey, updated);
+    if (updated.dirty) dirtyFileKeys.add(this.fileKey);
+    else dirtyFileKeys.delete(this.fileKey);
     savePersistedTabState(this.fileKey, {
       viewMode: updated.viewMode,
       imageZoom: updated.imageZoom,
@@ -655,6 +738,7 @@ export default class FileEditor extends View {
       pictureScrollX: updated.pictureScrollX,
       pictureScrollY: updated.pictureScrollY,
       findPropSignature: updated.findPropSignature,
+      dirty: updated.dirty === true,
     });
     const evicted = pruneFileTabStates(fileTabStates, MAX_CACHED_FILE_STATES, this.fileKey);
     for (const { entry } of evicted) {
@@ -921,6 +1005,7 @@ export default class FileEditor extends View {
         const hadUnsavedEdits = this.dirty;
         this.rawText = isBinary ? null : text;
         this.preparedText = preparedText;
+        this.findUndo = [];
         this.fileError = error;
         this.lineCount = lineCount;
         this.isBinary = isBinary;
@@ -1652,6 +1737,7 @@ export default class FileEditor extends View {
       .track_focus(this.focusHandle)
       .key_context("FileEditor")
       .on_action("file-editor.find", (_event, cx) => this.openFind(cx))
+      .on_action("file-editor.replace", (_event, cx) => this.openFindReplace(cx))
       .on_action("file-editor.find-next", (_event, cx) => this.stepFindOrOpen(1, cx))
       .on_action("file-editor.find-prev", (_event, cx) => this.stepFindOrOpen(-1, cx))
       .on_action("file-editor.find-close", (_event, cx) => this.closeFind(cx))
@@ -2354,6 +2440,9 @@ export default class FileEditor extends View {
       caseSensitive: this.find.caseSensitive,
       wholeWord: this.find.wholeWord,
       regex: this.find.regex,
+      replace: this.find.replace ?? "",
+      replaceOpen: this.find.replaceOpen === true,
+      preserveCase: this.find.preserveCase === true,
     });
   }
 
@@ -2375,12 +2464,38 @@ export default class FileEditor extends View {
   }
 
   /**
+   * Focuses the replace input on the next few frames, mirroring
+   * `focusFindInput` so the editor's own focus restoration cannot steal it.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  focusReplaceInput(cx) {
+    const attempt = () => {
+      if (this.closed || !this.find?.open || !this.find?.replaceOpen) return;
+      this.replaceInput?.focus();
+    };
+    attempt();
+    cx.timer.after(30, attempt);
+    cx.timer.after(140, attempt);
+  }
+
+  /**
    * Opens the find widget, optionally seeded with a query, toggles and a line.
    * Markdown and SVG previews switch to Code view because the read-only match
    * view is the surface that can highlight and scroll to a match.
    *
    * @param {import("gpui-kit").ViewContext} cx
-   * @param {{ query?: string, caseSensitive?: boolean, wholeWord?: boolean, regex?: boolean, line?: number }} [options]
+   * @param {{
+   *   query?: string,
+   *   caseSensitive?: boolean,
+   *   wholeWord?: boolean,
+   *   regex?: boolean,
+   *   line?: number,
+   *   replace?: string,
+   *   replaceOpen?: boolean,
+   *   preserveCase?: boolean,
+   *   focusReplace?: boolean,
+   * }} [options]
    */
   openFind(cx, options = {}) {
     if (this.closed || this.isImage || !this.find || !this.findInput) return;
@@ -2388,6 +2503,7 @@ export default class FileEditor extends View {
     if (hasPreview && this.viewMode !== "code") {
       this.setViewMode("code", cx, { focus: false });
     }
+    if (!this.code && this.preparedText !== null && !this.isBinary) this.rebuildEditor();
     if (typeof options.query === "string") {
       this.find.query = options.query;
       this.findInput.set_value(options.query);
@@ -2395,13 +2511,30 @@ export default class FileEditor extends View {
     for (const key of ["caseSensitive", "wholeWord", "regex"]) {
       if (typeof options[key] === "boolean") this.find[key] = options[key];
     }
+    if (typeof options.replace === "string") {
+      this.find.replace = options.replace;
+      this.replaceInput?.set_value(options.replace);
+    }
+    if (typeof options.replaceOpen === "boolean") this.find.replaceOpen = options.replaceOpen;
+    if (typeof options.preserveCase === "boolean") this.find.preserveCase = options.preserveCase;
     if (Number.isFinite(options.line)) this.pendingFindLine = options.line;
     this.find.open = true;
     this.find.scrollColumn = 0;
     this.refreshFindMatches(cx, false);
     this.persistFindPrefs();
-    this.focusFindInput(cx);
+    if (options.focusReplace === true && this.find.replaceOpen) this.focusReplaceInput(cx);
+    else this.focusFindInput(cx);
     cx.notify();
+  }
+
+  /**
+   * Opens find with the replace row expanded (Cmd+Alt+F / Ctrl+H).
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  openFindReplace(cx) {
+    if (this.closed || this.isImage || !this.find) return;
+    this.openFind(cx, { replaceOpen: true, focusReplace: true });
   }
 
   /**
@@ -2417,6 +2550,9 @@ export default class FileEditor extends View {
       wholeWord: find.wholeWord,
       regex: find.regex,
       line: find.line ?? undefined,
+      replace: typeof find.replace === "string" ? find.replace : undefined,
+      replaceOpen: typeof find.replaceOpen === "boolean" ? find.replaceOpen : undefined,
+      preserveCase: typeof find.preserveCase === "boolean" ? find.preserveCase : undefined,
     });
   }
 
@@ -2431,6 +2567,7 @@ export default class FileEditor extends View {
     if (!this.find?.open) return;
     this.find.open = false;
     this.pendingFindLine = null;
+    this.findUndo = [];
     if (options.focus !== false) {
       const refocus = (timerCx) => {
         if (!this.closed && !this.find?.open) this.focusEditor(timerCx);
@@ -2567,6 +2704,191 @@ export default class FileEditor extends View {
   }
 
   /**
+   * The match options currently shown in the find bar.
+   *
+   * @returns {{ query: string, caseSensitive: boolean, wholeWord: boolean, regex: boolean }}
+   */
+  findOptions() {
+    return {
+      query: this.find?.query ?? "",
+      caseSensitive: this.find?.caseSensitive === true,
+      wholeWord: this.find?.wholeWord === true,
+      regex: this.find?.regex === true,
+    };
+  }
+
+  /**
+   * Handles typing in the replace input. The replacement does not affect the
+   * match set, so this only persists the value and repaints the bar.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  handleReplaceInputChange(cx) {
+    if (!this.find) return;
+    this.find.replace = this.replaceInput ? this.replaceInput.value() : "";
+    this.persistFindPrefs();
+    cx.notify();
+  }
+
+  /**
+   * Expands or collapses the replace row and moves focus into it when opening.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  toggleFindReplace(cx) {
+    if (!this.find) return;
+    this.find.replaceOpen = !this.find.replaceOpen;
+    this.persistFindPrefs();
+    if (this.find.replaceOpen) this.focusReplaceInput(cx);
+    else this.focusFindInput(cx);
+    cx.notify();
+  }
+
+  /**
+   * Toggles preserve-case (AB) and persists it.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  togglePreserveCase(cx) {
+    if (!this.find) return;
+    this.find.preserveCase = !this.find.preserveCase;
+    this.persistFindPrefs();
+    this.focusReplaceInput(cx);
+    cx.notify();
+  }
+
+  /**
+   * Whether the replace row can edit the buffer: the file must have an editor
+   * and must not be read-only.
+   *
+   * @returns {boolean}
+   */
+  canEditWithReplace() {
+    return Boolean(this.find?.open && this.find?.replaceOpen && this.code && !this.isReadonly());
+  }
+
+  /**
+   * Pushes the text before a replace operation onto the small in-memory undo
+   * stack. `set_value` may reset the native undo history, so the find bar owns
+   * this fallback while it is open.
+   *
+   * @param {{ text: string, current: number }} entry
+   */
+  pushFindUndo(entry) {
+    if (!this.findUndo) this.findUndo = [];
+    this.findUndo.push(entry);
+    if (this.findUndo.length > 50) this.findUndo.shift();
+  }
+
+  /**
+   * Writes replacement text into the editor buffer without touching disk.
+   * Updates dirty state, line count and the cached tab state, and promotes a
+   * preview tab exactly like a normal edit.
+   *
+   * @param {string} text
+   */
+  setEditorText(text) {
+    if (!this.code) return;
+    this.code.set_value(text);
+    this.preparedText = text;
+    const dirty = isContentDirty(text, this.rawText);
+    if (dirty && !this.dirty) this.promotePreviewTab();
+    this.dirty = dirty;
+    this.lineCount = countLines(text);
+    this.updateCachedTabState({ dirty, lineCount: this.lineCount, preparedText: text });
+  }
+
+  /**
+   * Replaces the current match, then selects the next match at or after the
+   * inserted replacement (wrapping when needed).
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  replaceCurrentMatch(cx) {
+    if (!this.canEditWithReplace() || !this.find?.matches?.length) return;
+    const current = this.find.current;
+    if (current < 0 || current >= this.find.matches.length) return;
+    const now = Date.now();
+    if (this.lastReplaceActionAt && now - this.lastReplaceActionAt < 80) return;
+    this.lastReplaceActionAt = now;
+    const before = this.findSourceText();
+    const result = replaceSingleMatch(before, this.find.matches, current, this.find.replace ?? "", {
+      ...this.findOptions(),
+      preserveCase: this.find.preserveCase === true,
+      cap: FIND_MATCH_CAP,
+    });
+    if (!result.replaced) return;
+    this.pushFindUndo({ text: before, current });
+    this.setEditorText(result.text);
+    this.find.matches = result.matches;
+    this.find.valid = result.valid;
+    this.find.error = result.error;
+    this.find.limited = result.limited;
+    this.find.current = result.nextIndex;
+    this.pendingFindLine = null;
+    if (this.find.current >= 0) this.scrollToCurrentFindMatch(cx);
+    this.persistFindPrefs();
+    cx.notify();
+  }
+
+  /**
+   * Replaces every match in the buffer. Zero matches is a no-op and never
+   * marks the tab dirty.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  replaceAllInEditor(cx) {
+    if (!this.canEditWithReplace()) return;
+    const now = Date.now();
+    if (this.lastReplaceActionAt && now - this.lastReplaceActionAt < 80) return;
+    this.lastReplaceActionAt = now;
+    const before = this.findSourceText();
+    // The visible match list is capped at FIND_MATCH_CAP for rendering; a
+    // Replace All must still cover every match in the buffer.
+    const full = findMatches(before, this.find.query, {
+      ...this.findOptions(),
+      cap: Number.MAX_SAFE_INTEGER,
+    });
+    if (!full.valid || full.matches.length === 0) return;
+    const next = applyReplacements(before, full.matches, this.find.replace ?? "", {
+      ...this.findOptions(),
+      preserveCase: this.find.preserveCase === true,
+    });
+    if (next === before) return;
+    this.pushFindUndo({ text: before, current: this.find.current });
+    this.setEditorText(next);
+    this.refreshFindMatches(cx, false);
+    this.persistFindPrefs();
+    cx.notify();
+  }
+
+  /**
+   * Restores the buffer before the last replace operation while find is open.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   * @returns {boolean} Whether an entry was restored.
+   */
+  undoFindReplace(cx) {
+    if (!this.findUndo?.length || !this.code) return false;
+    // This is only called from the widget's on_key_down after checking that
+    // the stack is non-empty; with no binding, Cmd+Z propagates to the input
+    // when there is nothing to undo.
+    const entry = this.findUndo.pop();
+    this.setEditorText(entry.text);
+    this.refreshFindMatches(cx, false);
+    this.find.current =
+      entry.current >= 0 && entry.current < this.find.matches.length
+        ? entry.current
+        : this.find.matches.length > 0
+          ? 0
+          : -1;
+    if (this.find.current >= 0) this.scrollToCurrentFindMatch(cx);
+    this.persistFindPrefs();
+    cx.notify();
+    return true;
+  }
+
+  /**
    * Key handling while the find widget is open. Registered on the tab root and
    * on the widget so shortcuts still work when the input consumed the key.
    *
@@ -2585,10 +2907,43 @@ export default class FileEditor extends View {
       this.closeFind(cx);
       return true;
     }
-    if (command && key === "f") {
+    if (
+      (modifiers.platform && modifiers.alt && key === "f") ||
+      (modifiers.control && !modifiers.platform && !modifiers.alt && key === "h")
+    ) {
+      cx.stop_propagation();
+      this.openFindReplace(cx);
+      return true;
+    }
+    if (command && !modifiers.alt && key === "f") {
       cx.stop_propagation();
       this.focusFindInput(cx);
       return true;
+    }
+    if (command && !modifiers.shift && key === "z" && this.findUndo?.length) {
+      cx.stop_propagation();
+      this.undoFindReplace(cx);
+      return true;
+    }
+    if (key === "enter" && this.find.replaceOpen) {
+      const replaceAllChord = (modifiers.platform && !modifiers.shift) || (modifiers.control && modifiers.alt);
+      if (replaceAllChord) {
+        cx.stop_propagation();
+        this.replaceAllInEditor(cx);
+        return true;
+      }
+      if (this.findFocusTarget === "replace" && !modifiers.shift) {
+        cx.stop_propagation();
+        this.replaceCurrentMatch(cx);
+        return true;
+      }
+    }
+    if (command && modifiers.shift && (key === "1" || key === "!" || keystroke === "cmd-shift-1" || keystroke === "ctrl-shift-1")) {
+      if (this.find.replaceOpen) {
+        cx.stop_propagation();
+        this.replaceCurrentMatch(cx);
+        return true;
+      }
     }
     if (modifiers.alt && !modifiers.platform && !modifiers.control) {
       const isC = key === "c" || key === "ç" || keystroke === "alt-c";
@@ -2659,6 +3014,9 @@ export default class FileEditor extends View {
       include: "",
       exclude: "",
       filtersOpen: false,
+      replace: "",
+      replaceOpen: false,
+      preserveCase: false,
       groups: [],
       totalMatches: 0,
       totalFiles: 0,
@@ -2674,11 +3032,21 @@ export default class FileEditor extends View {
     this.rgAvailable = null;
     this.rgContextKey = null;
     this.lastSearchClick = null;
+    this.searchHoveredRow = null;
+    this.searchDiffCacheKey = "";
+    this.searchDiffCache = new Map();
+    this.replaceDialog = null;
+    this.replaceRunning = false;
+    this.pendingSearchReplaceDialog = false;
+    this.searchScrollY = 0;
+    this.searchViewportHeight = 0;
     this.searchInput = InputState.new({ placeholder: "Search" });
+    this.searchReplaceInput = InputState.new({ placeholder: "Replace" });
     this.includeInput = InputState.new({ placeholder: "files to include (e.g. src/**, *.js)" });
     this.excludeInput = InputState.new({ placeholder: "files to exclude (e.g. dist/**, *.lock)" });
     this.searchInput.on("change", (_event, eventCx) => this.handleSearchInputChange(eventCx));
     this.searchInput.on("submit", (_event, eventCx) => this.runSearchNow(eventCx));
+    this.searchReplaceInput.on("change", (_event, eventCx) => this.handleSearchReplaceInputChange(eventCx));
     this.includeInput.on("change", (_event, eventCx) => this.handleSearchFilterChange(eventCx));
     this.excludeInput.on("change", (_event, eventCx) => this.handleSearchFilterChange(eventCx));
 
@@ -2692,8 +3060,16 @@ export default class FileEditor extends View {
       this.search.regex = initialSearch.regex === true;
       this.search.include = typeof initialSearch.include === "string" ? initialSearch.include : "";
       this.search.exclude = typeof initialSearch.exclude === "string" ? initialSearch.exclude : "";
+      this.search.replace = typeof initialSearch.replace === "string" ? initialSearch.replace : "";
+      this.search.replaceOpen =
+        initialSearch.replaceOpen === true || this.search.replace.length > 0;
+      this.search.preserveCase = initialSearch.preserveCase === true;
+      // UI-only screenshot/automation hook: open the Replace All dialog for
+      // the settled results without ever running a replacement.
+      this.pendingSearchReplaceDialog = initialSearch.replaceDialog === true;
       this.search.filtersOpen = Boolean(this.search.include || this.search.exclude);
       this.searchInput.set_value(this.search.query);
+      this.searchReplaceInput.set_value(this.search.replace);
       this.includeInput.set_value(this.search.include);
       this.excludeInput.set_value(this.search.exclude);
       this.sections.search = true;
@@ -3475,6 +3851,9 @@ export default class FileEditor extends View {
         }
 
         remapRenamedFileStates(fileTabStates, oldPath, newPath, root);
+        const oldDirtyKey = toFileKey(root, oldPath);
+        const newDirtyKey = toFileKey(root, newPath);
+        if (dirtyFileKeys.delete(oldDirtyKey)) dirtyFileKeys.add(newDirtyKey);
 
         if (this.context) {
           await this.loadFolder(parentFolder, this.context);
@@ -3570,6 +3949,10 @@ export default class FileEditor extends View {
         for (const { entry } of removedEntries) {
           entry.code?.release();
         }
+        const deletedKey = toFileKey(root, path);
+        for (const key of Array.from(dirtyFileKeys)) {
+          if (key === deletedKey || key.startsWith(`${deletedKey}/`)) dirtyFileKeys.delete(key);
+        }
 
         if (this.context) {
           await this.loadFolder(parentFolder, this.context);
@@ -3607,6 +3990,7 @@ export default class FileEditor extends View {
     }
     this.renameDialog = null;
     this.deleteDialog = null;
+    this.replaceDialog = null;
     if (cx) cx.notify();
   }
 
@@ -3634,6 +4018,16 @@ export default class FileEditor extends View {
       }
       return;
     }
+    if (this.replaceDialog) {
+      if (event.key === "escape") {
+        cx.stop_propagation();
+        this.closeModals(cx);
+      } else if (event.key === "enter") {
+        cx.stop_propagation();
+        this.submitReplaceAllFiles(cx);
+      }
+      return;
+    }
     if (this.contextMenu) {
       if (event.key === "escape") {
         cx.stop_propagation();
@@ -3652,6 +4046,16 @@ export default class FileEditor extends View {
     if (isSearchShortcut && !event.is_held) {
       cx.stop_propagation();
       this.focusSearch(cx);
+      return;
+    }
+
+    const isReplaceAllShortcut =
+      event.keystroke === "cmd-shift-1" ||
+      event.keystroke === "ctrl-shift-1" ||
+      (commandOrControl && Boolean(event.modifiers?.shift) && (key === "1" || key === "!"));
+    if (isReplaceAllShortcut && !event.is_held && this.search.replaceOpen === true) {
+      cx.stop_propagation();
+      this.replaceAllInFiles(cx);
     }
   }
 
@@ -3737,6 +4141,467 @@ export default class FileEditor extends View {
   }
 
   /**
+   * Handles typing in the SEARCH replace input. It only repaints the inline
+   * diff preview; the query itself does not change.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  handleSearchReplaceInputChange(cx) {
+    this.search.replace = this.searchReplaceInput ? this.searchReplaceInput.value() : "";
+    cx.notify();
+  }
+
+  /**
+   * Shows or hides the SEARCH replace row.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  toggleSearchReplace(cx) {
+    this.search.replaceOpen = !this.search.replaceOpen;
+    const attempt = () => {
+      if (this.closed) return;
+      if (this.search.replaceOpen) this.searchReplaceInput?.focus();
+      else this.searchInput?.focus();
+    };
+    attempt();
+    cx.timer.after(40, attempt);
+    cx.notify();
+  }
+
+  /**
+   * Toggles preserve-case for Replace All in files.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  toggleSearchPreserveCase(cx) {
+    this.search.preserveCase = !this.search.preserveCase;
+    cx.notify();
+  }
+
+  /**
+   * The match options used by the current SEARCH query.
+   *
+   * @returns {{ query: string, caseSensitive: boolean, wholeWord: boolean, regex: boolean }}
+   */
+  searchFindOptions() {
+    return {
+      query: this.search.query,
+      caseSensitive: this.search.caseSensitive === true,
+      wholeWord: this.search.wholeWord === true,
+      regex: this.search.regex === true,
+    };
+  }
+
+  /**
+   * The inline strike/insert diff for one SEARCH result row, or null when the
+   * replace row is collapsed or the query is invalid.
+   *
+   * @param {{ file: string }} group
+   * @param {{ line: number, column: number, length: number, text: string }} match
+   * @param {number} [visibleLength] Clamped match length from the row's context trim.
+   * @returns {Array<{ kind: "removed" | "inserted", text: string }> | null}
+   */
+  searchRowDiff(group, match, visibleLength = match.length) {
+    if (this.search.replaceOpen !== true || this.search.valid === false) return null;
+    const cacheKey = JSON.stringify([
+      this.search.query,
+      this.search.caseSensitive,
+      this.search.wholeWord,
+      this.search.regex,
+      this.search.replace,
+      this.search.preserveCase,
+    ]);
+    if (this.searchDiffCacheKey !== cacheKey) {
+      this.searchDiffCacheKey = cacheKey;
+      this.searchDiffCache.clear();
+    }
+    const shownLength = Math.max(0, Math.min(match.length, visibleLength));
+    const rowKey = `${group.file}\u0000${match.line}\u0000${match.column}\u0000${shownLength}\u0000${match.text}`;
+    if (this.searchDiffCache.has(rowKey)) return this.searchDiffCache.get(rowKey);
+    const removed = match.text.slice(match.column, match.column + shownLength);
+    const inserted = expandSearchReplacement(
+      match.text,
+      this.search.query,
+      this.searchFindOptions(),
+      match,
+      this.search.replace ?? "",
+      { preserveCase: this.search.preserveCase === true }
+    );
+    const diff = replacementDiffSegments(removed, inserted);
+    this.searchDiffCache.set(rowKey, diff);
+    return diff;
+  }
+
+  /**
+   * Tracks which SEARCH row is hovered so its Replace/Dismiss actions show.
+   *
+   * @param {string} key
+   * @param {boolean} hovered
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  setSearchHoveredRow(key, hovered, cx) {
+    // Hover actions only exist while the replace row is open. Skipping the
+    // state change otherwise avoids re-rendering a large result list.
+    if (this.search.replaceOpen !== true) return;
+    if (hovered) {
+      if (this.searchHoveredRow === key) return;
+      this.searchHoveredRow = key;
+    } else if (this.searchHoveredRow === key) {
+      this.searchHoveredRow = null;
+    } else {
+      return;
+    }
+    cx.notify();
+  }
+
+  /**
+   * Clamps the manual SEARCH scroll offset to the current row count.
+   */
+  clampSearchScroll() {
+    const viewport = this.searchViewportHeight || 240;
+    const maxScroll = Math.max(0, (this.searchRows?.length ?? 0) * SEARCH_ROW_HEIGHT - viewport);
+    this.searchScrollY = Math.max(0, Math.min(maxScroll, this.searchScrollY || 0));
+  }
+
+  /**
+   * Records the measured height of the SEARCH results viewport. The windowed
+   * list uses it to decide how many rows to render.
+   *
+   * @param {{ width?: number, height?: number }} size
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  updateSearchViewport(size, cx) {
+    const height = Math.max(0, Math.round(Number(size?.height) || 0));
+    if (height === this.searchViewportHeight) return;
+    this.searchViewportHeight = height;
+    this.clampSearchScroll();
+    cx.notify();
+  }
+
+  /**
+   * Scrolls the manual SEARCH result window. The list is not a virtual list
+   * because GPUI forbids handlers inside a virtual-list renderer; instead it
+   * owns the offset and renders the visible rows plus overscan.
+   *
+   * @param {import("gpui-kit").ScrollWheelEvent} event
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  handleSearchWheel(event, cx) {
+    const delta =
+      event.delta?.y !== 0 && event.delta?.y !== undefined
+        ? event.delta.y
+        : event.delta_lines?.y
+          ? event.delta_lines.y * SEARCH_ROW_HEIGHT
+          : 0;
+    if (delta === 0) return;
+    const viewport = this.searchViewportHeight || 240;
+    const maxScroll = Math.max(0, (this.searchRows?.length ?? 0) * SEARCH_ROW_HEIGHT - viewport);
+    const next = Math.max(0, Math.min(maxScroll, (this.searchScrollY || 0) - delta));
+    if (next !== this.searchScrollY) {
+      this.searchScrollY = next;
+      this.searchHoveredRow = null;
+      cx.notify();
+    }
+  }
+
+  /**
+   * Rebuilds totals and the flat row list after a dismissal.
+   */
+  recomputeSearchResults() {
+    this.search.groups = this.search.groups.filter((group) => group.count > 0);
+    this.search.totalMatches = this.search.groups.reduce((sum, group) => sum + group.count, 0);
+    this.search.totalFiles = this.search.groups.length;
+    this.searchRows = flattenSearchRows(this.search.groups, this.search.collapsedFiles);
+    this.searchHoveredRow = null;
+    this.searchDiffCache.clear();
+    this.clampSearchScroll();
+  }
+
+  /**
+   * Removes one match row from the in-memory results.
+   *
+   * @param {Record<string, any>} group
+   * @param {Record<string, any>} match
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  dismissSearchMatch(group, match, cx) {
+    const target = this.search.groups.find((candidate) => candidate.file === group.file);
+    if (!target) return;
+    const index = target.matches.indexOf(match);
+    if (index < 0) return;
+    target.matches.splice(index, 1);
+    target.count = target.matches.length;
+    this.recomputeSearchResults();
+    cx.notify();
+  }
+
+  /**
+   * Removes a whole file group from the in-memory results.
+   *
+   * @param {Record<string, any>} group
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  dismissSearchGroup(group, cx) {
+    this.search.groups = this.search.groups.filter((candidate) => candidate !== group);
+    this.recomputeSearchResults();
+    cx.notify();
+  }
+
+  /**
+   * Whether a file has unsaved edits in any editor state source.
+   *
+   * A closed tab can still be restored from the bounded cache with its dirty
+   * buffer, so checking live `openTabs` alone is not enough. The live dirty
+   * set, the in-memory cache and the sessionStorage state are all consulted.
+   * Keys are normalized with `toFileKey`, the same function open tabs use.
+   *
+   * @param {string} file
+   * @returns {boolean}
+   */
+  isFileDirtyInEditor(file) {
+    const key = toFileKey(this.root, file);
+    return isDirtyFileState({
+      key,
+      dirtyKeys: dirtyFileKeys,
+      cached: fileTabStates.get(key),
+      persisted: loadPersistedTabState(key),
+    });
+  }
+
+  /**
+   * Replaces every match in one file without a confirmation dialog.
+   *
+   * @param {Record<string, any>} group
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  replaceAllInFile(group, cx) {
+    if (this.search.replaceOpen !== true) return;
+    this.runFileReplacements(
+      collectReplaceTargets([group]),
+      { preserveCase: this.search.preserveCase === true },
+      cx
+    );
+  }
+
+  /**
+   * Replaces one match without a confirmation dialog.
+   *
+   * @param {Record<string, any>} group
+   * @param {Record<string, any>} match
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  replaceOneSearchMatch(group, match, cx) {
+    if (this.search.replaceOpen !== true) return;
+    this.runFileReplacements(
+      collectReplaceTargets([{ ...group, matches: [match] }]),
+      { preserveCase: this.search.preserveCase === true },
+      cx
+    );
+  }
+
+  /**
+   * Replace All in files. Always asks first, even for one match or one file,
+   * like VS Code's search view. The per-row Replace and per-file Replace All
+   * hover actions skip the dialog.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  replaceAllInFiles(cx) {
+    this.openReplaceAllDialog(cx);
+  }
+
+  /**
+   * Opens the Replace All confirmation dialog for the current results without
+   * writing anything. The dialog's Replace button calls `submitReplaceAllFiles`.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  openReplaceAllDialog(cx) {
+    if (this.closed || this.replaceRunning || this.replaceDialog) return;
+    if (this.search.replaceOpen !== true) return;
+    if (this.sections.search !== true) return;
+    if (this.search.valid === false || this.search.running === true) return;
+    if (this.search.query.trim().length === 0) return;
+    const targets = collectReplaceTargets(this.search.groups);
+    const totalMatches = targets.reduce((sum, group) => sum + group.matches.length, 0);
+    const totalFiles = targets.length;
+    if (totalMatches === 0) return;
+    this.replaceDialog = {
+      count: totalMatches,
+      files: totalFiles,
+      query: this.search.query,
+      options: this.searchFindOptions(),
+      replacement: this.search.replace ?? "",
+      preserveCase: this.search.preserveCase === true,
+      targets,
+      error: null,
+    };
+    cx.notify();
+  }
+
+  /**
+   * Confirms the Replace All dialog and starts the run.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  submitReplaceAllFiles(cx) {
+    const dialog = this.replaceDialog;
+    if (!dialog || this.replaceRunning) return;
+    this.replaceDialog = null;
+    this.runFileReplacements(
+      dialog.targets,
+      {
+        preserveCase: dialog.preserveCase,
+        query: dialog.query,
+        options: dialog.options,
+        replacement: dialog.replacement,
+      },
+      cx
+    );
+  }
+
+  /**
+   * Safely replaces targets across files.
+   *
+   * For each file it re-reads the current disk text, recomputes matches with
+   * the same query options, and applies only targets that still match at the
+   * same line/column/length. A file with unsaved edits in an open editor tab,
+   * or one that changed on disk, is skipped. Writes preserve line endings and
+   * the trailing newline because untouched text is never rebuilt.
+   *
+   * @param {Array<{ file: string, matches: Array<{ line: number, column: number, length: number, text: string }> }>} targets
+   * @param {{
+   *   preserveCase?: boolean,
+   *   query?: string,
+   *   options?: { caseSensitive?: boolean, wholeWord?: boolean, regex?: boolean },
+   *   replacement?: string,
+   * }} [options]
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  runFileReplacements(targets, options, cx) {
+    if (this.closed || this.replaceRunning) return;
+    const context = this.context;
+    if (!context?.cwd || !Array.isArray(targets) || targets.length === 0) return;
+    const root = context.cwd;
+    const on = context.on;
+    const query = options?.query ?? this.search.query;
+    const matchOptions = options?.options ?? this.searchFindOptions();
+    const replacement = options?.replacement ?? this.search.replace ?? "";
+    const preserveCase = options?.preserveCase === true;
+    this.replaceRunning = true;
+    cx.notify();
+
+    cx.spawn(async (asyncCx) => {
+      let replacedCount = 0;
+      let replacedFiles = 0;
+      const skippedFiles = [];
+
+      for (const target of targets) {
+        if (this.closed) break;
+        const fullPath = root ? `${root}/${target.file}` : target.file;
+        if (this.isFileDirtyInEditor(target.file)) {
+          skippedFiles.push({ file: target.file, reason: "unsaved edits" });
+          continue;
+        }
+        try {
+          const byteSize = await fileByteSize(fullPath, on);
+          if (byteSize === null) {
+            skippedFiles.push({ file: target.file, reason: "size check failed" });
+            continue;
+          }
+          if (byteSize >= REPLACE_MAX_BYTES) {
+            skippedFiles.push({ file: target.file, reason: "too large" });
+            continue;
+          }
+          const current = await readTextFile(fullPath, { on });
+          if (typeof current !== "string") {
+            skippedFiles.push({ file: target.file, reason: "unreadable" });
+            continue;
+          }
+          const safety = classifyReplacementRead({ byteSize, text: current });
+          if (!safety.ok) {
+            skippedFiles.push({ file: target.file, reason: safety.reason });
+            continue;
+          }
+          // A file that grew between the size check and the read could have
+          // been truncated by readTextFile's 1 MiB cap.
+          if (typeof Buffer !== "undefined") {
+            const readBytes = Buffer.byteLength(current, "utf8");
+            if (readBytes !== byteSize) {
+              skippedFiles.push({ file: target.file, reason: "changed on disk" });
+              continue;
+            }
+          }
+          // Re-check after the await: a tab may have become dirty while the
+          // fresh read was in flight.
+          if (this.isFileDirtyInEditor(target.file)) {
+            skippedFiles.push({ file: target.file, reason: "unsaved edits" });
+            continue;
+          }
+          const plan = planFileReplacements(
+            current,
+            query,
+            matchOptions,
+            target.matches,
+            replacement,
+            { preserveCase }
+          );
+          if (!plan.ok) {
+            skippedFiles.push({
+              file: target.file,
+              reason: plan.reason === "changed" ? "changed on disk" : "unreadable",
+            });
+            continue;
+          }
+          if (on) {
+            await writeRemoteTextFile(fullPath, plan.text, on, current);
+          } else {
+            await writeTextFile(fullPath, plan.text, current);
+          }
+          replacedCount += plan.count;
+          replacedFiles += 1;
+        } catch {
+          skippedFiles.push({ file: target.file, reason: "write failed" });
+        }
+      }
+
+      const skipped = skippedFiles.length;
+      const skippedDetail =
+        skipped > 0
+          ? skippedFiles
+              .slice(0, 3)
+              .map((item) => `${item.file} (${item.reason})`)
+              .join(", ") + (skipped > 3 ? "…" : "")
+          : "";
+      const skippedNames = skipped > 0 ? ` (${skippedDetail})` : "";
+      const skippedLabel = skipped > 0 ? ` (${skipped} skipped: ${skippedDetail})` : "";
+      this.replaceRunning = false;
+      if (this.closed) return;
+      if (replacedCount > 0) {
+        notify({
+          title: "Replaced",
+          body: `${replacedCount} occurrence${replacedCount === 1 ? "" : "s"} in ${replacedFiles} file${
+            replacedFiles === 1 ? "" : "s"
+          }${skippedLabel}`,
+          level: "success",
+          timeout: 3000,
+        });
+      } else if (skipped > 0) {
+        notify({
+          title: "Nothing replaced",
+          body: `${skipped} file${skipped === 1 ? "" : "s"} skipped${skippedNames}`,
+          level: "warning",
+          timeout: 3500,
+        });
+      }
+      if (!this.closed) {
+        this.runSearchNow(asyncCx);
+        asyncCx.notify();
+      }
+    });
+  }
+
+  /**
    * Clears results while keeping the current query.
    *
    * @param {import("gpui-kit").ViewContext} cx
@@ -3751,6 +4616,9 @@ export default class FileEditor extends View {
     this.search.valid = true;
     this.search.running = false;
     this.searchRows = [];
+    this.searchHoveredRow = null;
+    this.searchDiffCache.clear();
+    this.searchScrollY = 0;
     cx.notify();
   }
 
@@ -3832,6 +4700,7 @@ export default class FileEditor extends View {
       this.search.limited = false;
       this.search.warning = null;
       this.searchRows = [];
+      this.searchHoveredRow = null;
       cx.notify();
       return;
     }
@@ -3922,7 +4791,16 @@ export default class FileEditor extends View {
         this.search.warning = warning;
         this.search.running = false;
         this.searchRows = flattenSearchRows(grouped.groups, this.search.collapsedFiles);
+        this.searchHoveredRow = null;
+        this.searchDiffCache.clear();
+        this.searchScrollY = 0;
         asyncCx.notify();
+        // UI-only hook: `search.replaceDialog: true` opens the confirmation
+        // dialog for the settled results. It never runs a replacement.
+        if (this.pendingSearchReplaceDialog) {
+          this.pendingSearchReplaceDialog = false;
+          this.openReplaceAllDialog(asyncCx);
+        }
       } catch (err) {
         if (stale()) return;
         this.search.error = formatSearchError(err?.message || String(err)) || "Search failed";
@@ -3933,6 +4811,7 @@ export default class FileEditor extends View {
         this.search.totalFiles = 0;
         this.search.limited = false;
         this.searchRows = [];
+        this.searchHoveredRow = null;
         asyncCx.notify();
       }
     });
@@ -4268,6 +5147,120 @@ export default class FileEditor extends View {
   }
 
   /**
+   * Renders the Replace All in Files confirmation modal.
+   *
+   * @param {Record<string, string>} t
+   * @returns {import("gpui-kit").Element | null}
+   */
+  renderReplaceDialog(t) {
+    const dialog = this.replaceDialog;
+    if (!dialog) return null;
+    const question = formatReplaceAllConfirmation(dialog.count, dialog.files, dialog.replacement);
+
+    return v_flex()
+      .id("files-replace-backdrop")
+      .absolute()
+      .inset_0()
+      .bg(isLightColor(t.background) ? "#00000040" : "#0000008c")
+      .items_center()
+      .justify_center()
+      .p(12)
+      .on_key_down((e, cx) => {
+        if (e.key === "escape") {
+          cx.stop_propagation();
+          this.closeModals(cx);
+        } else if (e.key === "enter") {
+          cx.stop_propagation();
+          this.submitReplaceAllFiles(cx);
+        }
+      })
+      .on_mouse_down("left", (_e, cx) => this.closeModals(cx))
+      .on_mouse_down("right", (_e, cx) => this.closeModals(cx))
+      .child(
+        v_flex()
+          .id("files-replace-dialog")
+          .w_full()
+          .max_w(340)
+          .p(14)
+          .gap(10)
+          .rounded(10)
+          .bg(t.popover)
+          .border_1()
+          .border_color(t.border)
+          .shadow_lg()
+          .text_size(12.5)
+          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+          .on_mouse_down("right", (_e, cx) => cx.stop_propagation())
+          .child(
+            h_flex()
+              .items_center()
+              .child(div().flex_1().font_semibold().text_size(13).text_color(t.foreground).child("Replace All"))
+              .child(
+                div()
+                  .text_size(11)
+                  .text_color(t.dim)
+                  .cursor_pointer()
+                  .hover((s) => s.text_color(t.foreground))
+                  .on_click((_e, cx) => this.closeModals(cx))
+                  .child("Esc")
+              )
+          )
+          .child(
+            div()
+              .text_size(11.5)
+              .text_color(t.muted)
+              .child(question)
+          )
+          .when(Boolean(dialog.error), (el) =>
+            el.child(
+              div()
+                .text_size(11)
+                .text_color(t.blocked || "#e05252")
+                .child(dialog.error)
+            )
+          )
+          .child(
+            h_flex()
+              .justify_end()
+              .gap(8)
+              .pt(4)
+              .child(
+                h_flex()
+                  .id("files-replace-cancel")
+                  .h(26)
+                  .px(10)
+                  .items_center()
+                  .rounded(6)
+                  .border_1()
+                  .border_color(t.border)
+                  .bg(t.raised)
+                  .text_color(t.foreground)
+                  .cursor_pointer()
+                  .hover((s) => s.bg(t.hover))
+                  .on_click((_e, cx) => this.closeModals(cx))
+                  .child("Cancel")
+              )
+              .child(
+                h_flex()
+                  .id("files-replace-confirm")
+                  .h(26)
+                  .px(10)
+                  .items_center()
+                  .rounded(6)
+                  .border_1()
+                  .border_color(t.accent || t.solid || t.foreground)
+                  .bg(t.accent || t.solid || t.foreground)
+                  .text_color(t.background)
+                  .cursor_pointer()
+                  .hover((s) => s.opacity(0.88))
+                  .on_click((_e, cx) => this.submitReplaceAllFiles(cx))
+                  .child(this.replaceRunning ? "Replacing…" : "Replace")
+              )
+          )
+      );
+  }
+
+  /**
    * Renders the file tree right-click menu over the pane.
    *
    * @param {Record<string, string>} t
@@ -4555,7 +5548,8 @@ export default class FileEditor extends View {
       .child(renderSearchSection(this, t))
       .when(Boolean(this.contextMenu), (el) => el.child(this.renderRowContextMenu(t)))
       .when(Boolean(this.renameDialog), (el) => el.child(this.renderRenameDialog(t)))
-      .when(Boolean(this.deleteDialog), (el) => el.child(this.renderDeleteDialog(t)));
+      .when(Boolean(this.deleteDialog), (el) => el.child(this.renderDeleteDialog(t)))
+      .when(Boolean(this.replaceDialog), (el) => el.child(this.renderReplaceDialog(t)));
   }
 
   /**
