@@ -13,7 +13,7 @@
  */
 
 import { View, div, svg, image } from "gpui-kit";
-import { v_flex, h_flex, Editor, EditorState, Input, InputState, Scrollbar } from "gpui-base";
+import { v_flex, h_flex, Editor, EditorState, Input, InputState, Scrollbar, VirtualListScrollHandle } from "gpui-base";
 import { readFile as readBinaryFile } from "fs/promises";
 import {
   spaces,
@@ -92,6 +92,40 @@ import {
   buildSplitPaneRequest,
   resolveFilesMenuPosition,
 } from "./file-logic.js";
+import {
+  FIND_MATCH_CAP,
+  SEARCH_FILE_CAP,
+  SEARCH_MATCH_CAP,
+  buildFindRegExp,
+  buildGrepArgs,
+  buildRipgrepArgs,
+  classifySearchResult,
+  expandGrepRows,
+  filterSearchRowsByGlobs,
+  findHorizontalOffset,
+  findMatchIndexAtLine,
+  findMatches,
+  findPropSignature,
+  flattenSearchRows,
+  formatSearchError,
+  groupSearchRows,
+  normalizeFindPrefs,
+  normalizeFindProp,
+  normalizeSections,
+  parseGlobList,
+  parseGrepOutput,
+  parseRgJson,
+  shouldConsumePendingFind,
+  shouldPromoteSearchClick,
+  stepMatchIndex,
+  PENDING_FIND_TTL_MS,
+} from "./find-logic.js";
+import {
+  renderFindBar,
+  renderFindCodeView,
+  renderSearchSection,
+  renderSidebarSectionHeader,
+} from "./find-view.js";
 import { renderMarkdownDocument } from "./markdown-view.js";
 
 /** In-memory cache for open and recent file tab states (scroll, cursor, text, view mode, EditorState). */
@@ -99,6 +133,33 @@ const fileTabStates = new Map();
 
 /** Max number of file editor instances to retain in the LRU cache. */
 const MAX_CACHED_FILE_STATES = 15;
+
+/**
+ * Installs the mod's app-wide key bindings exactly once per process. They are
+ * app state, not view state: binding them from every tab/pane init would grow
+ * the keymap with duplicate chords for the life of the process.
+ *
+ * @param {import("gpui-kit").ViewContext} cx
+ */
+function ensureFileEditorKeyBindings(cx) {
+  if (globalThis.__fileEditorFindKeyBindingsInstalled === true) return;
+  try {
+    cx.bind_keys([
+      { keystroke: "cmd-f", action: "file-editor.find", context: "FileEditor" },
+      { keystroke: "ctrl-f", action: "file-editor.find", context: "FileEditor" },
+      { keystroke: "cmd-g", action: "file-editor.find-next", context: "FileEditor" },
+      { keystroke: "ctrl-g", action: "file-editor.find-next", context: "FileEditor" },
+      { keystroke: "cmd-shift-g", action: "file-editor.find-prev", context: "FileEditor" },
+      { keystroke: "ctrl-shift-g", action: "file-editor.find-prev", context: "FileEditor" },
+      { keystroke: "f3", action: "file-editor.find-next", context: "FileEditor" },
+      { keystroke: "shift-f3", action: "file-editor.find-prev", context: "FileEditor" },
+      { keystroke: "escape", action: "file-editor.find-close", context: "FileEditorFind" },
+      { keystroke: "cmd-shift-f", action: "file-editor.search", context: "FilesPane" },
+      { keystroke: "ctrl-shift-f", action: "file-editor.search", context: "FilesPane" },
+    ]);
+    globalThis.__fileEditorFindKeyBindingsInstalled = true;
+  } catch {}
+}
 
 /**
  * Storage key prefix for persisted file tab state.
@@ -346,6 +407,7 @@ export default class FileEditor extends View {
     this.closed = false;
     const p = props() || {};
     this.tabMode = typeof p.file === "string" && p.file.length > 0;
+    ensureFileEditorKeyBindings(cx);
 
     if (this.tabMode) {
       this.initTabMode(p, cx);
@@ -366,6 +428,23 @@ export default class FileEditor extends View {
     this.hoveredPath = null;
     this.focusHandle = null;
     this.saving = false;
+    this.searchToken = null;
+    try {
+      this.findInput?.release();
+    } catch {}
+    this.findInput = null;
+    try {
+      this.findScrollHandle?.release();
+    } catch {}
+    this.findScrollHandle = null;
+    for (const input of [this.searchInput, this.includeInput, this.excludeInput]) {
+      try {
+        input?.release();
+      } catch {}
+    }
+    this.searchInput = null;
+    this.includeInput = null;
+    this.excludeInput = null;
 
     // Cache the tab state before closing so returning to it preserves cursor, scroll and settings
     if (this.fileKey) {
@@ -467,11 +546,55 @@ export default class FileEditor extends View {
     this.saving = false;
     this.lastSavedText = null;
 
+    // In-editor Find: the native EditorState exposes no selection or cursor
+    // API, so this state owns the query, matches and current index. While the
+    // widget is open the tab renders a read-only, highlighted virtual list
+    // instead of the native Editor (see find-view.js).
+    const persistedFind = normalizeFindPrefs(shared("file-editor.find"));
+    const propFind = normalizeFindProp(p.find);
+    const propSignature = findPropSignature(p.find);
+    const consumedFindSignature = cached?.findPropSignature ?? null;
+    // Apply a find prop once per file tab. Tab switches remount the view with
+    // the same props; without this record find would reopen and jump back to
+    // the original line every time.
+    const shouldOpenPropFind =
+      Boolean(propFind?.query) && Boolean(propSignature) && propSignature !== consumedFindSignature;
+    const activePropFind = shouldOpenPropFind ? propFind : null;
+    this.findPropSignature = shouldOpenPropFind ? propSignature : consumedFindSignature;
+    this.find = {
+      open: shouldOpenPropFind,
+      query: activePropFind?.query ?? persistedFind.query,
+      caseSensitive: activePropFind?.caseSensitive ?? persistedFind.caseSensitive,
+      wholeWord: activePropFind?.wholeWord ?? persistedFind.wholeWord,
+      regex: activePropFind?.regex ?? persistedFind.regex,
+      valid: true,
+      error: null,
+      matches: [],
+      current: -1,
+      limited: false,
+      scrollColumn: 0,
+    };
+    this.pendingFindLine = activePropFind?.line ?? null;
+    this.findScrollHandle = VirtualListScrollHandle.new();
+    this.findInput = InputState.new({ placeholder: "Find", value: this.find.query });
+    this.findInput.on("change", (_event, eventCx) => this.handleFindInputChange(eventCx));
+    this.findInput.on("submit", (event, eventCx) => this.stepFind(event?.shift ? -1 : 1, eventCx));
+    this.lastPendingFindTimestamp = null;
+    if (this.find.open) {
+      // A find prop wins over the preview default: the read-only match view is
+      // the only surface that can bring a line into view.
+      this.viewMode = "code";
+      cx.timer.after(120, () => {
+        if (!this.closed && this.find.open) this.findInput?.focus();
+      });
+    }
+
     if (fileTabStates.has(this.fileKey)) {
       fileTabStates.get(this.fileKey).lastAccess = Date.now();
     } else if (cached) {
       fileTabStates.set(this.fileKey, { ...cached, lastAccess: Date.now() });
     }
+    if (shouldOpenPropFind) this.updateCachedTabState();
 
     // Register this open tab in shared state
     this.registerOpenTab(p);
@@ -518,6 +641,7 @@ export default class FileEditor extends View {
       mdScrollY: this.mdScrollY ?? existing.mdScrollY ?? 0,
       pictureScrollX: this.pictureScrollX ?? existing.pictureScrollX ?? 0,
       pictureScrollY: this.pictureScrollY ?? existing.pictureScrollY ?? 0,
+      findPropSignature: this.findPropSignature ?? existing.findPropSignature ?? null,
       dirty: this.dirty,
       lastAccess: Date.now(),
       ...patch,
@@ -530,6 +654,7 @@ export default class FileEditor extends View {
       mdScrollY: updated.mdScrollY,
       pictureScrollX: updated.pictureScrollX,
       pictureScrollY: updated.pictureScrollY,
+      findPropSignature: updated.findPropSignature,
     });
     const evicted = pruneFileTabStates(fileTabStates, MAX_CACHED_FILE_STATES, this.fileKey);
     for (const { entry } of evicted) {
@@ -661,6 +786,28 @@ export default class FileEditor extends View {
       this.fileKey = toFileKey(this.root, this.file);
       this.loadFile(cx);
       changed = true;
+    }
+
+    // A Files pane search result can target an already-open tab. Props cannot
+    // update in place, so the click leaves a pending record in shared state and
+    // the mounted tab picks it up here. Records are single-use and expire, so a
+    // stale one cannot re-open find in a later tab of the same file.
+    const pendingFind = shared("file-editor.pendingFind");
+    if (pendingFind) {
+      if (shouldConsumePendingFind(pendingFind, this.fileKey, this.lastPendingFindTimestamp)) {
+        this.lastPendingFindTimestamp = pendingFind.timestamp;
+        setShared("file-editor.pendingFind", null);
+        const find = normalizeFindProp(pendingFind.find);
+        if (find) {
+          this.applyFindProp(find, cx);
+          changed = true;
+        }
+      } else if (
+        Number.isFinite(Number(pendingFind.timestamp)) &&
+        Date.now() - Number(pendingFind.timestamp) > PENDING_FIND_TTL_MS
+      ) {
+        setShared("file-editor.pendingFind", null);
+      }
     }
 
     // Resolve tabId if not discovered at mount time
@@ -797,11 +944,18 @@ export default class FileEditor extends View {
               this.rebuildEditor();
             }
           }
+          if (this.find?.open) this.refreshFindMatches(cx, false);
           this.updateCachedTabState();
         } else {
           this.code?.release();
           this.code = null;
           this.editorInputs = null;
+          if (this.find) {
+            this.find.matches = [];
+            this.find.current = -1;
+            this.find.valid = true;
+            this.find.error = null;
+          }
           this.updateCachedTabState();
         }
       } catch {
@@ -815,6 +969,10 @@ export default class FileEditor extends View {
         this.code?.release();
         this.code = null;
         this.editorInputs = null;
+        if (this.find) {
+          this.find.matches = [];
+          this.find.current = -1;
+        }
         this.updateCachedTabState();
       } finally {
         this.loading = false;
@@ -1008,6 +1166,24 @@ export default class FileEditor extends View {
    * @param {import("gpui-kit").ViewContext} cx
    */
   handleKeyDown(event, cx) {
+    const commandOrControl = Boolean(event.modifiers?.platform || event.modifiers?.control);
+    const key = String(event.key ?? "").toLowerCase();
+
+    if (this.find?.open && this.handleFindWidgetKeyDown(event, cx)) {
+      return;
+    }
+
+    const isFindShortcut =
+      event.keystroke === "cmd-f" ||
+      event.keystroke === "ctrl-f" ||
+      (commandOrControl && !event.modifiers?.shift && (key === "f" || key === "F"));
+
+    if (isFindShortcut && !event.is_held) {
+      cx.stop_propagation();
+      if (!this.isImage) this.openFind(cx);
+      return;
+    }
+
     const isSave =
       event.keystroke === "cmd-s" ||
       event.keystroke === "ctrl-s" ||
@@ -1177,9 +1353,12 @@ export default class FileEditor extends View {
    *
    * @param {"preview" | "code"} mode
    * @param {import("gpui-kit").ViewContext} cx
+   * @param {{ focus?: boolean }} [options] Pass `focus: false` when another
+   *   control (the find input) should keep the keyboard.
    */
-  setViewMode(mode, cx) {
+  setViewMode(mode, cx, options = {}) {
     if (this.viewMode === mode) return;
+    if (mode === "preview" && this.find?.open) this.closeFind(cx, { focus: false });
     if (this.code) {
       const currentText = this.code.value();
       this.preparedText = currentText;
@@ -1192,7 +1371,7 @@ export default class FileEditor extends View {
       if (!this.code) {
         this.rebuildEditor();
       }
-      this.focusEditor(cx);
+      if (options.focus !== false) this.focusEditor(cx);
     } else if (mode === "preview" && this.isSvg && !this.imageSrc && !this.imageLoading) {
       this.loadImage(cx);
     }
@@ -1450,6 +1629,7 @@ export default class FileEditor extends View {
    */
   renderFileTab(cx) {
     const t = theme();
+    const codeFont = settings()?.font_family ?? "monospace";
     const { base, dir } = splitPathInfo(this.file);
     const isMarkdown = isMarkdownFile(this.file);
     const isSvg = this.isSvg;
@@ -1470,6 +1650,11 @@ export default class FileEditor extends View {
       .text_color(t.foreground)
       .text_size(13)
       .track_focus(this.focusHandle)
+      .key_context("FileEditor")
+      .on_action("file-editor.find", (_event, cx) => this.openFind(cx))
+      .on_action("file-editor.find-next", (_event, cx) => this.stepFindOrOpen(1, cx))
+      .on_action("file-editor.find-prev", (_event, cx) => this.stepFindOrOpen(-1, cx))
+      .on_action("file-editor.find-close", (_event, cx) => this.closeFind(cx))
       .on_key_down((event, cx) => this.handleKeyDown(event, cx))
       .on_mouse_move((event, cx) => this.rememberViewport(event?.bounds, cx))
       .on_mouse_down("left", (event, cx) => {
@@ -1648,6 +1833,25 @@ export default class FileEditor extends View {
             )
           )
           .when(this.showsPicturePreview(), (e) => e.child(this.renderZoomControls(t)))
+          .when(!this.isImage, (e) =>
+            e.child(
+              h_flex()
+                .id("file-editor-find")
+                .flex_none()
+                .w(24)
+                .h(24)
+                .items_center()
+                .justify_center()
+                .rounded(4)
+                .cursor_pointer()
+                .when(this.find?.open, (btn) => btn.bg(t.selected).text_color(t.foreground))
+                .when(!this.find?.open, (btn) => btn.text_color(t.dim))
+                .hover((s) => s.bg(this.find?.open ? t.selected : t.hover))
+                .tooltip("Find in file (Cmd+F)")
+                .on_click((_e, cx) => this.openFind(cx))
+                .child(svg("mods/file-editor/search.svg").size(12))
+            )
+          )
           .when(isCodeView, (e) =>
             e.child(
               h_flex()
@@ -1724,28 +1928,37 @@ export default class FileEditor extends View {
           )
       )
       .child(
-        Boolean(this.fileError)
-          ? v_flex()
-              .flex_1()
-              .min_h(0)
-              .p(24)
-              .gap(8)
-              .items_center()
-              .justify_center()
-              .child(
-                div()
-                  .max_w(620)
-                  .text_size(12)
-                  .text_color(t.dim)
-                  .child(this.loading ? "Loading file…" : this.fileError)
-              )
-          : this.isImage
-            ? this.renderImageView(t)
-            : !isCodeView
-              ? isMarkdown
-                ? this.renderMarkdownView(t)
-                : this.renderSvgView(t)
-              : this.renderCodeView(t)
+        v_flex()
+          .relative()
+          .flex_1()
+          .min_h(0)
+          .child(
+            Boolean(this.fileError)
+              ? v_flex()
+                  .flex_1()
+                  .min_h(0)
+                  .p(24)
+                  .gap(8)
+                  .items_center()
+                  .justify_center()
+                  .child(
+                    div()
+                      .max_w(620)
+                      .text_size(12)
+                      .text_color(t.dim)
+                      .child(this.loading ? "Loading file…" : this.fileError)
+                  )
+              : this.isImage
+                ? this.renderImageView(t)
+                : !isCodeView
+                  ? isMarkdown
+                    ? this.renderMarkdownView(t)
+                    : this.renderSvgView(t)
+                  : this.find?.open
+                    ? renderFindCodeView(this, t, codeFont)
+                    : this.renderCodeView(t)
+          )
+          .when(this.find?.open && !this.isImage, (el) => el.child(renderFindBar(this, t)))
       );
   }
 
@@ -2113,6 +2326,294 @@ export default class FileEditor extends View {
   }
 
   /* ========================================================================
+   * In-Editor Find
+   * ======================================================================== */
+
+  /**
+   * The text the find engine searches. While Code view has an EditorState this
+   * is its live buffer (including unsaved edits); otherwise it is the text
+   * loaded from disk.
+   *
+   * @returns {string}
+   */
+  findSourceText() {
+    if (this.code) return this.code.value();
+    if (typeof this.preparedText === "string") return this.preparedText;
+    if (typeof this.rawText === "string") return this.rawText;
+    return "";
+  }
+
+  /**
+   * Persists the last query and the three match toggles in shared state, so
+   * reopening find in any file starts where the user left off.
+   */
+  persistFindPrefs() {
+    if (!this.find) return;
+    setShared("file-editor.find", {
+      query: this.find.query,
+      caseSensitive: this.find.caseSensitive,
+      wholeWord: this.find.wholeWord,
+      regex: this.find.regex,
+    });
+  }
+
+  /**
+   * Focuses the find input on the next few frames. Opening the widget and
+   * switching a preview to Code view both move the keyboard, so a single
+   * synchronous focus can be stolen by focusEditor.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  focusFindInput(cx) {
+    const attempt = () => {
+      if (this.closed || !this.find?.open) return;
+      this.findInput?.focus();
+    };
+    attempt();
+    cx.timer.after(30, attempt);
+    cx.timer.after(140, attempt);
+  }
+
+  /**
+   * Opens the find widget, optionally seeded with a query, toggles and a line.
+   * Markdown and SVG previews switch to Code view because the read-only match
+   * view is the surface that can highlight and scroll to a match.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   * @param {{ query?: string, caseSensitive?: boolean, wholeWord?: boolean, regex?: boolean, line?: number }} [options]
+   */
+  openFind(cx, options = {}) {
+    if (this.closed || this.isImage || !this.find || !this.findInput) return;
+    const hasPreview = isMarkdownFile(this.file) || this.isSvg;
+    if (hasPreview && this.viewMode !== "code") {
+      this.setViewMode("code", cx, { focus: false });
+    }
+    if (typeof options.query === "string") {
+      this.find.query = options.query;
+      this.findInput.set_value(options.query);
+    }
+    for (const key of ["caseSensitive", "wholeWord", "regex"]) {
+      if (typeof options[key] === "boolean") this.find[key] = options[key];
+    }
+    if (Number.isFinite(options.line)) this.pendingFindLine = options.line;
+    this.find.open = true;
+    this.find.scrollColumn = 0;
+    this.refreshFindMatches(cx, false);
+    this.persistFindPrefs();
+    this.focusFindInput(cx);
+    cx.notify();
+  }
+
+  /**
+   * Applies a `find` prop / pending search-result target to this mounted tab.
+   *
+   * @param {{ query: string, caseSensitive: boolean, wholeWord: boolean, regex: boolean, line: number | null }} find
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  applyFindProp(find, cx) {
+    this.openFind(cx, {
+      query: find.query,
+      caseSensitive: find.caseSensitive,
+      wholeWord: find.wholeWord,
+      regex: find.regex,
+      line: find.line ?? undefined,
+    });
+  }
+
+  /**
+   * Closes the widget and returns the keyboard to the native Editor. The
+   * EditorState is never recreated here, so unsaved edits survive.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   * @param {{ focus?: boolean }} [options]
+   */
+  closeFind(cx, options = {}) {
+    if (!this.find?.open) return;
+    this.find.open = false;
+    this.pendingFindLine = null;
+    if (options.focus !== false) {
+      const refocus = (timerCx) => {
+        if (!this.closed && !this.find?.open) this.focusEditor(timerCx);
+      };
+      cx.timer.after(20, refocus);
+      cx.timer.after(100, refocus);
+    }
+    cx.notify();
+  }
+
+  /**
+   * Handles a change in the find input: re-runs the match engine immediately
+   * (it is in-memory and cheap), resets to the first match and persists prefs.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  handleFindInputChange(cx) {
+    if (!this.find) return;
+    this.find.query = this.findInput ? this.findInput.value() : "";
+    this.pendingFindLine = null;
+    this.find.current = -1;
+    this.refreshFindMatches(cx, false);
+    this.persistFindPrefs();
+    cx.notify();
+  }
+
+  /**
+   * Recomputes matches over the current source and keeps the current index in
+   * range. When a line was requested (search-result click), the first match at
+   * or after it becomes current.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   * @param {boolean} [notify=true]
+   */
+  refreshFindMatches(cx, notify = true) {
+    if (!this.find) return;
+    const result = findMatches(this.findSourceText(), this.find.query, {
+      caseSensitive: this.find.caseSensitive,
+      wholeWord: this.find.wholeWord,
+      regex: this.find.regex,
+      cap: FIND_MATCH_CAP,
+    });
+    this.find.valid = result.valid;
+    this.find.error = result.error;
+    this.find.matches = result.matches;
+    this.find.limited = result.limited;
+
+    if (!result.valid || result.matches.length === 0) {
+      this.find.current = -1;
+      this.pendingFindLine = null;
+    } else if (this.pendingFindLine !== null && this.pendingFindLine !== undefined) {
+      this.find.current = findMatchIndexAtLine(result.matches, this.pendingFindLine - 1);
+      this.pendingFindLine = null;
+      this.scrollToCurrentFindMatch(cx);
+    } else if (this.find.current < 0 || this.find.current >= result.matches.length) {
+      this.find.current = 0;
+      this.scrollToCurrentFindMatch(cx);
+    }
+
+    if (notify) cx.notify();
+  }
+
+  /**
+   * Brings the current match's line into view in the read-only virtual list.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  scrollToCurrentFindMatch(cx) {
+    const match = this.find?.matches?.[this.find.current];
+    if (!match) return;
+    const line = match.line;
+    this.find.scrollColumn = findHorizontalOffset(
+      match.column,
+      this.tabViewport?.width || this.find?.viewportWidth || 800
+    );
+    const apply = () => {
+      if (this.closed || !this.find?.open) return;
+      try {
+        this.findScrollHandle?.scroll_to_item(line, "center");
+      } catch {}
+    };
+    apply();
+    cx.timer.after(20, apply);
+    cx.timer.after(120, apply);
+  }
+
+  /**
+   * Cmd+G / F3 behaviour: step when find is open, otherwise open it with the
+   * last query first (VS Code behaviour). A backward step from a closed widget
+   * lands on the last match.
+   *
+   * @param {1 | -1} direction
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  stepFindOrOpen(direction, cx) {
+    if (!this.find?.open) {
+      this.openFind(cx);
+      if (direction < 0) this.stepFind(-1, cx);
+      return;
+    }
+    this.stepFind(direction, cx);
+  }
+
+  /**
+   * Moves to the next or previous match, wrapping around.
+   *
+   * @param {1 | -1} direction
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  stepFind(direction, cx) {
+    if (!this.find?.open) return;
+    const next = stepMatchIndex(this.find.current, this.find.matches.length, direction);
+    if (next === this.find.current) return;
+    this.find.current = next;
+    this.scrollToCurrentFindMatch(cx);
+    cx.notify();
+  }
+
+  /**
+   * Toggles match case, whole word or regex, then recomputes.
+   *
+   * @param {"caseSensitive" | "wholeWord" | "regex"} name
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  toggleFindOption(name, cx) {
+    if (!this.find || !["caseSensitive", "wholeWord", "regex"].includes(name)) return;
+    this.find[name] = !this.find[name];
+    this.find.current = -1;
+    this.pendingFindLine = null;
+    this.refreshFindMatches(cx, false);
+    this.persistFindPrefs();
+    this.focusFindInput(cx);
+    cx.notify();
+  }
+
+  /**
+   * Key handling while the find widget is open. Registered on the tab root and
+   * on the widget so shortcuts still work when the input consumed the key.
+   *
+   * @param {import("gpui-kit").KeyEvent} event
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  handleFindWidgetKeyDown(event, cx) {
+    if (!this.find?.open) return false;
+    const modifiers = event.modifiers || {};
+    const command = Boolean(modifiers.platform || modifiers.control);
+    const key = String(event.key ?? "").toLowerCase();
+    const keystroke = String(event.keystroke ?? "").toLowerCase();
+
+    if (key === "escape") {
+      cx.stop_propagation();
+      this.closeFind(cx);
+      return true;
+    }
+    if (command && key === "f") {
+      cx.stop_propagation();
+      this.focusFindInput(cx);
+      return true;
+    }
+    if (modifiers.alt && !modifiers.platform && !modifiers.control) {
+      const isC = key === "c" || key === "ç" || keystroke === "alt-c";
+      const isW = key === "w" || key === "∑" || keystroke === "alt-w";
+      const isR = key === "r" || key === "®" || keystroke === "alt-r";
+      if (isC) {
+        cx.stop_propagation();
+        this.toggleFindOption("caseSensitive", cx);
+        return true;
+      }
+      if (isW) {
+        cx.stop_propagation();
+        this.toggleFindOption("wholeWord", cx);
+        return true;
+      }
+      if (isR) {
+        cx.stop_propagation();
+        this.toggleFindOption("regex", cx);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /* ========================================================================
    * Files Pane Mode Implementation
    * ======================================================================== */
 
@@ -2122,7 +2623,7 @@ export default class FileEditor extends View {
    * @param {Record<string, any>} _p
    * @param {import("gpui-kit").ViewContext} cx
    */
-  initPaneMode(_p, cx) {
+  initPaneMode(p, cx) {
     this.saved = new Map();
     this.entries = new Map();
     this.folders = new Set();
@@ -2146,6 +2647,59 @@ export default class FileEditor extends View {
     this.error = null;
     this.limited = false;
 
+    // Collapsible sidebar sections and the workspace search state. Search
+    // results live in memory; the actual scan runs off the UI thread in
+    // executeSearch and is discarded when its token is stale.
+    this.sections = normalizeSections(shared("file-editor.sections"));
+    this.search = {
+      query: "",
+      caseSensitive: false,
+      wholeWord: false,
+      regex: false,
+      include: "",
+      exclude: "",
+      filtersOpen: false,
+      groups: [],
+      totalMatches: 0,
+      totalFiles: 0,
+      limited: false,
+      error: null,
+      warning: null,
+      valid: true,
+      running: false,
+      collapsedFiles: new Set(),
+    };
+    this.searchRows = [];
+    this.searchToken = null;
+    this.rgAvailable = null;
+    this.rgContextKey = null;
+    this.lastSearchClick = null;
+    this.searchInput = InputState.new({ placeholder: "Search" });
+    this.includeInput = InputState.new({ placeholder: "files to include (e.g. src/**, *.js)" });
+    this.excludeInput = InputState.new({ placeholder: "files to exclude (e.g. dist/**, *.lock)" });
+    this.searchInput.on("change", (_event, eventCx) => this.handleSearchInputChange(eventCx));
+    this.searchInput.on("submit", (_event, eventCx) => this.runSearchNow(eventCx));
+    this.includeInput.on("change", (_event, eventCx) => this.handleSearchFilterChange(eventCx));
+    this.excludeInput.on("change", (_event, eventCx) => this.handleSearchFilterChange(eventCx));
+
+    // Optional deep link: `props().search` opens SEARCH with a prefilled query,
+    // which is also how a saved or scripted search can land directly in results.
+    const initialSearch = p?.search && typeof p.search === "object" ? p.search : null;
+    if (initialSearch) {
+      this.search.query = typeof initialSearch.query === "string" ? initialSearch.query : "";
+      this.search.caseSensitive = initialSearch.caseSensitive === true;
+      this.search.wholeWord = initialSearch.wholeWord === true;
+      this.search.regex = initialSearch.regex === true;
+      this.search.include = typeof initialSearch.include === "string" ? initialSearch.include : "";
+      this.search.exclude = typeof initialSearch.exclude === "string" ? initialSearch.exclude : "";
+      this.search.filtersOpen = Boolean(this.search.include || this.search.exclude);
+      this.searchInput.set_value(this.search.query);
+      this.includeInput.set_value(this.search.include);
+      this.excludeInput.set_value(this.search.exclude);
+      this.sections.search = true;
+      setShared("file-editor.sections", { ...this.sections });
+    }
+
     // Sanitize any poisoned openTabs entries loaded from shared state
     const openTabsMap = shared("file-editor.openTabs");
     if (openTabsMap && typeof openTabsMap === "object") {
@@ -2168,6 +2722,12 @@ export default class FileEditor extends View {
     cx.timer.every(250, (cx) => this.checkLocation(cx));
     // Full folder and git status refresh every 10s
     cx.timer.every(10000, (cx) => this.refresh(cx));
+
+    if (initialSearch && this.search.query.trim().length > 0) {
+      cx.timer.after(350, (timerCx) => {
+        if (!this.closed) this.runSearchNow(timerCx);
+      });
+    }
   }
 
   /**
@@ -2410,6 +2970,16 @@ export default class FileEditor extends View {
       this.error = null;
       this.limited = false;
       this.loading = false;
+      this.searchToken = null;
+      this.search.running = false;
+      this.search.groups = [];
+      this.search.totalMatches = 0;
+      this.search.totalFiles = 0;
+      this.search.limited = false;
+      this.search.error = null;
+      this.search.warning = null;
+      this.searchRows = [];
+      if (this.search.query.trim().length > 0) this.scheduleSearch(cx);
     }
 
     if (!cwd || this.loading) {
@@ -2536,6 +3106,16 @@ export default class FileEditor extends View {
     const openTabsMap = shared("file-editor.openTabs") || {};
     const fileKey = toFileKey(this.root, path);
 
+    // A search result can target an already-open tab, where props cannot
+    // change. Leave a pending record that the mounted tab consumes.
+    if (options?.find) {
+      setShared("file-editor.pendingFind", {
+        fileKey,
+        find: options.find,
+        timestamp: Date.now(),
+      });
+    }
+
     this.selectedFile = path;
     setShared("file-editor.activeFile", { root: this.root, file: path });
 
@@ -2601,6 +3181,7 @@ export default class FileEditor extends View {
     if (placement.action === "replace-pane") {
       const tabProps = { folder: this.root, file: path };
       if (this.on) tabProps.on = this.on;
+      if (options?.find) tabProps.find = options.find;
       run("pane.split", {
         direction: "right",
         pane: placement.targetPaneId,
@@ -2627,6 +3208,7 @@ export default class FileEditor extends View {
     if (placement.action === "replace-tab") {
       const tabProps = { folder: this.root, file: path };
       if (this.on) tabProps.on = this.on;
+      if (options?.find) tabProps.find = options.find;
       run("tab.new", { name: tabName, mod: "file-editor", props: tabProps });
       if (placement.closeTabId) {
         run("tab.close", { id: placement.closeTabId });
@@ -2678,6 +3260,7 @@ export default class FileEditor extends View {
 
     const tabProps = { folder: this.root, file: path };
     if (this.on) tabProps.on = this.on;
+    if (options?.find) tabProps.find = options.find;
     run("tab.new", { name: tabName, mod: "file-editor", props: tabProps });
 
     // The replacement now exists, so closing the old preview cannot take the
@@ -3056,7 +3639,368 @@ export default class FileEditor extends View {
         cx.stop_propagation();
         this.closeRowContextMenu(cx);
       }
+      return;
     }
+
+    const commandOrControl = Boolean(event.modifiers?.platform || event.modifiers?.control);
+    const key = String(event.key ?? "").toLowerCase();
+    const isSearchShortcut =
+      event.keystroke === "cmd-shift-f" ||
+      event.keystroke === "ctrl-shift-f" ||
+      (commandOrControl && Boolean(event.modifiers?.shift) && (key === "f" || key === "F"));
+
+    if (isSearchShortcut && !event.is_held) {
+      cx.stop_propagation();
+      this.focusSearch(cx);
+    }
+  }
+
+  /**
+   * Expands the SEARCH section and moves the keyboard into its query input.
+   * Used by Cmd/Ctrl+Shift+F and by the search icon in the EXPLORER header.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  focusSearch(cx) {
+    if (this.closed) return;
+    if (!this.sections.search) {
+      this.sections.search = true;
+      setShared("file-editor.sections", { ...this.sections });
+    }
+    const attempt = () => {
+      if (this.closed || !this.sections.search) return;
+      this.searchInput?.focus();
+    };
+    attempt();
+    cx.timer.after(30, attempt);
+    cx.timer.after(120, attempt);
+    cx.notify();
+  }
+
+  /**
+   * Toggles one sidebar section and persists both.
+   *
+   * @param {"explorer" | "search"} name
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  toggleSection(name, cx) {
+    if (!this.sections || (name !== "explorer" && name !== "search")) return;
+    this.sections[name] = !this.sections[name];
+    setShared("file-editor.sections", { ...this.sections });
+    cx.notify();
+  }
+
+  /**
+   * Handles typing in the search query and schedules a debounced scan.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  handleSearchInputChange(cx) {
+    this.search.query = this.searchInput ? this.searchInput.value() : "";
+    this.scheduleSearch(cx);
+  }
+
+  /**
+   * Handles typing in the include/exclude fields and schedules a rescan.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  handleSearchFilterChange(cx) {
+    this.search.include = this.includeInput ? this.includeInput.value() : "";
+    this.search.exclude = this.excludeInput ? this.excludeInput.value() : "";
+    this.scheduleSearch(cx);
+  }
+
+  /**
+   * Toggles a search match option and rescans.
+   *
+   * @param {"caseSensitive" | "wholeWord" | "regex"} name
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  toggleSearchOption(name, cx) {
+    if (!["caseSensitive", "wholeWord", "regex"].includes(name)) return;
+    this.search[name] = !this.search[name];
+    this.scheduleSearch(cx);
+    cx.timer.after(40, () => {
+      if (!this.closed) this.searchInput?.focus();
+    });
+  }
+
+  /**
+   * Shows or hides the include/exclude fields.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  toggleSearchFilters(cx) {
+    this.search.filtersOpen = !this.search.filtersOpen;
+    cx.notify();
+  }
+
+  /**
+   * Clears results while keeping the current query.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  clearSearchResults(cx) {
+    this.search.groups = [];
+    this.search.totalMatches = 0;
+    this.search.totalFiles = 0;
+    this.search.limited = false;
+    this.search.error = null;
+    this.search.warning = null;
+    this.search.valid = true;
+    this.search.running = false;
+    this.searchRows = [];
+    cx.notify();
+  }
+
+  /**
+   * Schedules a debounced (~300 ms) search. Every keystroke replaces the token,
+   * so a slower earlier scan cannot overwrite the result of a newer query.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  scheduleSearch(cx) {
+    if (this.closed) return;
+    const token = (this.searchToken = {});
+    const query = this.search.query;
+    if (query.trim().length === 0) {
+      this.clearSearchResults(cx);
+      return;
+    }
+    const built = buildFindRegExp(query, {
+      caseSensitive: this.search.caseSensitive,
+      wholeWord: this.search.wholeWord,
+      regex: this.search.regex,
+    });
+    this.search.valid = built.valid;
+    this.search.error = built.valid ? null : built.error;
+    this.search.warning = null;
+    this.search.running = built.valid;
+    cx.notify();
+    cx.timer.after(300, (timerCx) => {
+      if (this.closed || this.searchToken !== token) return;
+      this.executeSearch(timerCx, token);
+    });
+  }
+
+  /**
+   * Runs the current search immediately, bypassing the debounce (Enter).
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  runSearchNow(cx) {
+    if (this.closed) return;
+    const query = this.search.query;
+    if (query.trim().length === 0) {
+      this.clearSearchResults(cx);
+      return;
+    }
+    const token = (this.searchToken = {});
+    this.executeSearch(cx, token);
+  }
+
+  /**
+   * Executes the workspace search off the UI thread. Uses `rg --json` when
+   * ripgrep is available (which also honours .gitignore), and falls back to
+   * `grep -rn` plus a JavaScript re-match pass when it is not.
+   *
+   * @param {import("gpui-kit").AsyncContext} cx
+   * @param {object} token Stale-search token.
+   */
+  executeSearch(cx, token) {
+    const context = this.context;
+    if (!context || !context.cwd) {
+      this.search.running = false;
+      cx.notify();
+      return;
+    }
+    const query = this.search.query;
+    const options = {
+      caseSensitive: this.search.caseSensitive,
+      wholeWord: this.search.wholeWord,
+      regex: this.search.regex,
+    };
+    const built = buildFindRegExp(query, options);
+    if (!built.valid) {
+      this.search.valid = false;
+      this.search.error = built.error;
+      this.search.running = false;
+      this.search.groups = [];
+      this.search.totalMatches = 0;
+      this.search.totalFiles = 0;
+      this.search.limited = false;
+      this.search.warning = null;
+      this.searchRows = [];
+      cx.notify();
+      return;
+    }
+    this.search.valid = true;
+    this.search.error = null;
+    this.search.running = true;
+    cx.notify();
+
+    const include = parseGlobList(this.search.include);
+    const exclude = parseGlobList(this.search.exclude);
+    const stale = () => {
+      if (this.closed || this.searchToken !== token) return true;
+      if (!this.current(context)) {
+        this.search.running = false;
+        cx.notify();
+        return true;
+      }
+      return false;
+    };
+
+    cx.spawn(async (asyncCx) => {
+      try {
+        const hasRg = await this.detectRipgrep(context);
+        if (stale()) return;
+
+        let rows = [];
+        let limited = false;
+        let error = null;
+        let warning = null;
+
+        if (hasRg) {
+          const args = buildRipgrepArgs({ query, ...options, include, exclude });
+          const result = await exec("rg", args, {
+            cwd: context.cwd,
+            on: context.on,
+            timeout: 20000,
+          }).catch((err) => ({
+            code: -1,
+            stdout: "",
+            stderr: err?.message || String(err),
+          }));
+          if (stale()) return;
+          const parsed = parseRgJson(result.stdout, {
+            maxMatches: SEARCH_MATCH_CAP,
+            maxFiles: SEARCH_FILE_CAP,
+          });
+          rows = filterSearchRowsByGlobs(parsed.rows, { include, exclude });
+          limited = parsed.limited;
+          const outcome = classifySearchResult(result.code, rows.length, result.stderr, options.regex);
+          warning = outcome.warning;
+          error = outcome.error;
+        } else {
+          const args = buildGrepArgs({ query, ...options, include, exclude });
+          const result = await exec("grep", args, {
+            cwd: context.cwd,
+            on: context.on,
+            timeout: 20000,
+          }).catch((err) => ({
+            code: -1,
+            stdout: "",
+            stderr: err?.message || String(err),
+          }));
+          if (stale()) return;
+          const parsed = parseGrepOutput(result.stdout);
+          // Filter globs before the 2,000-match cap: otherwise include *.md
+          // can spend the whole budget on files it later discards.
+          const filtered = filterSearchRowsByGlobs(parsed.rows, { include, exclude });
+          const expanded = expandGrepRows(filtered, query, { ...options, cap: SEARCH_MATCH_CAP });
+          rows = expanded.rows;
+          limited = expanded.limited;
+          if (!expanded.valid) {
+            error = formatSearchError(expanded.error, options.regex) || expanded.error;
+          } else {
+            const outcome = classifySearchResult(result.code, rows.length, result.stderr, options.regex);
+            warning = outcome.warning;
+            error = outcome.error;
+          }
+        }
+
+        if (stale()) return;
+
+        const grouped = groupSearchRows(rows, { maxMatches: SEARCH_MATCH_CAP, maxFiles: SEARCH_FILE_CAP });
+        this.search.groups = grouped.groups;
+        this.search.totalMatches = grouped.totalMatches;
+        this.search.totalFiles = grouped.totalFiles;
+        this.search.limited = limited || grouped.limited;
+        this.search.error = error;
+        this.search.warning = warning;
+        this.search.running = false;
+        this.searchRows = flattenSearchRows(grouped.groups, this.search.collapsedFiles);
+        asyncCx.notify();
+      } catch (err) {
+        if (stale()) return;
+        this.search.error = formatSearchError(err?.message || String(err)) || "Search failed";
+        this.search.warning = null;
+        this.search.running = false;
+        this.search.groups = [];
+        this.search.totalMatches = 0;
+        this.search.totalFiles = 0;
+        this.search.limited = false;
+        this.searchRows = [];
+        asyncCx.notify();
+      }
+    });
+  }
+
+  /**
+   * Detects ripgrep once per workspace context. Each failed attempt is cached,
+   * so the grep fallback does not pay a process spawn on every keystroke.
+   *
+   * @param {{ key: string, cwd: string, on: string | null }} context
+   * @returns {Promise<boolean>}
+   */
+  async detectRipgrep(context) {
+    if (this.rgContextKey === context.key && this.rgAvailable !== null) return this.rgAvailable;
+    const result = await exec("rg", ["--version"], { cwd: context.cwd, on: context.on }).catch(() => null);
+    const available = Boolean(result && result.code === 0);
+    this.rgAvailable = available;
+    this.rgContextKey = context.key;
+    return available;
+  }
+
+  /**
+   * Handles a click on a virtual search row. Group headers collapse; match rows
+   * open their file with a find prop pointing at the line. Two clicks inside
+   * the double-click window promote the preview tab, like the Explorer does.
+   *
+   * @param {string} key
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  onSearchRowClick(key, cx) {
+    const row = this.searchRows.find((candidate) => candidate.key === key);
+    if (!row) return;
+    if (row.kind === "group") {
+      if (this.search.collapsedFiles.has(row.group.file)) {
+        this.search.collapsedFiles.delete(row.group.file);
+      } else {
+        this.search.collapsedFiles.add(row.group.file);
+      }
+      this.searchRows = flattenSearchRows(this.search.groups, this.search.collapsedFiles);
+      cx.notify();
+      return;
+    }
+
+    const now = Date.now();
+    const permanent = shouldPromoteSearchClick(this.lastSearchClick, key, now);
+    this.lastSearchClick = { key, at: now };
+    this.openSearchResult(row.group, row.match, permanent, cx);
+  }
+
+  /**
+   * Opens one search match through the normal preview-tab path, carrying the
+   * query, toggles and line so the opened tab can show the match.
+   *
+   * @param {{ file: string }} group
+   * @param {{ line: number }} match
+   * @param {boolean} permanent
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  openSearchResult(group, match, permanent, cx) {
+    const find = {
+      query: this.search.query,
+      caseSensitive: this.search.caseSensitive,
+      wholeWord: this.search.wholeWord,
+      regex: this.search.regex,
+      line: match.line,
+      at: Date.now(),
+    };
+    this.openFileTab(group.file, cx, { permanent, find });
   }
 
   /**
@@ -3539,50 +4483,76 @@ export default class FileEditor extends View {
       .text_color(t.foreground)
       .text_size(13)
       .track_focus(this.filesFocusHandle)
+      .key_context("FilesPane")
+      .on_action("file-editor.search", (_event, cx) => this.focusSearch(cx))
       .on_mouse_down("right", (event, cx) => this.openRowContextMenu(event, cx))
       .on_key_down((event, cx) => this.handleFilesKeyDown(event, cx))
       .child(
-        h_flex()
-          .h(42)
-          .flex_none()
-          .px(14)
-          .gap(8)
-          .items_center()
-          .border_b(1)
-          .border_color(t.border)
-          .child(div().font_semibold().child("Explorer"))
-          .child(
-            div()
-              .flex_1()
-              .min_w(0)
-              .truncate()
-              .text_right()
-              .text_size(12)
-              .text_color(t.dim)
-              .child(this.root?.split(/[\\/]/).pop() ?? "")
-          )
-      )
-      .child(
-        v_flex()
-          .id("files-tree")
-          .flex_1()
-          .min_h(0)
-          .overflow_y_scrollbar()
-          .p(6)
-          .children(this.rows("", 0, [], t))
-          .when(Boolean(this.error) || !this.entries.get("")?.length, (el) =>
-            el.child(
+        renderSidebarSectionHeader({
+          id: "files-section-explorer",
+          label: "EXPLORER",
+          open: this.sections.explorer,
+          t,
+          onToggle: (cx) => this.toggleSection("explorer", cx),
+          trailing: h_flex()
+            .gap(4)
+            .items_center()
+            .child(
               div()
-                .p(8)
-                .text_size(12)
+                .max_w(130)
+                .truncate()
+                .text_size(10.5)
                 .text_color(t.dim)
-                .child(this.error || (this.loading ? "Loading files…" : this.root ? "No files" : "No folder"))
+                .child(this.root?.split(/[\\/]/).pop() ?? "")
             )
-          )
-          .when(this.limited, (el) =>
-            el.child(div().p(8).text_size(11).text_color(t.dim).child("File list limited to 500 entries per folder and 5,000 total"))
-          )
+            .child(
+              h_flex()
+                .id("files-explorer-search")
+                .w(20)
+                .h(20)
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .rounded(4)
+                .cursor_pointer()
+                .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                .text_color(t.dim)
+                .tooltip("Search files (Cmd+Shift+F)")
+                .on_click((_event, cx) => {
+                  cx.stop_propagation();
+                  this.focusSearch(cx);
+                })
+                .child(svg("mods/file-editor/search.svg").size(12))
+            ),
+        })
       )
+      .when(this.sections.explorer, (el) =>
+        el.child(
+          v_flex()
+            .id("files-tree")
+            .flex_1()
+            .min_h(0)
+            .overflow_y_scrollbar()
+            .p(6)
+            .on_mouse_down("left", (_event, _cx) => {
+              this.filesFocusHandle?.focus();
+            })
+            .children(this.rows("", 0, [], t))
+            .when(Boolean(this.error) || !this.entries.get("")?.length, (el) =>
+              el.child(
+                div()
+                  .p(8)
+                  .text_size(12)
+                  .text_color(t.dim)
+                  .child(this.error || (this.loading ? "Loading files…" : this.root ? "No files" : "No folder"))
+              )
+            )
+            .when(this.limited, (el) =>
+              el.child(div().p(8).text_size(11).text_color(t.dim).child("File list limited to 500 entries per folder and 5,000 total"))
+            )
+        )
+      )
+      .child(renderSearchSection(this, t))
       .when(Boolean(this.contextMenu), (el) => el.child(this.renderRowContextMenu(t)))
       .when(Boolean(this.renameDialog), (el) => el.child(this.renderRenameDialog(t)))
       .when(Boolean(this.deleteDialog), (el) => el.child(this.renderDeleteDialog(t)));
