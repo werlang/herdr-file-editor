@@ -90,6 +90,7 @@ import {
   planFilePlacement,
   estimateMarkdownHeight,
   buildSplitPaneRequest,
+  resolveFilesMenuPosition,
 } from "./file-logic.js";
 import { renderMarkdownDocument } from "./markdown-view.js";
 
@@ -2132,13 +2133,12 @@ export default class FileEditor extends View {
     this.previewFiles = new Set();
     this.pendingFileOpen = null;
     this.contextMenu = null;
+    this.pendingContextTarget = null;
     this.renameDialog = null;
     this.deleteDialog = null;
     this.renameInput = null;
     this.actionPending = false;
     this.filesFocusHandle = cx.focus_handle();
-    this.filesOrigin = null;
-    this.filesBounds = null;
     this.loading = false;
     this.refreshPending = false;
     this.watched = null;
@@ -2740,27 +2740,36 @@ export default class FileEditor extends View {
   }
 
   /**
-   * Opens the right-click menu for a file tree row at the pointer position.
+   * Plans the right-click menu for a file tree row. The pane root's bubbled
+   * press opens it, where `local_position` is already relative to the pane.
    *
    * @param {{ name: string, dir: boolean }} entry
    * @param {string} path
+   */
+  rememberRowContextTarget(entry, path) {
+    this.pendingContextTarget = { path, dir: entry.dir };
+  }
+
+  /**
+   * Opens the right-click menu at the pane-relative press position.
+   *
    * @param {import("gpui-kit").MouseButtonEvent} event
    * @param {import("gpui-kit").ViewContext} cx
    */
-  openRowContextMenu(entry, path, event, cx) {
-    const menuWidth = 180;
-    const menuHeight = entry.dir ? 88 : 114;
-    const origin = this.filesOrigin;
-    const bounds = this.filesBounds;
-    const paneX = origin?.x ?? bounds?.x ?? 0;
-    const paneY = origin?.y ?? bounds?.y ?? 0;
-    let x = typeof event?.position?.x === "number" ? event.position.x - paneX : 20;
-    let y = typeof event?.position?.y === "number" ? event.position.y - paneY : 20;
-    const maxW = bounds?.width ?? 0;
-    const maxH = bounds?.height ?? 0;
-    if (maxW && x + menuWidth > maxW) x = Math.max(8, maxW - menuWidth - 8);
-    if (maxH && y + menuHeight > maxH) y = Math.max(8, maxH - menuHeight - 8);
-    this.contextMenu = { path, dir: entry.dir, x, y };
+  openRowContextMenu(event, cx) {
+    const target = this.pendingContextTarget;
+    this.pendingContextTarget = null;
+    if (!target) return;
+
+    const { x, y } = resolveFilesMenuPosition({
+      event,
+      localPosition: event?.local_position,
+      bounds: event?.bounds,
+      zoom: Number(settings()?.zoom) || 1,
+      menuWidth: 180,
+      menuHeight: target.dir ? 88 : 114,
+    });
+    this.contextMenu = { path: target.path, dir: target.dir, x, y };
     cx.notify();
   }
 
@@ -3429,7 +3438,7 @@ export default class FileEditor extends View {
           .rounded(7)
           .cursor_pointer()
           .cursor_context_menu()
-          .on_mouse_down("right", (event, cx) => this.openRowContextMenu(entry, path, event, cx))
+          .on_mouse_down("right", () => this.rememberRowContextTarget(entry, path))
           .when(isSelected, (el) => el.bg(t.selected))
           .hover((s) => s.bg(isSelected ? t.selected : t.hover))
           .on_hover((hovered, cx) => {
@@ -3530,13 +3539,8 @@ export default class FileEditor extends View {
       .text_color(t.foreground)
       .text_size(13)
       .track_focus(this.filesFocusHandle)
+      .on_mouse_down("right", (event, cx) => this.openRowContextMenu(event, cx))
       .on_key_down((event, cx) => this.handleFilesKeyDown(event, cx))
-      .on_mouse_move((e, _cx) => {
-        if (e.bounds) this.filesBounds = e.bounds;
-        if (e.position && e.local_position) {
-          this.filesOrigin = { x: e.position.x - e.local_position.x, y: e.position.y - e.local_position.y };
-        }
-      })
       .child(
         h_flex()
           .h(42)

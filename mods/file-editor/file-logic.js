@@ -905,6 +905,88 @@ export function resolveLocationState({
 }
 
 /**
+ * Places the Files pane right-click menu next to the pointer, in the pane's
+ * layout coordinates.
+ *
+ * Herdr reports pointer positions and element bounds in zoomed window pixels,
+ * while a mod draws with layout pixels written at zoom 1. Dividing the
+ * pane-relative click by the app zoom keeps the menu under the pointer at any
+ * zoom; skipping it made the vertical error grow with the distance down the
+ * file tree. The menu flips left or up when it would overflow the pane, then
+ * clamps to a small margin so it is always fully visible.
+ *
+ * @param {{
+ *   bounds?: { x?: number, y?: number, width?: number, height?: number } | null,
+ *   event?: { position?: { x: number, y: number } } | null,
+ *   localPosition?: { x: number, y: number } | null,
+ *   zoom?: number,
+ *   menuWidth: number,
+ *   menuHeight: number,
+ *   defaultX?: number,
+ *   defaultY?: number,
+ * }} options
+ * @returns {{ x: number, y: number }}
+ */
+export function resolveFilesMenuPosition({
+  bounds = null,
+  event = null,
+  localPosition = null,
+  zoom = 1,
+  menuWidth,
+  menuHeight,
+  defaultX = 20,
+  defaultY = 20,
+} = {}) {
+  const scale = Number.isFinite(zoom) && zoom > 0 ? zoom : 1;
+  const margin = 8;
+
+  // The bounds are the pane's own window box, so their origin is the anchor
+  // for the window-coordinate fallback when `local_position` is unavailable.
+  const paneX = Number.isFinite(bounds?.x) ? bounds.x : 0;
+  const paneY = Number.isFinite(bounds?.y) ? bounds.y : 0;
+  const paneW = Number.isFinite(bounds?.width) && bounds.width > 0 ? bounds.width / scale : 0;
+  const paneH = Number.isFinite(bounds?.height) && bounds.height > 0 ? bounds.height / scale : 0;
+
+  // `localPosition` is already relative to the pane, the element whose
+  // handler owns the overlay; fall back to window coordinates minus origin.
+  let x =
+    typeof localPosition?.x === "number"
+      ? localPosition.x / scale
+      : typeof event?.position?.x === "number"
+        ? (event.position.x - paneX) / scale
+        : defaultX;
+  let y =
+    typeof localPosition?.y === "number"
+      ? localPosition.y / scale
+      : typeof event?.position?.y === "number"
+        ? (event.position.y - paneY) / scale
+        : defaultY;
+
+  // If neither pane-local input is available, raw window coordinates fall far
+  // outside the pane; never clamp that leakage to the far edge.
+  if (paneW && (x < -margin || x > paneW + margin)) x = defaultX;
+  if (paneH && (y < -margin || y > paneH + margin)) y = defaultY;
+
+  if (paneW) {
+    if (x + menuWidth > paneW - margin) {
+      const flipped = x - menuWidth;
+      x = flipped >= margin ? flipped : Math.max(margin, paneW - menuWidth - margin);
+    }
+    x = Math.max(margin, Math.min(x, Math.max(margin, paneW - margin - menuWidth)));
+  }
+
+  if (paneH) {
+    if (y + menuHeight > paneH - margin) {
+      const flipped = y - menuHeight;
+      y = flipped >= margin ? flipped : Math.max(margin, paneH - menuHeight - margin);
+    }
+    y = Math.max(margin, Math.min(y, Math.max(margin, paneH - margin - menuHeight)));
+  }
+
+  return { x: Math.round(x), y: Math.round(y) };
+}
+
+/**
  * Resolves or generates the target tab for a given file.
  * Preserves tabs belonging to other roots/spaces during pruning.
  * Matches strictly by tabId once tabId is known.

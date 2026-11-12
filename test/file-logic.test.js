@@ -67,6 +67,7 @@ import {
   planFilePlacement,
   estimateMarkdownHeight,
   buildSplitPaneRequest,
+  resolveFilesMenuPosition,
 } from "../mods/file-editor/file-logic.js";
 
 test("splitPathInfo - extracts base, dir, and ext correctly", () => {
@@ -1971,4 +1972,123 @@ test("buildSplitPaneRequest - creates split request for new-pane or terminal", (
   assert.deepEqual(reqDefaults, {
     direction: "right",
   });
+});
+
+test("resolveFilesMenuPosition - anchors the menu at the pointer across zoom and edges", () => {
+  const bounds = { x: 50, y: 400, width: 330, height: 880 };
+
+  // Zoom 1: pane-relative window pixels map 1:1 to layout pixels.
+  assert.deepEqual(
+    resolveFilesMenuPosition({
+      bounds,
+      event: { position: { x: 150, y: 600 } },
+      zoom: 1,
+      menuWidth: 180,
+      menuHeight: 114,
+    }),
+    { x: 100, y: 200 }
+  );
+
+  // Zoom 1.1: 220 window pixels below the pane top are 200 layout pixels.
+  // The old unwrapped subtraction put the menu at 220, so the error grew
+  // with every row down the tree.
+  assert.deepEqual(
+    resolveFilesMenuPosition({
+      bounds,
+      event: { position: { x: 160, y: 620 } },
+      zoom: 1.1,
+      menuWidth: 180,
+      menuHeight: 114,
+    }),
+    { x: 100, y: 200 }
+  );
+
+  // Invalid zoom falls back to 1 instead of corrupting the position.
+  assert.deepEqual(
+    resolveFilesMenuPosition({
+      bounds: { width: 400, height: 600 },
+      event: { position: { x: 40, y: 60 } },
+      zoom: 0,
+      menuWidth: 180,
+      menuHeight: 114,
+    }),
+    { x: 40, y: 60 }
+  );
+
+  // The pane root's bubbled press reports a pane-local position; it wins over
+  // window coordinates, and its zoomed pixels are still divided by zoom.
+  assert.deepEqual(
+    resolveFilesMenuPosition({
+      event: { position: { x: 999, y: 999 } },
+      localPosition: { x: 132, y: 264 },
+      bounds: { x: 50, y: 400, width: 720, height: 1080 },
+      zoom: 1.2,
+      menuWidth: 180,
+      menuHeight: 114,
+    }),
+    { x: 110, y: 220 }
+  );
+
+  // Near the right edge the menu flips to the left of the pointer.
+  assert.deepEqual(
+    resolveFilesMenuPosition({
+      bounds: { width: 330, height: 600 },
+      event: { position: { x: 300, y: 100 } },
+      zoom: 1,
+      menuWidth: 180,
+      menuHeight: 114,
+    }),
+    { x: 120, y: 100 }
+  );
+
+  // Near the bottom edge the menu flips above the pointer.
+  assert.deepEqual(
+    resolveFilesMenuPosition({
+      bounds: { width: 400, height: 800 },
+      event: { position: { x: 100, y: 750 } },
+      zoom: 1,
+      menuWidth: 180,
+      menuHeight: 114,
+    }),
+    { x: 100, y: 636 }
+  );
+
+  // With no room to flip, the menu clamps inside the pane margin.
+  assert.deepEqual(
+    resolveFilesMenuPosition({
+      bounds: { width: 300, height: 200 },
+      event: { position: { x: 40, y: 40 } },
+      zoom: 1,
+      menuWidth: 300,
+      menuHeight: 300,
+    }),
+    { x: 8, y: 8 }
+  );
+
+  // Without a pane-local position, the window fallback still uses the bounds
+  // origin to subtract the pane's place in the window.
+  assert.deepEqual(
+    resolveFilesMenuPosition({
+      bounds: { x: 20, y: 100, width: 400, height: 800 },
+      event: { position: { x: 120, y: 300 } },
+      zoom: 1,
+      menuWidth: 180,
+      menuHeight: 114,
+    }),
+    { x: 100, y: 200 }
+  );
+
+  // Window-space leakage outside the pane resets the offending axis.
+  assert.deepEqual(
+    resolveFilesMenuPosition({
+      bounds: { width: 400, height: 300 },
+      event: { position: { x: 100, y: 900 } },
+      zoom: 1,
+      menuWidth: 180,
+      menuHeight: 114,
+      defaultX: 20,
+      defaultY: 20,
+    }),
+    { x: 100, y: 20 }
+  );
 });
