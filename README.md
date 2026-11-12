@@ -1,6 +1,6 @@
 # Herdr File Explorer & Editor
 
-A native, dual-mode **File Explorer & Editor** mod for Herdr featuring directory tree navigation, Git status porcelain badges, dedicated tabbed file viewing, theme-aware syntax highlighting, in-editor find, workspace-wide search, and rich Markdown and SVG previews powered directly by GPUI.
+A native, dual-mode **File Explorer & Editor** mod for Herdr featuring directory tree navigation, Git status porcelain badges, dedicated tabbed file viewing, theme-aware syntax highlighting, in-editor find/replace, workspace-wide search/replace, and rich Markdown and SVG previews powered directly by GPUI.
 
 Instead of opening raw code files inside the narrow Files panel, `file-editor` opens files into their own dedicated Herdr tabs with full-pane syntax highlighting and Markdown or SVG rendering, keeping your directory tree accessible and intact.
 
@@ -57,6 +57,8 @@ Instead of opening raw code files inside the narrow Files panel, `file-editor` o
   - `Cmd+F` / `Ctrl+F` (or the `search.svg` toolbar button) opens a VS Code-style find bar docked over the editor: focused query input, `Aa` match case, `ab` whole word, `.*` regex (also `Alt+C` / `Alt+W` / `Alt+R`), an `N of M` counter, previous/next, and close.
   - `Enter` / `Shift+Enter`, `F3` / `Shift+F3`, and `Cmd/Ctrl+G` / `Cmd/Ctrl+Shift+G` step through matches with wrap-around; `Esc` closes and returns to the native editor.
   - Every match is highlighted and the current one is scrolled into view, horizontally too when it lies past the pane width. Regex `^`/`$` anchor at every line, whole-word matches backtrack through alternations (`foo|foobar`), and invalid regexes show `Invalid regex` with a red input border instead of throwing. Images disable find.
+  - A chevron at the left of the find bar expands a VS Code-style replace row: replace input, `AB` preserve-case toggle, Replace and Replace All. `Cmd+Alt+F` / `Ctrl+H` opens it directly. While the replace input is focused, `Enter` replaces the current match and moves to the next, `Cmd+Enter` / `Ctrl+Alt+Enter` replaces all, and `Cmd+Shift+1` / `Cmd+Alt+Enter` are also accepted. The expanded state, last replacement and preserve-case flag persist in `shared("file-editor.find")`.
+  - Regex replacements support `$0` / `$&` (the whole match), `$1`…`$99`, `$$`, `\n`, `\t`, `\\` and the `\u` / `\l` / `\U` / `\L` / `\E` case operations; unknown escapes keep their backslash, so `C:\path` survives. Preserve case follows VS Code: all-upper → upper, all-lower → lower, mixed case adjusts only the first letter (and hyphen/underscore-separated segments are handled per segment). Replacements edit only the in-memory buffer through `set_value`, mark the tab dirty and promote a preview tab; nothing is written until `Cmd+S`. `Cmd+Z` / `Ctrl+Z` while find is open restores the text before the last replace, and does not consume the chord when the replace undo stack is empty. Replace is disabled with a read-only tooltip on binary, image, truncated or unreadable files.
   - The widget renders a read-only, virtualised text view while open because GPUI's `EditorState` has no selection/cursor/decoration API; the native editor state is left untouched, so unsaved edits survive. Markdown and SVG previews switch to Code view when find opens.
   - The last query and toggles persist in `shared("file-editor.find")`.
 - **Find in Files (SEARCH sidebar)**:
@@ -64,13 +66,18 @@ Instead of opening raw code files inside the narrow Files panel, `file-editor` o
   - Search accepts `Aa` / `ab` / `.*` toggles and comma-separated `files to include` / `files to exclude` globs behind a `…` toggle (e.g. `src/**, *.js` and `dist/**`).
   - A summary line reports `N results in M files` (or `No results`, `Invalid regex`, `Searching…`), and results are grouped by file with a file icon, dim relative directory, match-count badge and per-file collapse.
   - Each match row shows its line number and trimmed context with the matched span highlighted. Clicking a result opens the file through the normal preview-tab path and jumps to that match; double-clicking promotes it to permanent.
+  - A chevron at the left of the query expands a replace row with a replace input, `AB` preserve-case toggle and Replace All. With the row open, each result shows the VS Code inline diff: the match struck through on a red tint followed by the replacement on a green tint. Hovering a match row reveals Replace and Dismiss; hovering a file header reveals Replace All in file and Dismiss. `Cmd+Shift+1` / `Ctrl+Shift+1` replaces all when the replace row is open and results exist.
+  - The SEARCH Replace All button always asks `Replace N occurrences across M files with 'X'?` first, even for one match or one file, like VS Code. The per-row Replace and per-file Replace All hover actions write directly without a dialog. Each file is re-read, the query is recomputed on the fresh content and only targets that still match at the same line/column/length are written. Files changed on disk, unreadable files, files at or above 1 MiB, files whose fresh read contains `\uFFFD` (not valid UTF-8) and files with unsaved editor edits are skipped with the reason in the toast. Writes preserve line endings, the trailing newline and a UTF-8 BOM, use the existing local/remote save paths with a fresh snapshot, and the search re-runs afterwards.
+  - Results are rendered in a manual window: only the visible rows plus six rows of overscan are built each frame, with normal per-row hover/click handlers. For 2,000 results in a 400px viewport at 24px rows that is at most 29 rendered rows.
   - Searches are debounced (~300ms), run off the UI thread, and discard stale results with a token. `rg --json` is used when ripgrep exists (respecting `.gitignore`); otherwise the mod falls back to `grep -rn --null` and the pure JS match engine. Glob filtering happens before the match cap, so `*.md` cannot be starved by other files.
-  - rg is bounded to 1,000 columns, 2 MiB per file and 200 matches per file; grep skips binaries, `.git` and `node_modules` and caps each file. Both run with a 20s timeout; superseded scans are ignored rather than cancelled (the host `exec` API has no cancellation handle). Partial exit-2 runs keep their parsed matches and show a dim warning, and unsupported regex dialects are reported as `Regex not supported by search: …`. Results cap at 2,000 matches / 200 files with a visible `(limited)` note.
+  - rg is bounded to 1,000 columns, 1 MiB per file and 200 matches per file; grep skips binaries, `.git` and `node_modules` and caps each file. Both run with a 20s timeout; superseded scans are ignored rather than cancelled (the host `exec` API has no cancellation handle). Partial exit-2 runs keep their parsed matches and show a dim warning, and unsupported regex dialects are reported as `Regex not supported by search: …`. Results cap at 2,000 matches / 200 files with a visible `(limited)` note.
 
 - **Edge Case & Safety Protections**:
   - Friendly warnings for deleted or missing files (`"This file is no longer available"`).
   - Binary file detection (`"Binary file · no text preview"`).
   - Graceful truncation of files exceeding 400,000 characters.
+  - Replace in files skips files at or above 1 MiB and reads containing `\uFFFD` (not valid UTF-8), so a truncated or lossy read is never written back. A UTF-8 BOM is preserved.
+  - Known limitation: remote writes use a temp file + `mv -f`, which may drop the target file's mode; a portable mode copy is not attempted.
 
 ---
 
@@ -157,6 +164,13 @@ herdr-app do tab.new --name "main.js" --mod file-editor \
   --props '{"folder":"/path/to/project","file":"src/main.js","find":{"query":"render","caseSensitive":true}}'
 ```
 
+Open the find bar with the replace row expanded and a replacement prefilled:
+
+```sh
+herdr-app do tab.new --name "main.js" --mod file-editor \
+  --props '{"folder":"/path/to/project","file":"src/main.js","find":{"query":"render","replace":"draw","replaceOpen":true,"preserveCase":true}}'
+```
+
 Open the Files pane with the SEARCH section expanded and a query running:
 
 ```sh
@@ -164,17 +178,29 @@ herdr-app do tab.new --name "search" --mod file-editor \
   --props '{"folder":"/path/to/project","search":{"query":"render","include":"src/**, *.js","exclude":"dist/**"}}'
 ```
 
-`find` also accepts `wholeWord`, `regex` and `line` (1-based). `search` also accepts `wholeWord` and `regex`.
+Open SEARCH with the replace row and its inline diff:
+
+```sh
+herdr-app do tab.new --name "replace" --mod file-editor \
+  --props '{"folder":"/path/to/project","search":{"query":"render","replace":"draw","replaceOpen":true}}'
+```
+
+`find` also accepts `wholeWord`, `regex`, `line` (1-based), `replace`, `replaceOpen` and `preserveCase`. `search` also accepts `wholeWord`, `regex`, `replace`, `replaceOpen` and `preserveCase`. For screenshots or UI automation, `search.replaceDialog: true` (with `replaceOpen: true`) opens the Replace All confirmation for the settled results; it only opens the dialog and never writes anything.
 
 ### Find & Search Shortcuts
 
 | Action | Shortcut |
 | --- | --- |
 | Find in file | `Cmd+F` / `Ctrl+F`, or the `search.svg` toolbar button |
+| Find and replace in file | `Cmd+Alt+F` / `Ctrl+H` |
+| Replace current match (replace input focused) | `Enter`, or `Cmd+Shift+1` |
+| Replace all in file (replace input focused) | `Cmd+Enter`, `Ctrl+Alt+Enter`, or `Cmd+Alt+Enter` |
+| Undo last replace while find is open | `Cmd+Z` / `Ctrl+Z` |
 | Next / previous match | `Enter` / `Shift+Enter`, `F3` / `Shift+F3`, `Cmd/Ctrl+G` / `Cmd/Ctrl+Shift+G` |
 | Close find | `Esc` |
 | Toggle match case / whole word / regex | `Alt+C` / `Alt+W` / `Alt+R` (or the `Aa` / `ab` / `.*` buttons) |
 | Find in files | `Cmd+Shift+F` / `Ctrl+Shift+F`, or the search icon in the EXPLORER header |
+| Replace all in files | `Cmd+Shift+1` / `Ctrl+Shift+1` when the SEARCH replace row is open and results exist |
 
 ---
 

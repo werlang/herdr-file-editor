@@ -39,6 +39,22 @@ import {
   FIND_MATCH_CAP,
   SEARCH_MATCH_CAP,
   SEARCH_FILE_CAP,
+  applyPreserveCase,
+  expandReplacement,
+  applyReplacements,
+  replaceSingleMatch,
+  replacementDiffSegments,
+  expandSearchReplacement,
+  selectFreshMatches,
+  planFileReplacements,
+  collectReplaceTargets,
+  formatReplaceAllConfirmation,
+  normalizeReplacePrefs,
+  SEARCH_ROW_HEIGHT,
+  REPLACE_MAX_BYTES,
+  searchWindow,
+  classifyReplacementRead,
+  isDirtyFileState,
 } from "../mods/file-editor/find-logic.js";
 
 test("escapeRegExp - escapes every regex metacharacter", () => {
@@ -619,7 +635,7 @@ test("buildRipgrepArgs - caps line size, file size, per-file matches and globs (
   assert.ok(args.includes("--max-columns-preview"));
   assert.deepEqual(args.slice(args.indexOf("--max-filesize"), args.indexOf("--max-filesize") + 2), [
     "--max-filesize",
-    "2M",
+    "1M",
   ]);
   assert.deepEqual(args.slice(args.indexOf("--max-count"), args.indexOf("--max-count") + 2), ["--max-count", "200"]);
   assert.ok(args.includes("-i"));
@@ -778,4 +794,451 @@ test("public caps match the documented budgets", () => {
   assert.equal(SEARCH_MATCH_CAP, 2000);
   assert.equal(SEARCH_FILE_CAP, 200);
   assert.ok(FIND_MATCH_CAP >= 1000);
+});
+
+test("expandReplacement - plain mode is literal and preserve case still applies", () => {
+  assert.equal(expandReplacement("$1 \\n", { text: "Foo" }), "$1 \\n");
+  assert.equal(expandReplacement("bar", { text: "Foo" }, { preserveCase: true }), "Bar");
+  assert.equal(expandReplacement("", { text: "Foo" }, { regex: true }), "");
+  assert.equal(expandReplacement(null, { text: "Foo" }), "");
+});
+
+test("expandReplacement - regex groups, $&, $$ and escapes", () => {
+  assert.equal(expandReplacement("$1-$2", { text: "a-b", groups: ["a", "b"] }, { regex: true }), "a-b");
+  assert.equal(expandReplacement("$0", { text: "foo", groups: [] }, { regex: true }), "foo");
+  assert.equal(expandReplacement("$0-$&", { text: "foo", groups: [] }, { regex: true }), "foo-foo");
+  assert.equal(expandReplacement("$&", { text: "foo", groups: [] }, { regex: true }), "foo");
+  assert.equal(expandReplacement("$$1", { text: "foo", groups: ["x"] }, { regex: true }), "$1");
+  assert.equal(expandReplacement("\\n\\t\\\\", { text: "", groups: [] }, { regex: true }), "\n\t\\");
+  assert.equal(expandReplacement("\\$1", { text: "foo", groups: ["x"] }, { regex: true }), "$1");
+  assert.equal(expandReplacement("C:\\path", { text: "x", groups: [] }, { regex: true }), "C:\\path");
+  assert.equal(expandReplacement("\\q\\z", { text: "x", groups: [] }, { regex: true }), "\\q\\z");
+  assert.equal(expandReplacement("$9", { text: "foo", groups: ["x"] }, { regex: true }), "$9");
+  assert.equal(expandReplacement("$99", { text: "foo", groups: ["x"] }, { regex: true }), "$99");
+  assert.equal(expandReplacement("$1", { text: "ç", groups: ["á"] }, { regex: true }), "á");
+});
+
+test("expandReplacement - case operations \\u \\l \\U \\L and \\E", () => {
+  assert.equal(expandReplacement("\\u$1", { text: "foo", groups: ["bar"] }, { regex: true }), "Bar");
+  assert.equal(expandReplacement("\\l$1", { text: "FOO", groups: ["BAR"] }, { regex: true }), "bAR");
+  assert.equal(expandReplacement("\\U$1\\E-$1", { text: "foo", groups: ["bar"] }, { regex: true }), "BAR-bar");
+  assert.equal(expandReplacement("\\L$1\\E-$1", { text: "FOO", groups: ["BAR"] }, { regex: true }), "bar-BAR");
+  assert.equal(expandReplacement("\\Ufoo\\E", { text: "x" }, { regex: true }), "FOO");
+});
+
+test("applyPreserveCase - VS Code lower, title, upper, mixed and separated segments", () => {
+  assert.equal(applyPreserveCase("bar", "foo"), "bar");
+  assert.equal(applyPreserveCase("Bar", "foo"), "bar");
+  assert.equal(applyPreserveCase("bar", "Foo"), "Bar");
+  assert.equal(applyPreserveCase("bar", "FOO"), "BAR");
+  assert.equal(applyPreserveCase("bar", "fOo"), "bar");
+  assert.equal(applyPreserveCase("baz", "fooBar"), "baz");
+  assert.equal(applyPreserveCase("baz", "FooBAR"), "Baz");
+  assert.equal(applyPreserveCase("baz_qux", "Foo_Bar"), "Baz_Qux");
+  assert.equal(applyPreserveCase("baz-qux", "FOO-BAR"), "BAZ-QUX");
+  assert.equal(applyPreserveCase("baz-qux", "foo-bar"), "baz-qux");
+  assert.equal(applyPreserveCase("bar", ""), "bar");
+  assert.equal(applyPreserveCase("", "Foo"), "");
+  assert.equal(applyPreserveCase("éclair", "École"), "Éclair");
+  assert.equal(applyPreserveCase("baz_qux", "FooBar"), "Baz_qux");
+});
+
+test("applyReplacements - back to front, adjacent, overlapping and empty", () => {
+  const text = "foo foo foo";
+  const matches = findMatches(text, "foo").matches;
+  assert.equal(applyReplacements(text, matches, "bar"), "bar bar bar");
+  assert.equal(applyReplacements(text, matches, ""), "  ");
+  assert.equal(
+    applyReplacements("aXbXc", [{ index: 1, length: 1 }, { index: 3, length: 1 }], "yy"),
+    "ayybyyc"
+  );
+  assert.equal(
+    applyReplacements("ab", [{ index: 0, length: 1 }, { index: 1, length: 1 }], "X"),
+    "XX"
+  );
+  assert.equal(applyReplacements("abc", [{ index: 0, length: 2 }, { index: 1, length: 2 }], "X"), "aX");
+  assert.equal(applyReplacements("abc", [], "X"), "abc");
+});
+
+test("applyReplacements - CRLF, unicode, regex groups and whole-word groups", () => {
+  const crlf = "foo\r\nbar\r\nfoo\r\n";
+  assert.equal(applyReplacements(crlf, findMatches(crlf, "foo").matches, "baz"), "baz\r\nbar\r\nbaz\r\n");
+  assert.equal(
+    applyReplacements("açúcar foo", findMatches("açúcar foo", "foo").matches, "é"),
+    "açúcar é"
+  );
+
+  const regexText = "a1 b2";
+  assert.equal(
+    applyReplacements(
+      regexText,
+      findMatches(regexText, "([a-z])(\\d)", { regex: true }).matches,
+      "$2$1",
+      { regex: true, query: "([a-z])(\\d)" }
+    ),
+    "1a 2b"
+  );
+  assert.equal(
+    applyReplacements("foo", [{ index: 0, length: 3, groups: ["x"] }], "$1", { regex: true }),
+    "x"
+  );
+  assert.equal(
+    applyReplacements(
+      "cat",
+      findMatches("cat", "(c)(at)", { regex: true, wholeWord: true }).matches,
+      "$1$2",
+      { regex: true, wholeWord: true, query: "(c)(at)" }
+    ),
+    "cat"
+  );
+});
+
+test("applyReplacements - preserve case maps the replacement to the match", () => {
+  const text = "foo Foo FOO";
+  assert.equal(
+    applyReplacements(text, findMatches(text, "foo").matches, "bar", { preserveCase: true }),
+    "bar Bar BAR"
+  );
+});
+
+test("replaceSingleMatch - replaces one, selects the next and wraps", () => {
+  const text = "foo foo foo";
+  const matches = findMatches(text, "foo").matches;
+  const first = replaceSingleMatch(text, matches, 0, "bar", { query: "foo" });
+  assert.equal(first.text, "bar foo foo");
+  assert.equal(first.replaced, true);
+  assert.equal(first.nextIndex, 0);
+
+  const last = replaceSingleMatch(text, matches, 2, "bar", { query: "foo" });
+  assert.equal(last.text, "foo foo bar");
+  assert.equal(last.nextIndex, 0);
+
+  const missing = replaceSingleMatch(text, matches, 99, "bar", { query: "foo" });
+  assert.equal(missing.text, text);
+  assert.equal(missing.replaced, false);
+  assert.equal(missing.nextIndex, -1);
+});
+
+test("replaceSingleMatch - skips a replacement that matches the query", () => {
+  const text = "foo foo";
+  const matches = findMatches(text, "foo").matches;
+  const result = replaceSingleMatch(text, matches, 0, "foo", { query: "foo" });
+  assert.equal(result.text, "foo foo");
+  assert.equal(result.nextIndex, 1);
+
+  const grown = replaceSingleMatch("x", [{ index: 0, length: 1, text: "x" }], 0, "xx", { query: "x" });
+  assert.equal(grown.text, "xx");
+  assert.equal(grown.nextIndex, 0);
+});
+
+test("replacementDiffSegments - removed and inserted, empty and multiline", () => {
+  assert.deepEqual(replacementDiffSegments("foo", "bar"), [
+    { kind: "removed", text: "foo" },
+    { kind: "inserted", text: "bar" },
+  ]);
+  assert.deepEqual(replacementDiffSegments("foo", ""), [{ kind: "removed", text: "foo" }]);
+  assert.deepEqual(replacementDiffSegments("", "bar"), [{ kind: "inserted", text: "bar" }]);
+  assert.deepEqual(replacementDiffSegments("", ""), []);
+  assert.deepEqual(replacementDiffSegments("foo", "a\nb\tc"), [
+    { kind: "removed", text: "foo" },
+    { kind: "inserted", text: "a↵b→c" },
+  ]);
+  assert.deepEqual(replacementDiffSegments("ç", "é"), [
+    { kind: "removed", text: "ç" },
+    { kind: "inserted", text: "é" },
+  ]);
+});
+
+test("formatReplaceAllConfirmation - singular, plural, empty and long", () => {
+  assert.equal(formatReplaceAllConfirmation(1, 1, "x"), "Replace 1 occurrence across 1 file with 'x'?");
+  assert.equal(formatReplaceAllConfirmation(3, 2, "y"), "Replace 3 occurrences across 2 files with 'y'?");
+  assert.equal(formatReplaceAllConfirmation(0, 0, ""), "Replace 0 occurrences across 0 files with ''?");
+  const long = formatReplaceAllConfirmation(2, 2, "x".repeat(100));
+  assert.ok(long.includes("…"));
+  assert.ok(long.length < 140);
+});
+
+test("expandSearchReplacement - literal, regex groups and preserve case", () => {
+  assert.equal(expandSearchReplacement("foo bar", "foo", {}, { column: 0, length: 3 }, "baz"), "baz");
+  assert.equal(
+    expandSearchReplacement("a1 b2", "([a-z])(\\d)", { regex: true }, { column: 0, length: 2 }, "$2$1"),
+    "1a"
+  );
+  assert.equal(
+    expandSearchReplacement("Foo", "foo", {}, { column: 0, length: 3 }, "bar", { preserveCase: true }),
+    "Bar"
+  );
+  assert.equal(expandSearchReplacement("foo", "foo", {}, { column: 99, length: 1 }, "bar"), "bar");
+});
+
+test("selectFreshMatches and planFileReplacements - safe file replace", () => {
+  const fresh = findMatches("foo foo", "foo").matches;
+  const selected = selectFreshMatches(fresh, [{ line: 1, column: 0, length: 3, text: "foo" }]);
+  assert.equal(selected.matches.length, 1);
+  assert.equal(selected.missing, 0);
+  const missing = selectFreshMatches(fresh, [{ line: 1, column: 1, length: 3, text: "foo" }]);
+  assert.equal(missing.matches.length, 0);
+  assert.equal(missing.missing, 1);
+
+  // SEARCH rows carry the full line text; the matched slice is compared.
+  const fullLine = selectFreshMatches(fresh, [{ line: 1, column: 4, length: 3, text: "foo foo" }]);
+  assert.equal(fullLine.matches.length, 1);
+  assert.equal(fullLine.matches[0].index, 4);
+  assert.equal(fullLine.missing, 0);
+
+  const plan = planFileReplacements(
+    "foo foo",
+    "foo",
+    {},
+    [
+      { line: 1, column: 0, length: 3, text: "foo" },
+      { line: 1, column: 4, length: 3, text: "foo" },
+    ],
+    "bar"
+  );
+  assert.equal(plan.ok, true);
+  assert.equal(plan.text, "bar bar");
+  assert.equal(plan.count, 2);
+
+  const changed = planFileReplacements(
+    "foo baz",
+    "foo",
+    {},
+    [
+      { line: 1, column: 0, length: 3, text: "foo" },
+      { line: 1, column: 4, length: 3, text: "foo" },
+    ],
+    "bar"
+  );
+  assert.equal(changed.ok, false);
+  assert.equal(changed.reason, "changed");
+  assert.equal(changed.missing, 1);
+
+  const crlf = planFileReplacements(
+    "foo\r\nbar\r\n",
+    "foo",
+    {},
+    [{ line: 1, column: 0, length: 3, text: "foo" }],
+    "baz"
+  );
+  assert.equal(crlf.text, "baz\r\nbar\r\n");
+
+  const empty = planFileReplacements("foo foo", "foo", {}, [], "bar");
+  assert.equal(empty.ok, false);
+  assert.equal(empty.reason, "empty");
+
+  const regex = planFileReplacements(
+    "a1 b2",
+    "([a-z])(\\d)",
+    { regex: true },
+    [
+      { line: 1, column: 0, length: 2, text: "a1" },
+      { line: 1, column: 3, length: 2, text: "b2" },
+    ],
+    "$2$1"
+  );
+  assert.equal(regex.text, "1a 2b");
+});
+
+test("collectReplaceTargets - normalizes paths and clamps fields", () => {
+  assert.deepEqual(
+    collectReplaceTargets([{ file: "./a.js", matches: [{ line: 2, column: 1, length: 3, text: "foo" }] }]),
+    [{ file: "a.js", matches: [{ line: 2, column: 1, length: 3, text: "foo" }] }]
+  );
+  assert.deepEqual(collectReplaceTargets(null), []);
+  assert.deepEqual(collectReplaceTargets([{ file: "", matches: [] }]), []);
+});
+
+test("normalizeReplacePrefs and find props carry replace state", () => {
+  assert.deepEqual(normalizeReplacePrefs(null), { replace: "", replaceOpen: false, preserveCase: false });
+  assert.deepEqual(normalizeReplacePrefs({ replace: "x", replaceOpen: true, preserveCase: true }), {
+    replace: "x",
+    replaceOpen: true,
+    preserveCase: true,
+  });
+
+  const prop = normalizeFindProp({ query: "x", replace: "y" });
+  assert.equal(prop.replace, "y");
+  assert.equal(prop.replaceOpen, true);
+
+  const legacy = normalizeFindProp({ query: "x" });
+  assert.deepEqual(legacy, {
+    query: "x",
+    caseSensitive: false,
+    wholeWord: false,
+    regex: false,
+    line: null,
+    at: null,
+  });
+
+  assert.notEqual(
+    findPropSignature({ query: "x", replace: "a" }),
+    findPropSignature({ query: "x", replace: "b" })
+  );
+  assert.equal(
+    findPropSignature({ query: "x", replace: "a", replaceOpen: true }),
+    findPropSignature({ query: "x", replace: "a", replaceOpen: true })
+  );
+});
+
+test("parseRgJson - astral characters keep later columns aligned (S6)", () => {
+  const line = "a😀foo foo";
+  const stdout = JSON.stringify({
+    type: "match",
+    data: {
+      path: { text: "emoji.txt" },
+      lines: { text: `${line}\n` },
+      line_number: 1,
+      submatches: [
+        { start: 5, end: 8 },
+        { start: 9, end: 12 },
+      ],
+    },
+  });
+  const parsed = parseRgJson(stdout);
+  assert.deepEqual(parsed.rows, [
+    { file: "emoji.txt", line: 1, column: 3, length: 3, text: line },
+    { file: "emoji.txt", line: 1, column: 7, length: 3, text: line },
+  ]);
+});
+
+test("parseRgJson - CJK characters keep later columns aligned (S6)", () => {
+  const line = "a中foo";
+  const stdout = JSON.stringify({
+    type: "match",
+    data: {
+      path: { text: "cjk.txt" },
+      lines: { text: `${line}\n` },
+      line_number: 1,
+      submatches: [{ start: 4, end: 7 }],
+    },
+  });
+  const parsed = parseRgJson(stdout);
+  assert.deepEqual(parsed.rows, [{ file: "cjk.txt", line: 1, column: 2, length: 3, text: line }]);
+});
+
+test("expandGrepRows - strips a UTF-8 BOM so grep and rg agree (S6)", () => {
+  const expanded = expandGrepRows([{ file: "bom.txt", line: 1, text: "\uFEFFfoo bar" }], "foo");
+  assert.deepEqual(expanded.rows, [{ file: "bom.txt", line: 1, column: 0, length: 3, text: "foo bar" }]);
+});
+
+test("planFileReplacements - keeps a BOM and offsets only line 1 (S6)", () => {
+  const first = planFileReplacements(
+    "\uFEFFfoo bar",
+    "foo",
+    {},
+    [{ line: 1, column: 0, length: 3, text: "foo bar" }],
+    "baz"
+  );
+  assert.equal(first.ok, true);
+  assert.equal(first.text, "\uFEFFbaz bar");
+
+  const second = planFileReplacements(
+    "\uFEFFfoo\nfoo",
+    "foo",
+    {},
+    [{ line: 2, column: 0, length: 3, text: "foo" }],
+    "baz"
+  );
+  assert.equal(second.ok, true);
+  assert.equal(second.text, "\uFEFFfoo\nbaz");
+});
+
+test("search replacement preview equals the applied preserve-case text (S3)", () => {
+  const line = "Foo foo FOO";
+  const matches = findMatches(line, "foo").matches;
+  const previews = matches.map((match) =>
+    expandSearchReplacement(line, "foo", {}, match, "bar", { preserveCase: true })
+  );
+  assert.deepEqual(previews, ["Bar", "bar", "BAR"]);
+
+  const targets = matches.map((match) => ({
+    line: 1,
+    column: match.column,
+    length: match.length,
+    text: line,
+  }));
+  const plan = planFileReplacements(line, "foo", {}, targets, "bar", { preserveCase: true });
+  assert.equal(plan.ok, true);
+  assert.equal(plan.text, "Bar bar BAR");
+
+  let applied = line;
+  for (let index = matches.length - 1; index >= 0; index -= 1) {
+    const match = matches[index];
+    applied = applied.slice(0, match.column) + previews[index] + applied.slice(match.column + match.length);
+  }
+  assert.equal(applied, plan.text);
+});
+
+test("classifyReplacementRead - too large, not UTF-8, unreadable and unknown size (S2)", () => {
+  assert.deepEqual(classifyReplacementRead({ byteSize: REPLACE_MAX_BYTES - 1, text: "ok" }), {
+    ok: true,
+    reason: null,
+  });
+  assert.deepEqual(classifyReplacementRead({ byteSize: REPLACE_MAX_BYTES, text: "ok" }), {
+    ok: false,
+    reason: "too large",
+  });
+  assert.deepEqual(classifyReplacementRead({ byteSize: 10, text: "bad\uFFFD" }), {
+    ok: false,
+    reason: "not UTF-8",
+  });
+  assert.deepEqual(classifyReplacementRead({ byteSize: 10, text: null }), {
+    ok: false,
+    reason: "unreadable",
+  });
+  assert.deepEqual(classifyReplacementRead({ byteSize: null, text: "ok" }), {
+    ok: false,
+    reason: "size check failed",
+  });
+});
+
+test("isDirtyFileState - live set, cache and persisted state all block writes (S7)", () => {
+  assert.equal(isDirtyFileState({ key: "a", dirtyKeys: new Set(["a"]) }), true);
+  assert.equal(isDirtyFileState({ key: "a", cached: { dirty: true } }), true);
+  assert.equal(isDirtyFileState({ key: "a", persisted: { dirty: true } }), true);
+  assert.equal(isDirtyFileState({ key: "a", cached: { dirty: false }, persisted: { dirty: false } }), false);
+  assert.equal(isDirtyFileState({ key: "b", dirtyKeys: new Set(["a"]), cached: { dirty: false } }), false);
+  assert.equal(isDirtyFileState({ key: "", cached: { dirty: true } }), false);
+});
+
+test("searchWindow - renders only the visible rows plus overscan (C1)", () => {
+  assert.equal(SEARCH_ROW_HEIGHT, 24);
+  const top = searchWindow(2000, 0, 400, SEARCH_ROW_HEIGHT, 6);
+  assert.equal(top.start, 0);
+  assert.equal(top.end, 29);
+  assert.equal(top.visibleCount, 29);
+  assert.equal(top.maxScroll, 2000 * SEARCH_ROW_HEIGHT - 400);
+  assert.equal(top.offset, 0);
+
+  const mid = searchWindow(2000, 2400, 400, SEARCH_ROW_HEIGHT, 6);
+  assert.equal(mid.offset, 2400);
+  assert.equal(mid.start, 94);
+  assert.equal(mid.end, 123);
+  assert.equal(mid.visibleCount, 29);
+
+  const bottom = searchWindow(2000, top.maxScroll, 400, SEARCH_ROW_HEIGHT, 6);
+  assert.equal(bottom.end, 2000);
+  assert.ok(bottom.visibleCount <= 29);
+  assert.equal(bottom.offset, top.maxScroll);
+
+  assert.deepEqual(searchWindow(0, 0, 400, SEARCH_ROW_HEIGHT, 6), {
+    start: 0,
+    end: 0,
+    top: 0,
+    bottom: 0,
+    maxScroll: 0,
+    offset: 0,
+    visibleCount: 0,
+  });
+  assert.equal(searchWindow(10, 0, 100, SEARCH_ROW_HEIGHT, 0).visibleCount, 5);
+});
+
+test("applyReplacements - replaces more than the display cap (C4)", () => {
+  const text = "x ".repeat(6000).trim();
+  const matches = findMatches(text, "x", { cap: Number.MAX_SAFE_INTEGER }).matches;
+  assert.equal(matches.length, 6000);
+  const replaced = applyReplacements(text, matches, "y");
+  assert.equal((replaced.match(/y/g) || []).length, 6000);
+  assert.equal(replaced.includes("x"), false);
 });

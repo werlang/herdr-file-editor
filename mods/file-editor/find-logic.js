@@ -20,8 +20,14 @@ export const SEARCH_FILE_CAP = 200;
 /** Default height of one line in the read-only find view, in pixels. */
 export const FIND_LINE_HEIGHT = 20;
 
+/** Height of one SEARCH result row, in pixels. */
+export const SEARCH_ROW_HEIGHT = 24;
+
 /** Default visible context around a match in a Files pane result row. */
 export const SEARCH_CONTEXT_CHARS = 180;
+
+/** Largest file a Files-pane replace will write, matching `readTextFile`'s 1 MiB cap. */
+export const REPLACE_MAX_BYTES = 1024 * 1024;
 
 /**
  * Escapes a literal string so it can be embedded in a regular expression.
@@ -261,6 +267,650 @@ export function findMatchIndexAtLine(matches, line) {
   return index >= 0 ? index : 0;
 }
 
+/* ==========================================================================
+ * Replace engine
+ * ========================================================================== */
+
+/**
+ * Applies VS Code's simple preserve-case rules to one replacement segment.
+ *
+ * The source segment's letters decide the target case, following VS Code's
+ * `buildReplaceStringWithCasePreserved`:
+ * - all uppercase (`FOO`) uppercases the replacement (`BAR`);
+ * - all lowercase (`foo`) lowercases the replacement (`bar`);
+ * - mixed case adjusts only the replacement's first letter to the source's
+ *   first-letter case (`Foo` + `bar` -> `Bar`, `fooBar` + `baz` -> `baz`,
+ *   `FooBAR` + `baz` -> `Baz`).
+ *
+ * @param {string} replacement
+ * @param {string} source
+ * @returns {string}
+ */
+function preserveCaseSegment(replacement, source) {
+  const rep = typeof replacement === "string" ? replacement : "";
+  const src = typeof source === "string" ? source : "";
+  if (!rep || !src) return rep;
+  // A character has case when upper- and lower-casing differ. This avoids
+  // Unicode property escapes, which not every embedded JS engine supports.
+  const letters = Array.from(src)
+    .filter((ch) => ch.toUpperCase() !== ch.toLowerCase())
+    .join("");
+  if (!letters) return rep;
+  if (letters === letters.toUpperCase()) return rep.toUpperCase();
+  if (letters === letters.toLowerCase()) return rep.toLowerCase();
+  // Mixed case: follow VS Code's buildReplaceStringWithCasePreserved and
+  // adjust only the replacement's first letter to the source's first-letter
+  // case.
+  const first = letters[0];
+  const chars = Array.from(rep);
+  if (chars.length > 0) {
+    chars[0] = first === first.toUpperCase() ? chars[0].toUpperCase() : chars[0].toLowerCase();
+    return chars.join("");
+  }
+  return rep;
+}
+
+/**
+ * Preserves the case of a matched source string in its replacement.
+ *
+ * Hyphen/underscore-separated names are handled segment by segment when the
+ * replacement has the same shape (`foo_bar` -> `baz_qux` becomes
+ * `Baz_Qux` for `Foo_Bar`). Otherwise the whole replacement follows the
+ * VS Code case rule above.
+ *
+ * @param {string} replacement
+ * @param {string} source
+ * @returns {string}
+ */
+export function applyPreserveCase(replacement, source) {
+  const rep = typeof replacement === "string" ? replacement : "";
+  const src = typeof source === "string" ? source : "";
+  if (!rep || !src) return rep;
+  const srcParts = src.split(/([-_])/);
+  const repParts = rep.split(/([-_])/);
+  if (srcParts.length > 2 && srcParts.length === repParts.length) {
+    return srcParts
+      .map((part, index) => (index % 2 === 1 ? repParts[index] : preserveCaseSegment(repParts[index], part)))
+      .join("");
+  }
+  return preserveCaseSegment(rep, src);
+}
+
+/**
+ * Groups a regex match for replacement expansion.
+ *
+ * Whole-word mode wraps the query in an extra capture group, so the user's
+ * `$1` is the second capture in that mode. `$&` still refers to the whole
+ * matched text, which is passed separately.
+ *
+ * @param {RegExpExecArray} match
+ * @param {{ wholeWord?: boolean }} options
+ * @returns {string[]}
+ */
+function regexReplacementGroups(match, options) {
+  return options?.wholeWord === true ? match.slice(2) : match.slice(1);
+}
+
+/**
+ * Expands a VS Code-style replacement string for one match.
+ *
+ * In plain (non-regex) mode the replacement is inserted literally, including
+ * `$1` and `\n`. In regex mode it supports `$0` and `$&` (the whole match),
+ * `$1`..`$99`, `$$` (a literal `$`), `\n`, `\t`, `\\`, `\$`, and the case
+ * operations `\u`, `\l`, `\U`, `\L` and `\E` (end the `\U`/`\L` run).
+ * Unknown escapes keep their backslash.
+ *
+ * `preserveCase` is applied to the expanded text using the original matched
+ * text as the case source.
+ *
+ * @param {string} replacement
+ * @param {{ text?: string, groups?: string[] }} match
+ * @param {{ regex?: boolean, preserveCase?: boolean }} [options]
+ * @returns {string}
+ */
+export function expandReplacement(replacement, match, options = {}) {
+  const source = typeof replacement === "string" ? replacement : "";
+  const matchText = typeof match?.text === "string" ? match.text : "";
+  const regex = options.regex === true;
+
+  const expand = () => {
+    if (!regex) return source;
+    const groups = Array.isArray(match?.groups) ? match.groups : [];
+    const out = [];
+    let mode = null;
+    let nextCase = null;
+
+    const push = (value) => {
+      if (value === "") return;
+      let next = value;
+      if (mode === "upper") next = next.toUpperCase();
+      else if (mode === "lower") next = next.toLowerCase();
+      if (nextCase) {
+        const chars = Array.from(next);
+        if (chars.length > 0) {
+          chars[0] = nextCase === "upper" ? chars[0].toUpperCase() : chars[0].toLowerCase();
+          next = chars.join("");
+        }
+        nextCase = null;
+      }
+      out.push(next);
+    };
+
+    let i = 0;
+    while (i < source.length) {
+      const ch = source[i];
+      if (ch === "\\" && i + 1 < source.length) {
+        const code = source[i + 1];
+        if (code === "n") {
+          push("\n");
+          i += 2;
+          continue;
+        }
+        if (code === "t") {
+          push("\t");
+          i += 2;
+          continue;
+        }
+        if (code === "\\") {
+          push("\\");
+          i += 2;
+          continue;
+        }
+        if (code === "$") {
+          push("$");
+          i += 2;
+          continue;
+        }
+        if (code === "u") {
+          nextCase = "upper";
+          i += 2;
+          continue;
+        }
+        if (code === "l") {
+          nextCase = "lower";
+          i += 2;
+          continue;
+        }
+        if (code === "U") {
+          mode = "upper";
+          i += 2;
+          continue;
+        }
+        if (code === "L") {
+          mode = "lower";
+          i += 2;
+          continue;
+        }
+        if (code === "E") {
+          mode = null;
+          i += 2;
+          continue;
+        }
+        // Unknown escapes keep their backslash, so a Windows path such as
+        // C:\path survives a regex replacement.
+        push(`\\${code}`);
+        i += 2;
+        continue;
+      }
+
+      if (ch === "$" && i + 1 < source.length) {
+        const code = source[i + 1];
+        if (code === "$") {
+          push("$");
+          i += 2;
+          continue;
+        }
+        if (code === "&") {
+          push(matchText);
+          i += 2;
+          continue;
+        }
+        if (code === "0") {
+          push(matchText);
+          i += 2;
+          continue;
+        }
+        if (code >= "0" && code <= "9") {
+          const two = i + 2 < source.length && source[i + 2] >= "0" && source[i + 2] <= "9"
+            ? `${code}${source[i + 2]}`
+            : null;
+          if (two !== null && Number(two) >= 1 && Number(two) <= groups.length) {
+            push(groups[Number(two) - 1] ?? "");
+            i += 3;
+            continue;
+          }
+          const one = Number(code);
+          if (one >= 1 && one <= groups.length) {
+            push(groups[one - 1] ?? "");
+            i += 2;
+            continue;
+          }
+          push(`$${code}`);
+          i += 2;
+          continue;
+        }
+        push("$");
+        i += 1;
+        continue;
+      }
+
+      push(ch);
+      i += 1;
+    }
+    return out.join("");
+  };
+
+  const expanded = expand();
+  return options.preserveCase === true ? applyPreserveCase(expanded, matchText) : expanded;
+}
+
+/**
+ * Collects the capture groups for every regex match in a text, keyed by the
+ * match's JavaScript string index. Used by `applyReplacements` so `$1` works
+ * without re-running the regex once per match.
+ *
+ * @param {string} text
+ * @param {string} query
+ * @param {{ caseSensitive?: boolean, wholeWord?: boolean, regex?: boolean }} [options]
+ * @returns {Map<number, string[]>}
+ */
+function collectReplacementGroups(text, query, options = {}) {
+  const map = new Map();
+  const opts = normalizeFindOptions(options);
+  if (opts.regex !== true) return map;
+  const built = buildFindRegExp(query, opts);
+  if (!built.valid || !built.regex) return map;
+  let match;
+  while ((match = built.regex.exec(text)) !== null) {
+    const matchedText = opts.wholeWord ? match[1] ?? "" : match[0];
+    const index = opts.wholeWord ? match.index + match[0].length - matchedText.length : match.index;
+    if (matchedText.length === 0) {
+      built.regex.lastIndex += 1;
+      if (built.regex.lastIndex > text.length) break;
+      continue;
+    }
+    map.set(index, regexReplacementGroups(match, opts));
+  }
+  return map;
+}
+
+/**
+ * Applies a set of matches to text, working from the end so earlier offsets
+ * stay valid. Matches that overlap a later match are skipped; adjacent
+ * matches are both applied. Text outside the selected matches stays
+ * byte-identical, which preserves CRLF line endings and a trailing newline.
+ *
+ * @param {string} text
+ * @param {Array<{ index: number, length: number, text?: string, groups?: string[] }>} matches
+ * @param {string} replacement
+ * @param {{
+ *   regex?: boolean,
+ *   preserveCase?: boolean,
+ *   query?: string,
+ *   caseSensitive?: boolean,
+ *   wholeWord?: boolean,
+ * }} [options]
+ * @returns {string}
+ */
+export function applyReplacements(text, matches, replacement, options = {}) {
+  const raw = typeof text === "string" ? text : "";
+  const list = (Array.isArray(matches) ? matches : [])
+    .filter((match) => match && Number.isFinite(match.index) && Number.isFinite(match.length))
+    .slice()
+    .sort((a, b) => a.index - b.index);
+  if (list.length === 0) return raw;
+
+  const regex = options.regex === true;
+  const groupMap =
+    regex && typeof options.query === "string" && options.query.length > 0
+      ? collectReplacementGroups(raw, options.query, options)
+      : null;
+
+  let out = raw;
+  let lastStart = Infinity;
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const match = list[i];
+    const start = Math.max(0, Math.min(raw.length, Math.floor(match.index)));
+    const end = Math.max(start, Math.min(raw.length, start + Math.max(0, Math.floor(match.length))));
+    if (end > lastStart) continue;
+    const matchText = raw.slice(start, end);
+    const groups = Array.isArray(match.groups) ? match.groups : groupMap?.get(start) ?? [];
+    const expanded = expandReplacement(
+      replacement,
+      { text: matchText, groups },
+      { regex, preserveCase: options.preserveCase === true }
+    );
+    out = out.slice(0, start) + expanded + out.slice(end);
+    lastStart = start;
+  }
+  return out;
+}
+
+/**
+ * Replaces one match and reports the next match to select.
+ *
+ * The replacement is applied through `applyReplacements`, then the query is
+ * re-run on the new text. The next index is the first fresh match at or after
+ * the end of the inserted text (so a replacement that still matches the query
+ * is not selected immediately), wrapping to the first match when the end of
+ * the document is reached. With no matches left it is -1.
+ *
+ * @param {string} text
+ * @param {Array<{ index: number, length: number, text?: string, groups?: string[] }>} matches
+ * @param {number} currentIndex
+ * @param {string} replacement
+ * @param {{
+ *   query?: string,
+ *   caseSensitive?: boolean,
+ *   wholeWord?: boolean,
+ *   regex?: boolean,
+ *   preserveCase?: boolean,
+ *   cap?: number,
+ * }} [options]
+ * @returns {{
+ *   text: string,
+ *   replaced: boolean,
+ *   matches: Array<object>,
+ *   nextIndex: number,
+ *   valid: boolean,
+ *   limited: boolean,
+ *   error: string | null,
+ * }}
+ */
+export function replaceSingleMatch(text, matches, currentIndex, replacement, options = {}) {
+  const raw = typeof text === "string" ? text : "";
+  const list = Array.isArray(matches) ? matches : [];
+  const index = Number.isFinite(currentIndex) ? Math.floor(currentIndex) : -1;
+  const match = list[index];
+  if (!match) {
+    return { text: raw, replaced: false, matches: list, nextIndex: -1, valid: true, limited: false, error: null };
+  }
+
+  const start = Math.max(0, Math.floor(Number(match.index) || 0));
+  const length = Math.max(0, Math.floor(Number(match.length) || 0));
+  const nextText = applyReplacements(raw, [match], replacement, options);
+  const insertedLength = Math.max(0, nextText.length - (raw.length - length));
+  const end = start + insertedLength;
+  const result = findMatches(nextText, options.query ?? "", options);
+
+  let nextIndex = -1;
+  if (result.matches.length > 0) {
+    nextIndex = result.matches.findIndex((candidate) => candidate.index >= end);
+    if (nextIndex < 0) nextIndex = 0;
+  }
+
+  return {
+    text: nextText,
+    replaced: true,
+    matches: result.matches,
+    nextIndex,
+    valid: result.valid,
+    limited: result.limited,
+    error: result.error,
+  };
+}
+
+/**
+ * Splits a search result's match and replacement into the two inline-diff
+ * segments the SEARCH row draws: the removed match and the inserted text.
+ * Newlines and tabs in the replacement are made visible because a result row
+ * is one line tall.
+ *
+ * @param {string} matchText
+ * @param {string} replacementText
+ * @returns {Array<{ kind: "removed" | "inserted", text: string }>}
+ */
+export function replacementDiffSegments(matchText, replacementText) {
+  const removed = typeof matchText === "string" ? matchText : "";
+  const inserted = typeof replacementText === "string" ? replacementText : "";
+  const display = inserted
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/\n/g, "↵")
+    .replace(/\t/g, "→");
+  const segments = [];
+  if (removed.length > 0) segments.push({ kind: "removed", text: removed });
+  if (display.length > 0) segments.push({ kind: "inserted", text: display });
+  return segments;
+}
+
+/**
+ * Expands the replacement for one SEARCH result row. The row stores only the
+ * line text and the match position, so the query regex is re-run on that line
+ * to recover capture groups for `$1` expansion. If the match cannot be found
+ * again, the literal slice is used with no groups.
+ *
+ * @param {string} lineText
+ * @param {string} query
+ * @param {{ caseSensitive?: boolean, wholeWord?: boolean, regex?: boolean }} options
+ * @param {{ column: number, length: number }} match
+ * @param {string} replacement
+ * @param {{ preserveCase?: boolean }} [replaceOptions]
+ * @returns {string}
+ */
+export function expandSearchReplacement(lineText, query, options, match, replacement, replaceOptions = {}) {
+  const text = typeof lineText === "string" ? lineText : "";
+  const column = Math.max(0, Math.floor(Number(match?.column) || 0));
+  const length = Math.max(0, Math.floor(Number(match?.length) || 0));
+  const opts = normalizeFindOptions(options);
+  const built = buildFindRegExp(query, opts);
+  if (built.valid && built.regex) {
+    let found;
+    while ((found = built.regex.exec(text)) !== null) {
+      const matchedText = opts.wholeWord ? found[1] ?? "" : found[0];
+      const index = opts.wholeWord ? found.index + found[0].length - matchedText.length : found.index;
+      if (matchedText.length === 0) {
+        built.regex.lastIndex += 1;
+        if (built.regex.lastIndex > text.length) break;
+        continue;
+      }
+      if (index === column && matchedText.length === length) {
+        return expandReplacement(
+          replacement,
+          { text: matchedText, groups: regexReplacementGroups(found, opts) },
+          { regex: opts.regex, preserveCase: replaceOptions.preserveCase === true }
+        );
+      }
+    }
+  }
+  return expandReplacement(
+    replacement,
+    { text: text.slice(column, column + length), groups: [] },
+    { regex: opts.regex, preserveCase: replaceOptions.preserveCase === true }
+  );
+}
+
+/**
+ * Matches search-result targets against a freshly recomputed match list.
+ *
+ * A target is a search row's `{ line, column, length, text }` (line is
+ * 1-based). Only targets that still exist at the same position and length are
+ * selected; each fresh match is used at most once.
+ *
+ * @param {Array<{ id: number, line: number, column: number, length: number, text: string }>} freshMatches
+ * @param {Array<{ line: number, column: number, length: number, text?: string }>} targets
+ * @returns {{ matches: Array<object>, missing: number }}
+ */
+export function selectFreshMatches(freshMatches, targets) {
+  const fresh = Array.isArray(freshMatches) ? freshMatches : [];
+  const wanted = Array.isArray(targets) ? targets : [];
+  const used = new Set();
+  const selected = [];
+  let missing = 0;
+
+  for (const target of wanted) {
+    if (!target) {
+      missing += 1;
+      continue;
+    }
+    const line = Math.max(1, Math.floor(Number(target.line) || 1));
+    const column = Math.max(0, Math.floor(Number(target.column) || 0));
+    const length = Math.max(0, Math.floor(Number(target.length) || 0));
+    const text = typeof target.text === "string" ? target.text : null;
+    const targetText = text === null ? null : text.slice(column, column + length);
+    const found = fresh.find(
+      (match) =>
+        !used.has(match.id) &&
+        match.line + 1 === line &&
+        match.column === column &&
+        match.length === length &&
+        (text === null || match.text === targetText || match.text === text)
+    );
+    if (!found) {
+      missing += 1;
+      continue;
+    }
+    used.add(found.id);
+    selected.push(found);
+  }
+
+  return { matches: selected, missing };
+}
+
+/**
+ * Plans a safe replace for one file from SEARCH results.
+ *
+ * The caller passes the current disk text; the query is re-run on it and only
+ * the requested targets that still exist are replaced. Any missing target
+ * means the file changed on disk and the whole file is skipped, so a stale
+ * search result can never replace the wrong occurrence.
+ *
+ * @param {string} freshText
+ * @param {string} query
+ * @param {{ caseSensitive?: boolean, wholeWord?: boolean, regex?: boolean, cap?: number }} options
+ * @param {Array<{ line: number, column: number, length: number, text?: string }>} targets
+ * @param {string} replacement
+ * @param {{ preserveCase?: boolean }} [replaceOptions]
+ * @returns {{
+ *   ok: boolean,
+ *   reason: "empty" | "invalid" | "changed" | null,
+ *   text: string,
+ *   count: number,
+ *   missing: number,
+ *   error?: string | null,
+ * }}
+ */
+export function planFileReplacements(freshText, query, options, targets, replacement, replaceOptions = {}) {
+  const text = typeof freshText === "string" ? freshText : "";
+  const wanted = Array.isArray(targets) ? targets : [];
+  if (wanted.length === 0) {
+    return { ok: false, reason: "empty", text, count: 0, missing: 0, error: null };
+  }
+
+  const fresh = findMatches(text, query, options);
+  if (!fresh.valid) {
+    return { ok: false, reason: "invalid", text, count: 0, missing: 0, error: fresh.error };
+  }
+
+  // ripgrep strips a UTF-8 BOM, so its line-1 columns are one code unit to
+  // the left of the same match in the fresh text (which still has the BOM).
+  // Grep rows are normalized by expandGrepRows, so both sources use this
+  // BOM-free column contract. The BOM itself is never touched when writing.
+  const adjusted =
+    text.startsWith("\uFEFF") && wanted.length > 0
+      ? wanted.map((target) =>
+          target && Math.floor(Number(target.line) || 1) === 1
+            ? {
+                ...target,
+                column: Math.max(0, Math.floor(Number(target.column) || 0)) + 1,
+                // `selectFreshMatches` slices the target text at its column;
+                // prefix the BOM so the matched text stays aligned too.
+                text: typeof target.text === "string" ? `\uFEFF${target.text}` : target.text,
+              }
+            : target
+        )
+      : wanted;
+  const selected = selectFreshMatches(fresh.matches, adjusted);
+  if (selected.missing > 0 || selected.matches.length !== wanted.length) {
+    return {
+      ok: false,
+      reason: "changed",
+      text,
+      count: 0,
+      missing: selected.missing || wanted.length - selected.matches.length,
+      error: null,
+    };
+  }
+
+  const next = applyReplacements(text, selected.matches, replacement, {
+    ...options,
+    query,
+    preserveCase: replaceOptions.preserveCase === true,
+  });
+  return { ok: true, reason: null, text: next, count: selected.matches.length, missing: 0, error: null };
+}
+
+/**
+ * Classifies a fresh read before a Files-pane replace writes it back.
+ *
+ * `readTextFile` reads at most 1 MiB of UTF-8, so a larger file could be
+ * truncated; a replacement rune (`\uFFFD`) means the read was lossy. Both are
+ * skipped rather than written. An unknown size is also skipped, because the
+ * safe answer is not to write a file whose read cannot be trusted.
+ *
+ * @param {{
+ *   byteSize?: number,
+ *   text?: string,
+ *   maxBytes?: number,
+ * }} [input]
+ * @returns {{ ok: boolean, reason: "too large" | "not UTF-8" | "unreadable" | "size check failed" | null }}
+ */
+export function classifyReplacementRead(input = {}) {
+  const size =
+    input.byteSize === null || input.byteSize === undefined ? NaN : Number(input.byteSize);
+  const limit =
+    Number.isFinite(input.maxBytes) && input.maxBytes > 0 ? input.maxBytes : REPLACE_MAX_BYTES;
+  if (!Number.isFinite(size) || size < 0) return { ok: false, reason: "size check failed" };
+  if (size >= limit) return { ok: false, reason: "too large" };
+  if (typeof input.text !== "string") return { ok: false, reason: "unreadable" };
+  if (input.text.includes("\uFFFD")) return { ok: false, reason: "not UTF-8" };
+  return { ok: true, reason: null };
+}
+
+/**
+ * Whether a file has unsaved edits according to any of the editor state
+ * sources: the live dirty set, the bounded in-memory tab cache, or the
+ * sessionStorage tab state. A closed tab can still be restored from the cache
+ * with its dirty buffer, so the open-tab map alone is not enough.
+ *
+ * @param {{
+ *   key?: string,
+ *   dirtyKeys?: Set<string>,
+ *   cached?: { dirty?: boolean } | null,
+ *   persisted?: { dirty?: boolean } | null,
+ * }} [state]
+ * @returns {boolean}
+ */
+export function isDirtyFileState(state = {}) {
+  const key = typeof state.key === "string" ? state.key : "";
+  if (!key) return false;
+  if (state.dirtyKeys instanceof Set && state.dirtyKeys.has(key)) return true;
+  if (state.cached?.dirty === true) return true;
+  if (state.persisted?.dirty === true) return true;
+  return false;
+}
+
+/**
+ * Collects replace targets from grouped SEARCH results. The result is a
+ * per-file snapshot safe to hold while disk reads and writes happen.
+ *
+ * @param {Array<{ file: string, matches: Array<{ line: number, column: number, length: number, text: string }> }>} groups
+ * @returns {Array<{ file: string, matches: Array<{ line: number, column: number, length: number, text: string }> }>}
+ */
+export function collectReplaceTargets(groups) {
+  return (Array.isArray(groups) ? groups : [])
+    .map((group) => ({
+      file: normalizeSearchPath(group?.file),
+      matches: (Array.isArray(group?.matches) ? group.matches : []).map((match) => ({
+        line: Math.max(1, Math.floor(Number(match?.line) || 1)),
+        column: Math.max(0, Math.floor(Number(match?.column) || 0)),
+        length: Math.max(0, Math.floor(Number(match?.length) || 0)),
+        text: typeof match?.text === "string" ? match.text : "",
+      })),
+    }))
+    .filter((group) => group.file.length > 0 && group.matches.length > 0);
+}
+
 /**
  * The counter label shown beside the find input.
  *
@@ -491,7 +1141,7 @@ export function searchGlobVariants(glob) {
 /**
  * Builds the ripgrep argument vector for a search. The caps are deliberately
  * low enough to keep one pathological file from stalling the UI: at most 1,000
- * columns per line, 2 MiB per file and 200 matches per file.
+ * columns per line, 1 MiB per file and 200 matches per file.
  *
  * @param {{
  *   query: string,
@@ -514,7 +1164,7 @@ export function buildRipgrepArgs(options) {
     "1000",
     "--max-columns-preview",
     "--max-filesize",
-    "2M",
+    "1M",
     "--max-count",
     "200",
   ];
@@ -687,7 +1337,18 @@ export function shouldConsumePendingFind(pending, fileKey, lastTimestamp, now = 
 export function findPropSignature(raw) {
   const find = normalizeFindProp(raw);
   if (!find) return null;
-  return JSON.stringify([find.query, find.caseSensitive, find.wholeWord, find.regex, find.line, find.at]);
+  const replace = normalizeReplacePrefs(raw);
+  return JSON.stringify([
+    find.query,
+    find.caseSensitive,
+    find.wholeWord,
+    find.regex,
+    find.line,
+    find.at,
+    replace.replace,
+    replace.replaceOpen || replace.replace.length > 0,
+    replace.preserveCase,
+  ]);
 }
 
 /**
@@ -768,8 +1429,14 @@ function buildByteToUnitMap(text) {
   for (let i = 0; i < text.length; i += 1) {
     const codePoint = text.codePointAt(i) ?? 0;
     if (codePoint > 0xffff) {
+      // A surrogate pair is one 4-byte UTF-8 sequence. The boundary between
+      // the two UTF-16 code units is not a UTF-8 boundary, so it maps to the
+      // byte offset before the sequence; the offset after the sequence lands
+      // on the low surrogate. This keeps an astral character from shifting
+      // every later column by one.
+      const before = bytes;
       bytes += 4;
-      map[i + 1] = bytes;
+      map[i + 1] = before;
       i += 1;
       map[i + 1] = bytes;
     } else {
@@ -925,7 +1592,10 @@ export function expandGrepRows(rows, query, options = {}) {
       limited = true;
       break;
     }
-    const result = findMatches(row.text, query, { ...options, cap: cap - out.length });
+    // ripgrep strips a UTF-8 BOM; grep does not. Normalize grep rows to the
+    // same BOM-free line so SEARCH columns and the replace planner agree.
+    const lineText = row.text.startsWith("\uFEFF") ? row.text.slice(1) : row.text;
+    const result = findMatches(lineText, query, { ...options, cap: cap - out.length });
     if (!result.valid) {
       valid = false;
       error = result.error;
@@ -936,7 +1606,7 @@ export function expandGrepRows(rows, query, options = {}) {
         limited = true;
         break;
       }
-      out.push({ file: row.file, line: row.line, column: match.column, length: match.length, text: row.text });
+      out.push({ file: row.file, line: row.line, column: match.column, length: match.length, text: lineText });
     }
     if (result.limited) limited = true;
   }
@@ -1038,6 +1708,49 @@ export function flattenSearchRows(groups, collapsedFiles) {
 }
 
 /**
+ * The visible window of a manually windowed SEARCH result list.
+ *
+ * GPUI refuses event handlers inside a virtual-list renderer, so the search
+ * list owns its scroll offset and renders only the visible rows plus overscan.
+ * This helper keeps that math pure and testable.
+ *
+ * @param {number} rowCount
+ * @param {number} scrollY
+ * @param {number} viewportHeight
+ * @param {number} [rowHeight=SEARCH_ROW_HEIGHT]
+ * @param {number} [overscan=6]
+ * @returns {{
+ *   start: number,
+ *   end: number,
+ *   top: number,
+ *   bottom: number,
+ *   maxScroll: number,
+ *   offset: number,
+ *   visibleCount: number,
+ * }}
+ */
+export function searchWindow(rowCount, scrollY, viewportHeight, rowHeight = SEARCH_ROW_HEIGHT, overscan = 6) {
+  const count = Math.max(0, Math.floor(Number(rowCount) || 0));
+  const height = Math.max(1, Math.floor(Number(viewportHeight) || 240));
+  const rowH = Math.max(1, Math.floor(Number(rowHeight) || SEARCH_ROW_HEIGHT));
+  const over = Math.max(0, Math.floor(Number(overscan) || 0));
+  const maxScroll = Math.max(0, count * rowH - height);
+  const offset = Math.max(0, Math.min(maxScroll, Number(scrollY) || 0));
+  const visible = Math.max(1, Math.ceil(height / rowH));
+  const first = Math.max(0, Math.floor(offset / rowH) - over);
+  const last = Math.min(count, first + visible + over * 2);
+  return {
+    start: first,
+    end: last,
+    top: first * rowH,
+    bottom: Math.max(0, (count - last) * rowH),
+    maxScroll,
+    offset,
+    visibleCount: last - first,
+  };
+}
+
+/**
  * The summary line shown above search results.
  *
  * @param {{
@@ -1065,6 +1778,24 @@ export function formatSearchSummary(state = {}) {
 }
 
 /**
+ * The confirmation message shown before replacing across several files.
+ *
+ * @param {number} count Occurrence count.
+ * @param {number} fileCount File count.
+ * @param {string} replacement Replacement text, truncated when very long.
+ * @returns {string}
+ */
+export function formatReplaceAllConfirmation(count, fileCount, replacement) {
+  const occurrences = Math.max(0, Math.floor(Number(count) || 0));
+  const files = Math.max(0, Math.floor(Number(fileCount) || 0));
+  const text = typeof replacement === "string" ? replacement : "";
+  const shown = text.length > 60 ? `${text.slice(0, 59)}…` : text;
+  return `Replace ${occurrences} occurrence${occurrences === 1 ? "" : "s"} across ${files} file${
+    files === 1 ? "" : "s"
+  } with '${shown}'?`;
+}
+
+/**
  * Reads the persisted find preferences from shared state.
  *
  * @param {unknown} raw
@@ -1081,6 +1812,21 @@ export function normalizeFindPrefs(raw) {
 }
 
 /**
+ * Reads the persisted replace preferences from shared state.
+ *
+ * @param {unknown} raw
+ * @returns {{ replace: string, replaceOpen: boolean, preserveCase: boolean }}
+ */
+export function normalizeReplacePrefs(raw) {
+  const value = raw && typeof raw === "object" ? raw : {};
+  return {
+    replace: typeof value.replace === "string" ? value.replace : "",
+    replaceOpen: value.replaceOpen === true,
+    preserveCase: value.preserveCase === true,
+  };
+}
+
+/**
  * Normalizes a `find` prop into something the editor can consume.
  *
  * @param {unknown} raw
@@ -1091,13 +1837,23 @@ export function normalizeFindProp(raw) {
   const prefs = normalizeFindPrefs(raw);
   const hasLine = Number.isFinite(raw.line);
   if (prefs.query.length === 0 && !hasLine) return null;
-  return {
+  const prop = {
     ...prefs,
     line: hasLine ? Math.max(1, Math.floor(raw.line)) : null,
     // Per-request nonce: a new search-result click must re-open find even when
     // the same query and line were consumed before for this file.
     at: Number.isFinite(raw.at) ? raw.at : null,
   };
+  // Replace fields are optional: older callers and the search-result handoff
+  // still pass only `{ query, caseSensitive, wholeWord, regex, line }`, and
+  // their normalized shape must stay unchanged.
+  if (raw.replace !== undefined || raw.replaceOpen !== undefined || raw.preserveCase !== undefined) {
+    const replace = normalizeReplacePrefs(raw);
+    prop.replace = replace.replace;
+    prop.replaceOpen = replace.replaceOpen || replace.replace.length > 0;
+    prop.preserveCase = replace.preserveCase;
+  }
+  return prop;
 }
 
 /**
