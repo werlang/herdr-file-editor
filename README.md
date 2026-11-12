@@ -1,6 +1,6 @@
 # Herdr File Explorer & Editor
 
-A native, dual-mode **File Explorer & Editor** mod for Herdr featuring directory tree navigation, Git status porcelain badges, dedicated tabbed file viewing, theme-aware syntax highlighting, and rich Markdown and SVG previews powered directly by GPUI.
+A native, dual-mode **File Explorer & Editor** mod for Herdr featuring directory tree navigation, Git status porcelain badges, dedicated tabbed file viewing, theme-aware syntax highlighting, in-editor find, workspace-wide search, and rich Markdown and SVG previews powered directly by GPUI.
 
 Instead of opening raw code files inside the narrow Files panel, `file-editor` opens files into their own dedicated Herdr tabs with full-pane syntax highlighting and Markdown or SVG rendering, keeping your directory tree accessible and intact.
 
@@ -48,10 +48,24 @@ Instead of opening raw code files inside the narrow Files panel, `file-editor` o
     - `Zoom Controls`: `−` / percentage / `+` for raster images and SVG previews; the percentage resets to fit.
     - `Wrap Toggle`: `wrap.svg` icon button toggling soft line wrapping on and off (via button or `Alt+Z` / `Opt+Z`), remembered in shared settings (`file-editor.wrap`).
     - `Split Actions`: `split-right.svg` and `split-down.svg` icon buttons splitting the editor right (also `Cmd+\` / `Ctrl+\`) or down, opening the `new-pane` chooser.
+    - `Find Button`: `search.svg` opening the in-editor find widget (also `Cmd+F` / `Ctrl+F`).
     - `Copy Button`: `copy.svg` button copying file text to the clipboard with an instant toast notification.
     - `Refresh Button`: `refresh.svg` button reloading file contents directly from disk.
 - **Live Disk Watching & Polling**:
   - Integrates with `watchFolder` off the UI thread and a 1.5s disk change poll so external modifications by agents or tools automatically update the open tab without clobbering unsaved edits.
+- **Find in File**:
+  - `Cmd+F` / `Ctrl+F` (or the `search.svg` toolbar button) opens a VS Code-style find bar docked over the editor: focused query input, `Aa` match case, `ab` whole word, `.*` regex (also `Alt+C` / `Alt+W` / `Alt+R`), an `N of M` counter, previous/next, and close.
+  - `Enter` / `Shift+Enter`, `F3` / `Shift+F3`, and `Cmd/Ctrl+G` / `Cmd/Ctrl+Shift+G` step through matches with wrap-around; `Esc` closes and returns to the native editor.
+  - Every match is highlighted and the current one is scrolled into view. Invalid regexes show `Invalid regex` with a red input border instead of throwing. Images disable find.
+  - The widget renders a read-only, virtualised text view while open because GPUI's `EditorState` has no selection/cursor/decoration API; the native editor state is left untouched, so unsaved edits survive. Markdown and SVG previews switch to Code view when find opens.
+  - The last query and toggles persist in `shared("file-editor.find")`.
+- **Find in Files (SEARCH sidebar)**:
+  - The Files pane now has collapsible `EXPLORER` and `SEARCH` sections (state persisted in `shared("file-editor.sections")`). `Cmd+Shift+F` / `Ctrl+Shift+F` or the search icon expands SEARCH and focuses its input.
+  - Search accepts `Aa` / `ab` / `.*` toggles and comma-separated `files to include` / `files to exclude` globs behind a `…` toggle (e.g. `src/**, *.js` and `dist/**`).
+  - A summary line reports `N results in M files` (or `No results`, `Invalid regex`, `Searching…`), and results are grouped by file with a file icon, dim relative directory, match-count badge and per-file collapse.
+  - Each match row shows its line number and trimmed context with the matched span highlighted. Clicking a result opens the file through the normal preview-tab path and jumps to that match; double-clicking promotes it to permanent.
+  - Searches are debounced (~300ms), run off the UI thread, and discard stale results with a token. `rg --json` is used when ripgrep exists (respecting `.gitignore`); otherwise the mod falls back to `grep -rn` and the pure JS match engine. Results cap at 2,000 matches / 200 files with a visible `(limited)` note.
+
 - **Edge Case & Safety Protections**:
   - Friendly warnings for deleted or missing files (`"This file is no longer available"`).
   - Binary file detection (`"Binary file · no text preview"`).
@@ -64,6 +78,7 @@ Instead of opening raw code files inside the narrow Files panel, `file-editor` o
 - Herdr desktop app (`herdr-app`).
 - Git installed on your system.
 - Node.js (v18+) for running unit tests.
+- Optional: ripgrep (`rg`) for fast, `.gitignore`-aware Find in Files. Without it, the mod falls back to `grep -rn`.
 
 ---
 
@@ -133,6 +148,32 @@ Force Code view for an SVG:
 herdr-app do tab.new --name "icon.svg" --mod file-editor \
   --props '{"folder":"/path/to/project","file":"assets/icon.svg","viewMode":"code"}'
 ```
+
+Open a file with the find widget already searching for `render`:
+
+```sh
+herdr-app do tab.new --name "main.js" --mod file-editor \
+  --props '{"folder":"/path/to/project","file":"src/main.js","find":{"query":"render","caseSensitive":true}}'
+```
+
+Open the Files pane with the SEARCH section expanded and a query running:
+
+```sh
+herdr-app do tab.new --name "search" --mod file-editor \
+  --props '{"folder":"/path/to/project","search":{"query":"render","include":"src/**, *.js","exclude":"dist/**"}}'
+```
+
+`find` also accepts `wholeWord`, `regex` and `line` (1-based). `search` also accepts `wholeWord` and `regex`.
+
+### Find & Search Shortcuts
+
+| Action | Shortcut |
+| --- | --- |
+| Find in file | `Cmd+F` / `Ctrl+F`, or the `search.svg` toolbar button |
+| Next / previous match | `Enter` / `Shift+Enter`, `F3` / `Shift+F3`, `Cmd/Ctrl+G` / `Cmd/Ctrl+Shift+G` |
+| Close find | `Esc` |
+| Toggle match case / whole word / regex | `Alt+C` / `Alt+W` / `Alt+R` (or the `Aa` / `ab` / `.*` buttons) |
+| Find in files | `Cmd+Shift+F` / `Ctrl+Shift+F`, or the search icon in the EXPLORER header |
 
 ---
 
