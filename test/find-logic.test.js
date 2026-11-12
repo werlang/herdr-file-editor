@@ -15,11 +15,20 @@ import {
   parseGlobList,
   globToRegExp,
   matchesGlob,
+  searchGlobVariants,
   filterSearchRowsByGlobs,
   normalizeSearchPath,
   parseRgJson,
   parseGrepOutput,
   expandGrepRows,
+  buildRipgrepArgs,
+  buildGrepArgs,
+  formatSearchError,
+  classifySearchResult,
+  findHorizontalOffset,
+  shouldConsumePendingFind,
+  findPropSignature,
+  PENDING_FIND_TTL_MS,
   groupSearchRows,
   flattenSearchRows,
   formatSearchSummary,
@@ -59,17 +68,17 @@ test("buildFindRegExp - literal, case, whole word, regex, empty and invalid", ()
   const literal = buildFindRegExp("a.b", {});
   assert.equal(literal.valid, true);
   assert.equal(literal.source, "a\\.b");
-  assert.equal(literal.flags, "gi");
+  assert.equal(literal.flags, "gim");
   assert.equal(literal.regex.test("a.b"), true);
   assert.equal(literal.regex.test("axb"), false);
 
   const sensitive = buildFindRegExp("A", { caseSensitive: true });
-  assert.equal(sensitive.flags, "g");
+  assert.equal(sensitive.flags, "gm");
   assert.equal(sensitive.regex.test("a"), false);
 
   const whole = buildFindRegExp("cat", { wholeWord: true });
   assert.equal(whole.valid, true);
-  assert.equal(whole.source, "cat");
+  assert.match(whole.source, /^\(\?:\^\|\\W\)\(cat\)\(\?=\\W\|\$\)$/);
   assert.equal(findMatches("cat concatenate cat.", "cat", { wholeWord: true }).matches.length, 2);
 
   const regex = buildFindRegExp("a+b", { regex: true });
@@ -118,6 +127,35 @@ test("findMatches - case sensitivity and whole word", () => {
   assert.equal(findMatches("Cat cat CAT", "cat").matches.length, 3);
   assert.equal(findMatches("Cat cat CAT", "cat", { caseSensitive: true }).matches.length, 1);
   assert.equal(findMatches("cat concatenate cat.", "cat", { wholeWord: true }).matches.length, 2);
+});
+
+test("findMatches - regex anchors match line boundaries (R1)", () => {
+  const imports = findMatches("import a\nimport b\n", "^import", { regex: true });
+  assert.equal(imports.matches.length, 2);
+  assert.deepEqual(
+    imports.matches.map((match) => match.line),
+    [0, 1]
+  );
+
+  const semicolons = findMatches("a;\nb;\n", ";$", { regex: true });
+  assert.equal(semicolons.matches.length, 2);
+  assert.deepEqual(
+    semicolons.matches.map((match) => match.line),
+    [0, 1]
+  );
+});
+
+test("findMatches - whole word retries alternation candidates (R8)", () => {
+  const one = findMatches("foobar", "foo|foobar", { regex: true, wholeWord: true });
+  assert.equal(one.matches.length, 1);
+  assert.equal(one.matches[0].text, "foobar");
+  assert.equal(one.matches[0].index, 0);
+
+  const both = findMatches("foo foobar", "foo|foobar", { regex: true, wholeWord: true });
+  assert.deepEqual(
+    both.matches.map((match) => match.text),
+    ["foo", "foobar"]
+  );
 });
 
 test("findMatches - regex mode, invalid pattern and zero-length matches", () => {
@@ -265,6 +303,24 @@ test("globToRegExp and matchesGlob - base names, paths, globstar, braces and que
   assert.equal(matchesGlob("src\\a\\b.ts", "src/**"), true);
 });
 
+test("matchesGlob - bare folder names match at any depth (R6)", () => {
+  assert.equal(matchesGlob("src", "src"), true);
+  assert.equal(matchesGlob("src/a.js", "src"), true);
+  assert.equal(matchesGlob("project/src/a.js", "src"), true);
+  assert.equal(matchesGlob("srcx/a.js", "src"), false);
+  assert.equal(matchesGlob("node_modules/pkg/index.js", "node_modules"), true);
+  assert.equal(matchesGlob("docs/README.md", "README.md"), true);
+  assert.equal(matchesGlob("docs/README.md.bak", "README.md"), false);
+});
+
+test("searchGlobVariants - bare names expand to node and descendants (R6)", () => {
+  assert.deepEqual(searchGlobVariants("src"), ["**/src/**", "**/src"]);
+  assert.deepEqual(searchGlobVariants("README.md"), ["**/README.md/**", "**/README.md"]);
+  assert.deepEqual(searchGlobVariants("*.js"), ["*.js"]);
+  assert.deepEqual(searchGlobVariants("src/**"), ["src/**"]);
+  assert.deepEqual(searchGlobVariants(""), []);
+});
+
 test("filterSearchRowsByGlobs - includes OR together and excludes win", () => {
   const rows = [
     { file: "src/a.js" },
@@ -328,6 +384,29 @@ test("parseRgJson - groups submatch rows and skips non-match events", () => {
     { file: "src/a.js", line: 3, column: 15, length: 6, text: "const render = render;" },
     { file: "src/b.ts", line: 1, column: 0, length: 6, text: "render();" },
   ]);
+});
+
+test("parseRgJson - parses a 1 MB line with 2,000 submatches under 50 ms (R5)", () => {
+  const line = "a".repeat(1_000_000);
+  const submatches = [];
+  for (let i = 0; i < 2000; i += 1) {
+    const start = i * 400;
+    submatches.push({ start, end: start + 4 });
+  }
+  const stdout = JSON.stringify({
+    type: "match",
+    data: {
+      path: { text: "big.js" },
+      lines: { text: `${line}\n` },
+      line_number: 1,
+      submatches,
+    },
+  });
+  const started = performance.now();
+  const parsed = parseRgJson(stdout, { maxMatches: 5000, maxFiles: 200 });
+  const elapsed = performance.now() - started;
+  assert.equal(parsed.rows.length, 2000);
+  assert.ok(elapsed < 50, `parse took ${elapsed.toFixed(1)} ms`);
 });
 
 test("parseRgJson - caps matches and files with a limited flag", () => {
@@ -407,6 +486,21 @@ test("parseGrepOutput - parses path:line:text, keeps colons in text and skips no
     { file: "src/a.js", line: 3, text: "const render = 1;" },
     { file: "src/a.js", line: 4, text: "http://localhost:3000" },
     { file: "C:/work/a.js", line: 9, text: "render()" },
+  ]);
+});
+
+test("parseGrepOutput - NUL separators keep paths containing :digits: intact (R9)", () => {
+  const stdout = [
+    "C:\\work:12:file.js\0" + "9:const render = 1;",
+    "src/a.js\0" + "3:http://localhost:3000",
+    "broken\0not-a-line",
+    "",
+  ].join("\n");
+  const parsed = parseGrepOutput(stdout);
+  assert.equal(parsed.malformed, 1);
+  assert.deepEqual(parsed.rows, [
+    { file: "C:/work:12:file.js", line: 9, text: "const render = 1;" },
+    { file: "src/a.js", line: 3, text: "http://localhost:3000" },
   ]);
 });
 
@@ -506,6 +600,124 @@ test("flattenSearchRows - headers then match rows, hiding collapsed groups", () 
   assert.deepEqual(flattenSearchRows(null), []);
 });
 
+test("formatSearchSummary - whitespace-only query is empty (R7)", () => {
+  assert.equal(formatSearchSummary({ query: "   " }), "");
+  assert.equal(formatSearchSummary({ query: "\t\n" }), "");
+});
+
+test("buildRipgrepArgs - caps line size, file size, per-file matches and globs (R3/R5/R6)", () => {
+  const args = buildRipgrepArgs({
+    query: "render",
+    caseSensitive: false,
+    wholeWord: true,
+    regex: true,
+    include: ["src", "*.js"],
+    exclude: ["node_modules", "dist/**"],
+  });
+  assert.ok(args.includes("--max-columns"));
+  assert.equal(args[args.indexOf("--max-columns") + 1], "1000");
+  assert.ok(args.includes("--max-columns-preview"));
+  assert.deepEqual(args.slice(args.indexOf("--max-filesize"), args.indexOf("--max-filesize") + 2), [
+    "--max-filesize",
+    "2M",
+  ]);
+  assert.deepEqual(args.slice(args.indexOf("--max-count"), args.indexOf("--max-count") + 2), ["--max-count", "200"]);
+  assert.ok(args.includes("-i"));
+  assert.ok(args.includes("-w"));
+  assert.ok(!args.includes("--fixed-strings"));
+  assert.deepEqual(
+    args.filter((arg, index) => args[index - 1] === "--glob"),
+    ["**/src/**", "**/src", "*.js", "!**/node_modules/**", "!**/node_modules", "!dist/**"]
+  );
+  assert.deepEqual(args.slice(-3), ["-e", "render", "."]);
+  const spaced = buildRipgrepArgs({ query: " render " });
+  assert.deepEqual(spaced.slice(-3), ["-e", " render ", "."]);
+});
+
+test("buildGrepArgs - NUL output, binary skip, excludes and per-file cap (R3/R5/R9)", () => {
+  const args = buildGrepArgs({
+    query: "render",
+    caseSensitive: true,
+    wholeWord: false,
+    regex: false,
+    include: ["*.md", "src/**", "src"],
+    exclude: ["node_modules", "dist/**"],
+  });
+  assert.deepEqual(args.slice(0, 5), ["-rn", "-I", "--null", "-m", "200"]);
+  assert.ok(!args.includes("-i"));
+  assert.ok(!args.includes("-w"));
+  assert.ok(args.includes("-F"));
+  assert.ok(args.includes("--include=*.md"));
+  assert.ok(!args.includes("--include=src/**"));
+  assert.ok(!args.includes("--include=src"));
+  assert.ok(args.includes("--exclude=node_modules"));
+  assert.ok(args.includes("--exclude-dir=node_modules"));
+  assert.ok(args.includes("--exclude-dir=.git"));
+  assert.ok(!args.includes("--exclude=dist/**"));
+  assert.equal(args[args.indexOf("-e") + 1], "render");
+  assert.equal(args.at(-1), ".");
+  const spaced = buildGrepArgs({ query: " render " });
+  assert.equal(spaced[spaced.indexOf("-e") + 1], " render ");
+});
+
+test("formatSearchError - clean regex dialect message and raw fallback (C)", () => {
+  const regexError = formatSearchError(
+    "regex parse error:\n    (?<=a)foo\n    ^^^\nerror: look-around, including look-ahead and look-behind, is not supported",
+    true
+  );
+  assert.match(regexError, /^Regex not supported by search: /);
+  assert.match(regexError, /look-around|look-behind/);
+  assert.equal(formatSearchError("permission denied", true), "permission denied");
+  assert.equal(formatSearchError("", true), null);
+  assert.ok(formatSearchError("x".repeat(500)).length <= 220);
+});
+
+test("classifySearchResult - exit 2 keeps parsed matches as a warning (R4)", () => {
+  assert.deepEqual(classifySearchResult(0, 5, "", false), { error: null, warning: null });
+  assert.deepEqual(classifySearchResult(1, 0, "", false), { error: null, warning: null });
+  const partial = classifySearchResult(2, 3, "permission denied", true);
+  assert.equal(partial.error, null);
+  assert.equal(partial.warning, "permission denied");
+  const failed = classifySearchResult(2, 0, "regex parse error: look-around is not supported", true);
+  assert.equal(failed.warning, null);
+  assert.match(failed.error, /^Regex not supported by search: /);
+});
+
+test("findHorizontalOffset - keeps the current match on screen (R10)", () => {
+  assert.equal(findHorizontalOffset(0, 800), 0);
+  assert.equal(findHorizontalOffset(10, 800), 0);
+  const far = findHorizontalOffset(300, 800);
+  assert.ok(far > 0);
+  assert.ok(far < 300);
+  assert.ok(300 - far < 100);
+});
+
+test("shouldConsumePendingFind - single use, right file and short TTL (R2)", () => {
+  const now = 1_000_000;
+  const pending = { fileKey: "root/a.js", find: { query: "x" }, timestamp: now - 100 };
+  assert.equal(shouldConsumePendingFind(pending, "root/a.js", null, now), true);
+  assert.equal(shouldConsumePendingFind(pending, "root/b.js", null, now), false);
+  assert.equal(shouldConsumePendingFind(pending, "root/a.js", pending.timestamp, now), false);
+  assert.equal(shouldConsumePendingFind(pending, "root/a.js", null, now + PENDING_FIND_TTL_MS + 1), false);
+  assert.equal(shouldConsumePendingFind(null, "root/a.js", null, now), false);
+  assert.equal(shouldConsumePendingFind({ fileKey: "root/a.js", timestamp: now }, "root/a.js", null, now), false);
+});
+
+test("findPropSignature - stable per prop, different for a new line (B)", () => {
+  const a = findPropSignature({ query: "render", wholeWord: true, line: 10 });
+  const b = findPropSignature({ query: "render", wholeWord: true, line: 10 });
+  const c = findPropSignature({ query: "render", wholeWord: true, line: 11 });
+  assert.equal(a, b);
+  assert.notEqual(a, c);
+  assert.notEqual(
+    findPropSignature({ query: "render", line: 10, at: 1 }),
+    findPropSignature({ query: "render", line: 10, at: 2 }),
+    "a new click on the same result must re-open find"
+  );
+  assert.equal(findPropSignature(null), null);
+  assert.equal(findPropSignature({}), null);
+});
+
 test("formatSearchSummary - running, invalid, empty, zero, plural and limited", () => {
   assert.equal(formatSearchSummary({ running: true }), "Searching…");
   assert.equal(formatSearchSummary({ valid: false }), "Invalid regex");
@@ -536,6 +748,7 @@ test("normalizeFindPrefs and normalizeFindProp - tolerate junk and line numbers"
     wholeWord: false,
     regex: false,
     line: 12,
+    at: null,
   });
   assert.deepEqual(normalizeFindProp({ line: 0 }), {
     query: "",
@@ -543,6 +756,7 @@ test("normalizeFindPrefs and normalizeFindProp - tolerate junk and line numbers"
     wholeWord: false,
     regex: false,
     line: 1,
+    at: null,
   });
 });
 

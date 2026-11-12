@@ -86,11 +86,13 @@ export function buildFindRegExp(query, options = {}) {
   }
 
   const body = opts.regex ? raw : escapeRegExp(raw);
-  // Whole-word is applied per match in findMatches instead of with lookbehind:
-  // not every JS engine embedded in a host supports lookbehind, and a failing
-  // pattern would turn a normal query into "Invalid regex".
-  const source = body;
-  const flags = opts.caseSensitive ? "g" : "gi";
+  // Whole-word is built with a leading non-word boundary wrapped in a capture
+  // group and a trailing lookahead. This avoids lookbehind (not every embedded
+  // JS engine supports it) and, unlike a post-filter, lets the engine backtrack
+  // from `foo` to `foobar` in an alternation so both remain whole-word matches.
+  const source = opts.wholeWord ? `(?:^|\\W)(${body})(?=\\W|$)` : body;
+  // `m` makes ^ and $ match line boundaries in regex mode, matching VS Code.
+  const flags = opts.caseSensitive ? "gm" : "gim";
   try {
     return {
       empty: false,
@@ -148,29 +150,13 @@ export function lineIndexAt(lineStarts, index) {
 }
 
 /**
- * Whether a match is surrounded by non-word characters (or the string edges),
- * the same rule VS Code's "match whole word" applies.
- *
- * @param {string} text
- * @param {number} index
- * @param {number} length
- * @returns {boolean}
- */
-function isWholeWordMatch(text, index, length) {
-  const isWord = (ch) => Boolean(ch) && /[A-Za-z0-9_]/.test(ch);
-  const before = index > 0 ? text[index - 1] : "";
-  const after = index + length < text.length ? text[index + length] : "";
-  return !isWord(before) && !isWord(after);
-}
-
-/**
  * Finds every non-empty match of a query in text.
  *
  * Each match carries its absolute index, line, column, line text and a stable
  * id, which is what the read-only find view uses to highlight the current
  * occurrence. Empty regex matches are skipped so a pattern such as `^` cannot
- * loop forever. Whole-word mode filters matches at their edges, avoiding a
- * lookbehind in the regex itself.
+ * loop forever. Whole-word mode wraps the body in boundary groups, so the
+ * engine can still backtrack through alternatives.
  *
  * @param {string} text
  * @param {string} query
@@ -215,26 +201,25 @@ export function findMatches(text, query, options = {}) {
   let match;
 
   while ((match = regex.exec(raw)) !== null) {
-    if (match[0].length === 0) {
+    const matchedText = opts.wholeWord ? match[1] ?? "" : match[0];
+    const index = opts.wholeWord ? match.index + match[0].length - matchedText.length : match.index;
+    if (matchedText.length === 0) {
       regex.lastIndex += 1;
       if (regex.lastIndex > raw.length) break;
-      continue;
-    }
-    if (opts.wholeWord && !isWholeWordMatch(raw, match.index, match[0].length)) {
       continue;
     }
     if (matches.length >= opts.cap) {
       limited = true;
       break;
     }
-    const line = lineIndexAt(lineStarts, match.index);
+    const line = lineIndexAt(lineStarts, index);
     matches.push({
       id: matches.length,
-      index: match.index,
-      length: match[0].length,
+      index,
+      length: matchedText.length,
       line,
-      column: match.index - lineStarts[line],
-      text: match[0],
+      column: index - lineStarts[line],
+      text: matchedText,
       lineText: lines[line] ?? "",
     });
   }
@@ -402,6 +387,7 @@ export function globToRegExp(glob) {
     .replace(/^\.\//, "")
     .replace(/^\/+/, "");
   const hasSlash = raw.includes("/");
+  const isBareName = !hasSlash && !/[*?{[]/.test(raw);
   let source = "";
   let i = 0;
 
@@ -445,8 +431,9 @@ export function globToRegExp(glob) {
   }
 
   const prefix = hasSlash ? "^" : "(?:^|/)";
+  const suffix = isBareName ? "(?:/|$)" : "$";
   try {
-    return new RegExp(`${prefix}${source}$`);
+    return new RegExp(`${prefix}${source}${suffix}`);
   } catch {
     return new RegExp("a^");
   }
@@ -487,6 +474,223 @@ export function filterSearchRowsByGlobs(rows, globs = {}) {
 }
 
 /**
+ * Expands one VS Code-style glob into the pattern(s) a search tool needs.
+ * A bare name such as `src` or `README.md` means that folder or file at any
+ * depth, which needs both the descendant and the node itself.
+ *
+ * @param {string} glob
+ * @returns {string[]}
+ */
+export function searchGlobVariants(glob) {
+  const raw = String(glob ?? "").trim().replace(/^!+/, "");
+  if (!raw) return [];
+  if (raw.includes("/") || /[*?{[]/.test(raw)) return [raw];
+  return [`**/${raw}/**`, `**/${raw}`];
+}
+
+/**
+ * Builds the ripgrep argument vector for a search. The caps are deliberately
+ * low enough to keep one pathological file from stalling the UI: at most 1,000
+ * columns per line, 2 MiB per file and 200 matches per file.
+ *
+ * @param {{
+ *   query: string,
+ *   caseSensitive?: boolean,
+ *   wholeWord?: boolean,
+ *   regex?: boolean,
+ *   include?: string[],
+ *   exclude?: string[],
+ * }} options
+ * @returns {string[]}
+ */
+export function buildRipgrepArgs(options) {
+  const args = [
+    "--json",
+    "--line-number",
+    "--color",
+    "never",
+    "--no-heading",
+    "--max-columns",
+    "1000",
+    "--max-columns-preview",
+    "--max-filesize",
+    "2M",
+    "--max-count",
+    "200",
+  ];
+  if (options.caseSensitive !== true) args.push("-i");
+  if (options.wholeWord === true) args.push("-w");
+  if (options.regex !== true) args.push("--fixed-strings");
+  for (const glob of Array.isArray(options.include) ? options.include : []) {
+    for (const variant of searchGlobVariants(glob)) args.push("--glob", variant);
+  }
+  for (const glob of Array.isArray(options.exclude) ? options.exclude : []) {
+    for (const variant of searchGlobVariants(glob)) args.push("--glob", `!${variant}`);
+  }
+  args.push("-e", String(options.query ?? ""), ".");
+  return args;
+}
+
+/**
+ * Builds the grep fallback argument vector. NUL separators (`--null`) keep
+ * paths containing `:digits:` intact, `-I` skips binary files and `-m 200`
+ * bounds each file. Include/exclude globs without a slash are passed straight
+ * to grep; slash-bearing globs are applied afterwards, before the match cap.
+ *
+ * @param {{
+ *   query: string,
+ *   caseSensitive?: boolean,
+ *   wholeWord?: boolean,
+ *   regex?: boolean,
+ *   include?: string[],
+ *   exclude?: string[],
+ * }} options
+ * @returns {string[]}
+ */
+export function buildGrepArgs(options) {
+  const args = ["-rn", "-I", "--null", "-m", "200"];
+  if (options.caseSensitive !== true) args.push("-i");
+  if (options.wholeWord === true) args.push("-w");
+  args.push(options.regex === true ? "-E" : "-F", "-e", String(options.query ?? ""));
+  args.push("--exclude-dir=.git", "--exclude-dir=node_modules");
+
+  const simple = (glob) => !String(glob ?? "").includes("/");
+  const fileLike = (glob) => /[*?{[]/.test(glob) || String(glob).includes(".");
+  for (const glob of Array.isArray(options.include) ? options.include : []) {
+    // A bare folder name (`src`) must not become --include=src: grep would
+    // then search only a file literally named src. It is applied by the
+    // post-filter instead.
+    if (simple(glob) && fileLike(glob)) args.push(`--include=${glob}`);
+  }
+  for (const glob of Array.isArray(options.exclude) ? options.exclude : []) {
+    if (!simple(glob)) continue;
+    args.push(`--exclude=${glob}`);
+    args.push(`--exclude-dir=${glob}`);
+  }
+  args.push(".");
+  return args;
+}
+
+/**
+ * Shortens arbitrary process stderr into one readable line.
+ *
+ * @param {string} text
+ * @param {number} [max=220]
+ * @returns {string}
+ */
+function compactErrorText(text, max = 220) {
+  const compact = String(text ?? "")
+    .replace(/\x1b\[[0-9;]*m/g, "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(0, 5)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return compact.length > max ? `${compact.slice(0, max - 1)}…` : compact;
+}
+
+/**
+ * Turns raw rg/grep stderr into a message the search panel can show. Regex
+ * dialect failures get a stable, user-facing prefix instead of a raw dump.
+ *
+ * @param {string} stderr
+ * @param {boolean} [regexMode=false]
+ * @returns {string | null}
+ */
+export function formatSearchError(stderr, regexMode = false) {
+  const compact = compactErrorText(stderr);
+  if (!compact) return null;
+  const regexFailure =
+    /regex parse error|error parsing regex|invalid regular expression|unrecognized character|look-around|look-around, including look-ahead|backreference/i.test(
+      compact
+    );
+  if (regexMode && regexFailure) {
+    const detail = compact.replace(/^.*?regex parse error:?\s*/i, "").trim();
+    return `Regex not supported by search: ${detail || compact}`;
+  }
+  return compact;
+}
+
+/**
+ * Interprets a search tool's exit code and parsed rows. Exit 2 usually means a
+ * partial read error; if the tool still produced matches, they are usable and
+ * the stderr becomes a dim warning instead of throwing the result away.
+ *
+ * @param {number} code
+ * @param {number} rowCount
+ * @param {string} stderr
+ * @param {boolean} [regexMode=false]
+ * @returns {{ error: string | null, warning: string | null }}
+ */
+export function classifySearchResult(code, rowCount, stderr, regexMode = false) {
+  if (code === 0 || code === 1) return { error: null, warning: null };
+  const message = formatSearchError(stderr, regexMode) || "Search failed";
+  if (rowCount > 0) return { error: null, warning: message };
+  return { error: message, warning: null };
+}
+
+/**
+ * Character offset that brings a match column into view in the read-only find
+ * view. The line-number gutter stays fixed; the visible text is sliced from
+ * this column, which is cheaper and more reliable than shifting a laid-out row.
+ *
+ * @param {number} column Zero-based match column.
+ * @param {number} viewportWidth
+ * @param {number} [charWidth=7.4] Approximate monospace character width in px.
+ * @param {number} [gutter=48]
+ * @param {number} [rightPad=24]
+ * @returns {number} Number of characters to trim from the line start.
+ */
+export function findHorizontalOffset(column, viewportWidth, charWidth = 7.4, gutter = 48, rightPad = 24) {
+  const width = Math.max(1, Number(viewportWidth) || 800);
+  const available = Math.max(1, width - gutter - rightPad);
+  const visibleChars = Math.max(1, Math.floor(available / Math.max(0.1, Number(charWidth) || 7.4)));
+  const col = Math.max(0, Math.floor(Number(column) || 0));
+  if (col < visibleChars) return 0;
+  return Math.max(0, col - Math.floor(visibleChars * 0.25));
+}
+
+/** How long a pending-find record is allowed to live, in milliseconds. */
+export const PENDING_FIND_TTL_MS = 15000;
+
+/**
+ * Whether a `shared("file-editor.pendingFind")` record should be consumed by
+ * this file tab. Records are single-use and expire quickly so a stale one does
+ * not re-open find in a later tab.
+ *
+ * @param {unknown} pending
+ * @param {string} fileKey
+ * @param {number | null | undefined} lastTimestamp
+ * @param {number} [now=Date.now()]
+ * @param {number} [ttl=PENDING_FIND_TTL_MS]
+ * @returns {boolean}
+ */
+export function shouldConsumePendingFind(pending, fileKey, lastTimestamp, now = Date.now(), ttl = PENDING_FIND_TTL_MS) {
+  if (!pending || typeof pending !== "object") return false;
+  if (pending.fileKey !== fileKey || !pending.find) return false;
+  const timestamp = Number(pending.timestamp);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return false;
+  if (lastTimestamp && timestamp === lastTimestamp) return false;
+  const age = now - timestamp;
+  return age >= -1000 && age <= Math.max(0, ttl);
+}
+
+/**
+ * Stable signature for a find prop, used to apply the prop only once per file
+ * tab even when the view re-initializes on a tab switch.
+ *
+ * @param {unknown} raw
+ * @returns {string | null}
+ */
+export function findPropSignature(raw) {
+  const find = normalizeFindProp(raw);
+  if (!find) return null;
+  return JSON.stringify([find.query, find.caseSensitive, find.wholeWord, find.regex, find.line, find.at]);
+}
+
+/**
  * Normalizes a path reported by a search tool into a relative, forward-slash
  * path suitable for `openFileTab`.
  *
@@ -524,15 +728,56 @@ function rgText(value) {
  * unit offset. rg reports submatch positions in bytes; slicing a JS string with
  * them would shift highlights on any line with non-ASCII text.
  *
- * @param {string} text
- * @param {number} offset
+ * The encoded line and its ASCII flag are precomputed once per match event, and
+ * ASCII lines (the overwhelmingly common case) need no conversion at all.
+ *
+ * @param {Buffer} bytes UTF-8 encoding of the line.
+ * @param {number} offset Byte offset reported by rg.
+ * @param {boolean} ascii True when byte and UTF-16 offsets are identical.
+ * @param {number} textLength Length of the decoded line.
+ * @param {Uint32Array | null} byteMap Cumulative bytes at each code unit.
  * @returns {number}
  */
-function byteOffsetToCodeUnit(text, offset) {
-  const raw = typeof text === "string" ? text : "";
-  const bytes = Buffer.from(raw, "utf8");
+function byteOffsetToCodeUnit(bytes, offset, ascii, textLength, byteMap) {
   const safe = Math.max(0, Math.min(bytes.length, Number(offset) || 0));
+  if (ascii) return safe;
+  if (byteMap && safe <= byteMap[byteMap.length - 1]) {
+    let low = 0;
+    let high = byteMap.length - 1;
+    while (low < high) {
+      const mid = (low + high) >> 1;
+      if (byteMap[mid] < safe) low = mid + 1;
+      else high = mid;
+    }
+    return low;
+  }
   return bytes.subarray(0, safe).toString("utf8").length;
+}
+
+/**
+ * Builds the cumulative UTF-8 byte offset at each UTF-16 code unit of a line.
+ * Used once per non-ASCII line, so each rg submatch becomes a binary search
+ * instead of re-encoding a prefix.
+ *
+ * @param {string} text
+ * @returns {Uint32Array}
+ */
+function buildByteToUnitMap(text) {
+  const map = new Uint32Array(text.length + 1);
+  let bytes = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const codePoint = text.codePointAt(i) ?? 0;
+    if (codePoint > 0xffff) {
+      bytes += 4;
+      map[i + 1] = bytes;
+      i += 1;
+      map[i + 1] = bytes;
+    } else {
+      bytes += codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : 3;
+      map[i + 1] = bytes;
+    }
+  }
+  return map;
 }
 
 /**
@@ -578,6 +823,9 @@ export function parseRgJson(stdout, options = {}) {
 
     const line = Math.max(1, Number(event.data.line_number) || 1);
     const text = rgText(event.data.lines).replace(/\r?\n$/, "");
+    const lineBytes = Buffer.from(text, "utf8");
+    const asciiLine = lineBytes.length === text.length;
+    const byteMap = asciiLine ? null : buildByteToUnitMap(text);
     const submatches = Array.isArray(event.data.submatches) ? event.data.submatches : [];
     for (const sub of submatches) {
       if (rows.length >= maxMatches) {
@@ -586,8 +834,8 @@ export function parseRgJson(stdout, options = {}) {
       }
       const startBytes = Math.max(0, Number(sub?.start) || 0);
       const endBytes = Math.max(startBytes, Number(sub?.end) || startBytes);
-      const start = byteOffsetToCodeUnit(text, startBytes);
-      const end = byteOffsetToCodeUnit(text, endBytes);
+      const start = byteOffsetToCodeUnit(lineBytes, startBytes, asciiLine, text.length, byteMap);
+      const end = byteOffsetToCodeUnit(lineBytes, endBytes, asciiLine, text.length, byteMap);
       rows.push({ file, line, column: start, length: Math.max(0, end - start), text });
     }
     if (rows.length >= maxMatches) {
@@ -600,10 +848,12 @@ export function parseRgJson(stdout, options = {}) {
 }
 
 /**
- * Parses `grep -rn` output (`path:line:text`) into candidate rows.
+ * Parses `grep -rn --null` output into candidate rows.
  *
- * The first colon followed by digits separates the path, so paths that contain
- * colons survive. `Binary file … matches` notices are ignored.
+ * With `--null`, grep writes `path\0line:text`, so a path containing `:12:`
+ * cannot be mistaken for the line separator. The colon form is still accepted
+ * as a fallback (older greps or a NUL-less transport). `Binary file … matches`
+ * notices are ignored.
  *
  * @param {string} stdout
  * @returns {{
@@ -618,18 +868,32 @@ export function parseGrepOutput(stdout) {
     const line = rawLine.replace(/\r$/, "");
     if (!line) continue;
     if (line.startsWith("Binary file ")) continue;
-    const match = /^(.*?):(\d+):(.*)$/.exec(line);
-    if (!match) {
-      malformed += 1;
-      continue;
+
+    let file = "";
+    let lineNumber = NaN;
+    let text = "";
+    const nul = line.indexOf("\0");
+    if (nul >= 0) {
+      file = line.slice(0, nul);
+      const rest = /^(\d+):(.*)$/.exec(line.slice(nul + 1));
+      if (rest) {
+        lineNumber = Number(rest[1]);
+        text = rest[2];
+      }
+    } else {
+      const match = /^(.*?):(\d+):(.*)$/.exec(line);
+      if (match) {
+        file = match[1];
+        lineNumber = Number(match[2]);
+        text = match[3];
+      }
     }
-    const file = normalizeSearchPath(match[1]);
-    const lineNumber = Number(match[2]);
+
     if (!file || !Number.isFinite(lineNumber)) {
       malformed += 1;
       continue;
     }
-    rows.push({ file, line: lineNumber, text: match[3] });
+    rows.push({ file: normalizeSearchPath(file), line: lineNumber, text });
   }
   return { rows, malformed };
 }
@@ -791,7 +1055,7 @@ export function formatSearchSummary(state = {}) {
   if (state.running) return "Searching…";
   if (state.valid === false) return "Invalid regex";
   const query = typeof state.query === "string" ? state.query : "";
-  if (query.length === 0) return "";
+  if (query.trim().length === 0) return "";
   const matches = Math.max(0, Number(state.totalMatches) || 0);
   const files = Math.max(0, Number(state.totalFiles) || 0);
   if (matches === 0) return state.error ? String(state.error) : "No results found";
@@ -830,6 +1094,9 @@ export function normalizeFindProp(raw) {
   return {
     ...prefs,
     line: hasLine ? Math.max(1, Math.floor(raw.line)) : null,
+    // Per-request nonce: a new search-result click must re-open find even when
+    // the same query and line were consumed before for this file.
+    at: Number.isFinite(raw.at) ? raw.at : null,
   };
 }
 
