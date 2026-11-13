@@ -25,6 +25,7 @@ import {
   shouldReloadWatchedFile,
   parseMarkdownBlocks,
   buildSyntaxTheme,
+  tokenizeCodeLines,
   resolveLocationState,
   resolveFileTab,
   isTabMatchingFile,
@@ -2127,4 +2128,79 @@ test("resolveFilesMenuPosition - anchors the menu at the pointer across zoom and
     }),
     { x: 100, y: 20 }
   );
+});
+
+test("tokenizeCodeLines - preserves text and colors JavaScript tokens", () => {
+  const lines = [
+    "const answer = 42; // the answer",
+    "function greet(name) {",
+    "  return \"hi \" + `x`;",
+    "}",
+  ];
+  const tokenized = tokenizeCodeLines(lines, "js");
+  assert.equal(tokenized.length, lines.length);
+  for (let i = 0; i < lines.length; i += 1) {
+    assert.equal(tokenized[i].map((token) => token.text).join(""), lines[i]);
+  }
+
+  const first = tokenized[0];
+  assert.equal(first[0].token, "keyword");
+  assert.equal(first[0].text, "const");
+  assert.ok(first.some((token) => token.token === "number" && token.text === "42"));
+  assert.ok(first.some((token) => token.token === "comment" && token.text === "// the answer"));
+  assert.ok(tokenized[1].some((token) => token.token === "function" && token.text === "greet"));
+  assert.ok(tokenized[2].some((token) => token.token === "string" && token.text === "\"hi \""));
+  assert.ok(tokenized[2].some((token) => token.token === "keyword" && token.text === "return"));
+});
+
+test("tokenizeCodeLines - carries block comments and template strings across lines", () => {
+  const tokenized = tokenizeCodeLines(
+    ["/* first", "second */ const x = 1;", "const t = `a", "b`;"],
+    "js"
+  );
+  assert.equal(tokenized[0][0].token, "comment");
+  assert.equal(tokenized[0][0].text, "/* first");
+  assert.equal(tokenized[1][0].token, "comment");
+  assert.equal(tokenized[1][0].text, "second */");
+  assert.ok(tokenized[2].some((token) => token.token === "string" && token.text === "`a"));
+  assert.ok(tokenized[3].some((token) => token.token === "string" && token.text === "b`"));
+
+  // Lua's `--[[` block opener also starts with its `--` line-comment prefix.
+  const lua = tokenizeCodeLines(["--[[ block", "end ]] local x = 1"], "lua");
+  assert.equal(lua[0][0].token, "comment");
+  assert.equal(lua[0][0].text, "--[[ block");
+  assert.equal(lua[1][0].token, "comment");
+  assert.equal(lua[1][0].text, "end ]]");
+  assert.ok(lua[1].some((token) => token.token === "keyword" && token.text === "local"));
+});
+
+test("tokenizeCodeLines - handles Markdown, HTML, CSS and plain text", () => {
+  const markdown = tokenizeCodeLines(["# Title", "- item", "`code`"], "markdown");
+  assert.equal(markdown[0][0].token, "keyword");
+  assert.equal(markdown[0][0].text, "#");
+  assert.equal(markdown[1][0].token, "keyword");
+  assert.ok(markdown[2].some((token) => token.token === "string" && token.text === "`code`"));
+
+  const html = tokenizeCodeLines(["<div class=\"x\">hi &amp;</div>"], "html")[0];
+  assert.ok(html.some((token) => token.token === "type" && token.text === "div"));
+  assert.ok(html.some((token) => token.token === "function" && token.text === "class"));
+  assert.ok(html.some((token) => token.token === "string" && token.text === "\"x\""));
+  assert.ok(html.some((token) => token.token === "constant" && token.text === "&amp;"));
+
+  const css = tokenizeCodeLines([".a { color: #fff; width: 10px; /* c */ }"], "css")[0];
+  assert.ok(css.some((token) => token.token === "function" && token.text === "color"));
+  assert.ok(css.some((token) => token.token === "number" && token.text === "#fff"));
+  assert.ok(css.some((token) => token.token === "comment" && token.text === "/* c */"));
+  const atRule = tokenizeCodeLines(["@media (max-width: 600px) {"], "css")[0];
+  assert.ok(atRule.some((token) => token.token === "keyword" && token.text === "@media"));
+
+  assert.deepEqual(tokenizeCodeLines(["plain text"], "text"), [[{ text: "plain text", token: null }]]);
+});
+
+test("tokenizeCodeLines - handles Python triple-quoted strings", () => {
+  const tokenized = tokenizeCodeLines(["def f():", "    return \"\"\"doc", "still\"\"\""], "python");
+  assert.ok(tokenized[0].some((token) => token.token === "keyword" && token.text === "def"));
+  assert.ok(tokenized[0].some((token) => token.token === "function" && token.text === "f"));
+  assert.ok(tokenized[1].some((token) => token.token === "string" && token.text === "\"\"\"doc"));
+  assert.ok(tokenized[2].some((token) => token.token === "string" && token.text === "still\"\"\""));
 });

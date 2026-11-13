@@ -11,6 +11,7 @@ import {
   findMatchIndexAtLine,
   describeFindCounter,
   lineMatchSegments,
+  mergeSyntaxSegments,
   trimMatchContext,
   parseGlobList,
   globToRegExp,
@@ -254,6 +255,56 @@ test("lineMatchSegments - clamps matches that run past the line", () => {
   assert.deepEqual(segments, [
     { text: "ab", highlight: false, current: false },
     { text: "c", highlight: true, current: true },
+  ]);
+});
+
+test("mergeSyntaxSegments - keeps token colors and match highlights together", () => {
+  const line = "const x = 42;";
+  const matches = lineMatchSegments(line, [{ id: 0, line: 0, column: 6, length: 1 }], 0, 0);
+  const tokens = [
+    { text: "const", token: "keyword" },
+    { text: " ", token: null },
+    { text: "x", token: null },
+    { text: " = ", token: null },
+    { text: "42", token: "number" },
+    { text: ";", token: null },
+  ];
+  const segments = mergeSyntaxSegments(line, 0, tokens, matches);
+  assert.equal(segments.map((segment) => segment.text).join(""), line);
+  assert.deepEqual(
+    segments.map((segment) => [segment.text, segment.token, segment.highlight, segment.current]),
+    [
+      ["const", "keyword", false, false],
+      [" ", null, false, false],
+      ["x", null, true, true],
+      [" = ", null, false, false],
+      ["42", "number", false, false],
+      [";", null, false, false],
+    ]
+  );
+});
+
+test("mergeSyntaxSegments - clips tokens and matches to the scrolled window", () => {
+  const tokens = [
+    { text: "const", token: "keyword" },
+    { text: " value = ", token: null },
+    { text: "42", token: "number" },
+    { text: ";", token: null },
+  ];
+  const visible = " = 42;";
+  const matches = lineMatchSegments(visible, [{ id: 0, line: 0, column: 3, length: 2 }], 0, 0);
+  const segments = mergeSyntaxSegments(visible, 11, tokens, matches);
+  assert.equal(segments.map((segment) => segment.text).join(""), visible);
+  assert.deepEqual(
+    segments.map((segment) => [segment.text, segment.token, segment.highlight]),
+    [
+      [" = ", null, false],
+      ["42", "number", true],
+      [";", null, false],
+    ]
+  );
+  assert.deepEqual(mergeSyntaxSegments("", 0, [], []), [
+    { text: "", token: null, highlight: false, current: false },
   ]);
 });
 

@@ -874,6 +874,841 @@ export function buildSyntaxTheme(themeObj = {}) {
   };
 }
 
+/** Sticky regexes used by the lightweight find-view syntax tokenizer. */
+const TOKEN_IDENTIFIER = /[A-Za-z_$\u00c0-\uffff][\w$\u00c0-\uffff]*/y;
+const TOKEN_NUMBER = /(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+|(?:\d[\d_]*(?:\.[\d_]*)?|\.\d[\d_]*)(?:[eE][+-]?\d+)?)/y;
+const TOKEN_CSS_HEX = /#[0-9a-fA-F]{3,8}/y;
+const TOKEN_CSS_AT_RULE = /@[A-Za-z-]+/y;
+const TOKEN_VARIABLE = /[$@][A-Za-z_][\w]*/y;
+
+/**
+ * Matches a sticky regular expression exactly at `index`.
+ *
+ * @param {RegExp} regex
+ * @param {string} text
+ * @param {number} index
+ * @returns {string | null}
+ */
+function matchSticky(regex, text, index) {
+  regex.lastIndex = index;
+  const match = regex.exec(text);
+  return match && match.index === index ? match[0] : null;
+}
+
+/** Keywords that make the following identifier a type name. */
+const TYPE_DECLARATION_WORDS = new Set([
+  "class",
+  "struct",
+  "enum",
+  "interface",
+  "type",
+  "trait",
+  "impl",
+  "namespace",
+  "protocol",
+  "union",
+  "record",
+]);
+
+const JS_KEYWORDS = new Set([
+  "as", "async", "await", "break", "case", "catch", "class", "const", "continue",
+  "debugger", "declare", "default", "delete", "do", "else", "enum", "export",
+  "extends", "finally", "for", "from", "function", "get", "if", "implements",
+  "import", "in", "infer", "instanceof", "interface", "is", "keyof", "let", "new",
+  "of", "package", "private", "protected", "public", "readonly", "return",
+  "satisfies", "set", "static", "super", "switch", "this", "throw", "try",
+  "type", "typeof", "var", "void", "while", "with", "yield",
+]);
+const JS_CONSTANTS = new Set(["true", "false", "null", "undefined", "NaN", "Infinity"]);
+
+const PYTHON_KEYWORDS = new Set([
+  "and", "as", "assert", "async", "await", "break", "class", "continue", "def",
+  "del", "elif", "else", "except", "finally", "for", "from", "global", "if",
+  "import", "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise",
+  "return", "try", "while", "with", "yield",
+]);
+const PYTHON_CONSTANTS = new Set(["True", "False", "None", "self", "cls"]);
+
+const RUST_KEYWORDS = new Set([
+  "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else",
+  "enum", "extern", "fn", "for", "if", "impl", "in", "let", "loop", "match",
+  "mod", "move", "mut", "pub", "ref", "return", "static", "struct", "trait",
+  "type", "unsafe", "use", "where", "while",
+]);
+const RUST_CONSTANTS = new Set(["true", "false", "None", "Some", "Ok", "Err", "self", "Self"]);
+
+const GO_KEYWORDS = new Set([
+  "break", "case", "chan", "const", "continue", "default", "defer", "else",
+  "fallthrough", "for", "func", "go", "goto", "if", "import", "interface", "map",
+  "package", "range", "return", "select", "struct", "switch", "type", "var",
+]);
+const GO_CONSTANTS = new Set(["true", "false", "nil", "iota"]);
+
+const C_KEYWORDS = new Set([
+  "auto", "break", "case", "char", "const", "continue", "default", "do", "double",
+  "else", "enum", "extern", "float", "for", "goto", "if", "inline", "int", "long",
+  "register", "return", "short", "signed", "sizeof", "static", "struct", "switch",
+  "typedef", "union", "unsigned", "void", "volatile", "while",
+]);
+const C_CONSTANTS = new Set(["true", "false", "NULL", "nullptr"]);
+
+const CPP_KEYWORDS = new Set([
+  ...C_KEYWORDS,
+  "alignas", "alignof", "and", "asm", "bool", "catch", "class", "concept",
+  "constexpr", "const_cast", "co_await", "co_return", "co_yield", "decltype",
+  "delete", "dynamic_cast", "explicit", "export", "friend", "mutable",
+  "namespace", "new", "noexcept", "operator", "or", "private", "protected",
+  "public", "reinterpret_cast", "requires", "static_assert", "static_cast",
+  "template", "this", "throw", "try", "typeid", "typename", "using", "virtual",
+  "not", "xor",
+]);
+
+const JAVA_KEYWORDS = new Set([
+  "abstract", "assert", "break", "case", "catch", "class", "const", "continue",
+  "default", "do", "else", "enum", "extends", "final", "finally", "for", "goto",
+  "if", "implements", "import", "instanceof", "interface", "native", "new",
+  "package", "private", "protected", "public", "return", "static", "strictfp",
+  "super", "switch", "synchronized", "this", "throw", "throws", "transient",
+  "try", "void", "volatile", "while",
+]);
+
+const KOTLIN_KEYWORDS = new Set([
+  "as", "break", "class", "continue", "do", "else", "false", "for", "fun", "if",
+  "in", "interface", "is", "null", "object", "package", "return", "super",
+  "this", "throw", "true", "try", "typealias", "val", "var", "when", "while",
+]);
+
+const SWIFT_KEYWORDS = new Set([
+  "associatedtype", "class", "deinit", "enum", "extension", "fileprivate", "func",
+  "import", "init", "inout", "internal", "let", "open", "operator", "private",
+  "protocol", "public", "rethrows", "static", "struct", "subscript", "typealias",
+  "var", "break", "case", "continue", "default", "defer", "do", "else",
+  "fallthrough", "for", "guard", "if", "in", "repeat", "return", "switch",
+  "throw", "where", "while",
+]);
+const SWIFT_CONSTANTS = new Set(["true", "false", "nil", "self", "Self"]);
+
+const PHP_KEYWORDS = new Set([
+  "abstract", "and", "array", "as", "break", "callable", "case", "catch",
+  "class", "clone", "const", "continue", "declare", "default", "do", "echo",
+  "else", "elseif", "empty", "enddeclare", "endfor", "endforeach", "endif",
+  "endswitch", "endwhile", "eval", "exit", "extends", "final", "finally", "fn",
+  "for", "foreach", "function", "global", "goto", "if", "implements", "include",
+  "include_once", "instanceof", "insteadof", "interface", "isset", "list",
+  "match", "namespace", "new", "or", "print", "private", "protected", "public",
+  "readonly", "require", "require_once", "return", "static", "switch", "throw",
+  "trait", "try", "unset", "use", "var", "while", "xor", "yield",
+]);
+const PHP_CONSTANTS = new Set(["true", "false", "null", "TRUE", "FALSE", "NULL"]);
+
+const RUBY_KEYWORDS = new Set([
+  "alias", "and", "begin", "break", "case", "class", "def", "defined?", "do",
+  "else", "elsif", "end", "ensure", "false", "for", "if", "in", "module", "next",
+  "nil", "not", "or", "redo", "rescue", "retry", "return", "self", "super",
+  "then", "true", "undef", "unless", "until", "when", "while", "yield",
+]);
+
+const LUA_KEYWORDS = new Set([
+  "and", "break", "do", "else", "elseif", "end", "false", "for", "function",
+  "goto", "if", "in", "local", "nil", "not", "or", "repeat", "return", "then",
+  "true", "until", "while",
+]);
+const LUA_CONSTANTS = new Set(["true", "false", "nil"]);
+
+const BASH_KEYWORDS = new Set([
+  "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done",
+  "case", "esac", "function", "in", "select", "time", "coproc",
+]);
+const BASH_CONSTANTS = new Set(["true", "false"]);
+
+const YAML_KEYWORDS = new Set([]);
+const YAML_CONSTANTS = new Set(["true", "false", "null", "True", "False", "Null", "yes", "no", "on", "off"]);
+
+const SQL_KEYWORDS = new Set([
+  "SELECT", "FROM", "WHERE", "INSERT", "INTO", "VALUES", "UPDATE", "SET",
+  "DELETE", "JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "FULL", "ON", "AS",
+  "GROUP", "BY", "ORDER", "HAVING", "LIMIT", "OFFSET", "CREATE", "TABLE",
+  "ALTER", "DROP", "INDEX", "AND", "OR", "NOT", "NULL", "IS", "IN", "LIKE",
+  "BETWEEN", "DISTINCT", "UNION", "ALL", "CASE", "WHEN", "THEN", "ELSE", "END",
+  "PRIMARY", "KEY", "FOREIGN", "REFERENCES", "CONSTRAINT", "DEFAULT", "CHECK",
+]);
+const SQL_CONSTANTS = new Set(["NULL", "TRUE", "FALSE"]);
+
+const DOCKER_KEYWORDS = new Set([
+  "FROM", "RUN", "CMD", "LABEL", "MAINTAINER", "EXPOSE", "ENV", "ADD", "COPY",
+  "ENTRYPOINT", "VOLUME", "USER", "WORKDIR", "ARG", "ONBUILD", "STOPSIGNAL",
+  "HEALTHCHECK", "SHELL",
+]);
+const MAKE_KEYWORDS = new Set([
+  "include", "define", "endef", "ifeq", "ifneq", "ifdef", "ifndef", "else",
+  "endif", "export", "unexport", "override",
+]);
+const CMAKE_KEYWORDS = new Set([
+  "if", "elseif", "else", "endif", "foreach", "endforeach", "while", "endwhile",
+  "function", "endfunction", "macro", "endmacro", "set", "unset", "message",
+  "include", "project", "add_executable", "add_library", "target_link_libraries",
+  "target_include_directories", "install", "find_package",
+]);
+
+const CSS_KEYWORDS = new Set([
+  "@media", "@import", "@keyframes", "@font-face", "@supports", "@charset",
+  "@namespace", "@page", "@layer", "@container", "@property",
+]);
+
+/**
+ * Per-language rules for the lightweight syntax tokenizer used by the
+ * read-only find view. The native Editor paints its own syntax; this view needs
+ * to reproduce the same token colors because it replaces the Editor while find
+ * is open.
+ *
+ * @type {Record<string, {
+ *   lineComments: string[],
+ *   blockComments: Array<[string, string]>,
+ *   quotes: string[],
+ *   multilineQuotes?: string[],
+ *   keywords: Set<string>,
+ *   constants?: Set<string>,
+ *   types?: boolean,
+ *   functions?: boolean,
+ *   propertyBeforeColon?: boolean,
+ *   caseInsensitiveKeywords?: boolean,
+ *   cssHex?: boolean,
+ *   variables?: boolean,
+ * }>}
+ */
+const LANGUAGE_PROFILES = {
+  js: {
+    lineComments: ["//"],
+    blockComments: [["/*", "*/"]],
+    quotes: ['"', "'", "`"],
+    multilineQuotes: ["`"],
+    keywords: JS_KEYWORDS,
+    constants: JS_CONSTANTS,
+    types: true,
+    functions: true,
+  },
+  json: {
+    lineComments: ["//"],
+    blockComments: [["/*", "*/"]],
+    quotes: ['"'],
+    keywords: new Set(),
+    constants: new Set(["true", "false", "null"]),
+    types: false,
+    functions: false,
+  },
+  css: {
+    lineComments: [],
+    blockComments: [["/*", "*/"]],
+    quotes: ['"', "'"],
+    keywords: CSS_KEYWORDS,
+    constants: new Set(),
+    types: false,
+    functions: true,
+    propertyBeforeColon: true,
+    cssHex: true,
+    cssAtRules: true,
+  },
+  rust: {
+    lineComments: ["//"],
+    blockComments: [["/*", "*/"]],
+    quotes: ['"'],
+    keywords: RUST_KEYWORDS,
+    constants: RUST_CONSTANTS,
+    types: true,
+    functions: true,
+  },
+  python: {
+    lineComments: ["#"],
+    blockComments: [],
+    quotes: ['"""', "'''", '"', "'"],
+    multilineQuotes: ['"""', "'''"],
+    keywords: PYTHON_KEYWORDS,
+    constants: PYTHON_CONSTANTS,
+    types: true,
+    functions: true,
+  },
+  go: {
+    lineComments: ["//"],
+    blockComments: [["/*", "*/"]],
+    quotes: ['"', "'", "`"],
+    multilineQuotes: ["`"],
+    keywords: GO_KEYWORDS,
+    constants: GO_CONSTANTS,
+    types: true,
+    functions: true,
+  },
+  c: {
+    lineComments: ["//"],
+    blockComments: [["/*", "*/"]],
+    quotes: ['"', "'"],
+    keywords: C_KEYWORDS,
+    constants: C_CONSTANTS,
+    types: true,
+    functions: true,
+  },
+  cpp: {
+    lineComments: ["//"],
+    blockComments: [["/*", "*/"]],
+    quotes: ['"', "'"],
+    keywords: CPP_KEYWORDS,
+    constants: C_CONSTANTS,
+    types: true,
+    functions: true,
+  },
+  java: {
+    lineComments: ["//"],
+    blockComments: [["/*", "*/"]],
+    quotes: ['"', "'"],
+    keywords: JAVA_KEYWORDS,
+    constants: new Set(["true", "false", "null"]),
+    types: true,
+    functions: true,
+  },
+  kotlin: {
+    lineComments: ["//"],
+    blockComments: [["/*", "*/"]],
+    quotes: ['"', "'"],
+    keywords: KOTLIN_KEYWORDS,
+    constants: new Set(["true", "false", "null"]),
+    types: true,
+    functions: true,
+  },
+  swift: {
+    lineComments: ["//"],
+    blockComments: [["/*", "*/"]],
+    quotes: ['"'],
+    keywords: SWIFT_KEYWORDS,
+    constants: SWIFT_CONSTANTS,
+    types: true,
+    functions: true,
+  },
+  php: {
+    lineComments: ["//", "#"],
+    blockComments: [["/*", "*/"]],
+    quotes: ['"', "'"],
+    keywords: PHP_KEYWORDS,
+    constants: PHP_CONSTANTS,
+    types: true,
+    functions: true,
+    variables: true,
+  },
+  ruby: {
+    lineComments: ["#"],
+    blockComments: [],
+    quotes: ['"', "'"],
+    keywords: RUBY_KEYWORDS,
+    constants: new Set(["true", "false", "nil", "self"]),
+    types: true,
+    functions: true,
+    variables: true,
+  },
+  lua: {
+    lineComments: ["--"],
+    blockComments: [["--[[", "]]"]],
+    quotes: ['"', "'"],
+    keywords: LUA_KEYWORDS,
+    constants: LUA_CONSTANTS,
+    types: false,
+    functions: true,
+    variables: true,
+  },
+  bash: {
+    lineComments: ["#"],
+    blockComments: [],
+    quotes: ['"', "'", "`"],
+    multilineQuotes: ["`"],
+    keywords: BASH_KEYWORDS,
+    constants: BASH_CONSTANTS,
+    types: false,
+    functions: true,
+    variables: true,
+  },
+  yaml: {
+    lineComments: ["#"],
+    blockComments: [],
+    quotes: ['"', "'"],
+    keywords: YAML_KEYWORDS,
+    constants: YAML_CONSTANTS,
+    types: false,
+    functions: false,
+    propertyBeforeColon: true,
+  },
+  toml: {
+    lineComments: ["#"],
+    blockComments: [],
+    quotes: ['"""', "'''", '"', "'"],
+    multilineQuotes: ['"""', "'''"],
+    keywords: new Set([]),
+    constants: YAML_CONSTANTS,
+    types: false,
+    functions: false,
+    propertyBeforeColon: true,
+  },
+  sql: {
+    lineComments: ["--"],
+    blockComments: [["/*", "*/"]],
+    quotes: ["'", '"'],
+    keywords: SQL_KEYWORDS,
+    constants: SQL_CONSTANTS,
+    types: false,
+    functions: true,
+    caseInsensitiveKeywords: true,
+  },
+  dockerfile: {
+    lineComments: ["#"],
+    blockComments: [],
+    quotes: ['"', "'"],
+    keywords: DOCKER_KEYWORDS,
+    constants: new Set(["true", "false", "null"]),
+    types: false,
+    functions: false,
+    caseInsensitiveKeywords: true,
+  },
+  makefile: {
+    lineComments: ["#"],
+    blockComments: [],
+    quotes: ['"', "'"],
+    keywords: MAKE_KEYWORDS,
+    constants: new Set(),
+    types: false,
+    functions: false,
+    caseInsensitiveKeywords: true,
+  },
+  cmake: {
+    lineComments: ["#"],
+    blockComments: [],
+    quotes: ['"'],
+    keywords: CMAKE_KEYWORDS,
+    constants: new Set(["ON", "OFF", "TRUE", "FALSE", "YES", "NO"]),
+    types: false,
+    functions: true,
+    caseInsensitiveKeywords: true,
+  },
+  text: {
+    lineComments: [],
+    blockComments: [],
+    quotes: [],
+    keywords: new Set(),
+    constants: new Set(),
+    types: false,
+    functions: false,
+  },
+};
+
+/**
+ * Splits one line into syntax tokens using the language profile. Comments and
+ * strings that span lines keep their state in `state`, so block comments,
+ * template literals and Python triple-quoted strings stay colored.
+ *
+ * @param {string} line
+ * @param {NonNullable<typeof LANGUAGE_PROFILES[string]>} profile
+ * @param {{ blockEnd: string | null, stringEnd: string | null, expectType: boolean }} state
+ * @returns {Array<{ text: string, token: string | null }>}
+ */
+function tokenizeGenericLine(line, profile, state) {
+  /** @type {Array<{ text: string, token: string | null }>} */
+  const tokens = [];
+  let i = 0;
+  let plain = "";
+
+  const flushPlain = () => {
+    if (!plain) return;
+    const last = tokens[tokens.length - 1];
+    if (last && last.token === null) last.text += plain;
+    else tokens.push({ text: plain, token: null });
+    plain = "";
+  };
+
+  const push = (text, token) => {
+    if (!text) return;
+    if (!token) {
+      plain += text;
+      return;
+    }
+    flushPlain();
+    const last = tokens[tokens.length - 1];
+    if (last && last.token === token) last.text += text;
+    else tokens.push({ text, token });
+  };
+
+  // Tail of a block comment carried over from the previous line.
+  if (state.blockEnd) {
+    const end = line.indexOf(state.blockEnd, i);
+    if (end === -1) {
+      push(line, "comment");
+      return tokens;
+    }
+    const stop = end + state.blockEnd.length;
+    push(line.slice(0, stop), "comment");
+    state.blockEnd = null;
+    i = stop;
+  }
+
+  // Tail of a multi-line string carried over from the previous line.
+  if (state.stringEnd) {
+    const quote = state.stringEnd;
+    let j = i;
+    let closed = false;
+    while (j < line.length) {
+      if (line[j] === "\\") { j += 2; continue; }
+      if (line.startsWith(quote, j)) { j += quote.length; closed = true; break; }
+      j += 1;
+    }
+    push(line.slice(i, j), "string");
+    if (closed) state.stringEnd = null;
+    if (!closed) return tokens;
+    i = j;
+  }
+
+  while (i < line.length) {
+    // Block comments win over line comments: Lua's `--[[` also starts with `--`.
+    const blockComment = profile.blockComments.find(([start]) => line.startsWith(start, i));
+    if (blockComment) {
+      const [start, end] = blockComment;
+      const endIndex = line.indexOf(end, i + start.length);
+      if (endIndex === -1) {
+        push(line.slice(i), "comment");
+        state.blockEnd = end;
+        i = line.length;
+      } else {
+        const stop = endIndex + end.length;
+        push(line.slice(i, stop), "comment");
+        i = stop;
+      }
+      continue;
+    }
+
+    const lineComment = profile.lineComments.find((prefix) => line.startsWith(prefix, i));
+    if (lineComment) {
+      push(line.slice(i), "comment");
+      i = line.length;
+      continue;
+    }
+
+    const quote = profile.quotes.find((candidate) => line.startsWith(candidate, i));
+    if (quote) {
+      const multiline = profile.multilineQuotes?.includes(quote) === true;
+      let j = i + quote.length;
+      let closed = false;
+      while (j < line.length) {
+        if (line[j] === "\\") { j += 2; continue; }
+        if (line.startsWith(quote, j)) { j += quote.length; closed = true; break; }
+        j += 1;
+      }
+      push(line.slice(i, j), "string");
+      if (!closed && multiline) state.stringEnd = quote;
+      i = j;
+      continue;
+    }
+
+    // CSS hex colors and variable sigils read better as constants.
+    const hex = profile.cssHex ? matchSticky(TOKEN_CSS_HEX, line, i) : null;
+    if (hex) {
+      push(hex, "number");
+      i += hex.length;
+      continue;
+    }
+
+    const atRule = profile.cssAtRules ? matchSticky(TOKEN_CSS_AT_RULE, line, i) : null;
+    if (atRule) {
+      push(atRule, profile.keywords.has(atRule) ? "keyword" : "constant");
+      i += atRule.length;
+      continue;
+    }
+
+    const variable = profile.variables ? matchSticky(TOKEN_VARIABLE, line, i) : null;
+    if (variable) {
+      push(variable, "constant");
+      i += variable.length;
+      continue;
+    }
+
+    const number = matchSticky(TOKEN_NUMBER, line, i);
+    if (number) {
+      push(number, "number");
+      i += number.length;
+      continue;
+    }
+
+    const identifier = matchSticky(TOKEN_IDENTIFIER, line, i);
+    if (identifier) {
+      const text = identifier;
+      const key = profile.caseInsensitiveKeywords ? text.toUpperCase() : text;
+      let token = null;
+      if (profile.keywords.has(key) || profile.keywords.has(text)) {
+        token = "keyword";
+        if (TYPE_DECLARATION_WORDS.has(text)) state.expectType = true;
+      } else if (profile.constants?.has(key) || profile.constants?.has(text)) {
+        token = "constant";
+      } else if (state.expectType) {
+        token = "type";
+        state.expectType = false;
+      } else if (profile.types && /^[A-Z]/.test(text)) {
+        token = "type";
+      } else {
+        let next = i + text.length;
+        while (next < line.length && (line[next] === " " || line[next] === "\t")) next += 1;
+        if (profile.functions && line[next] === "(") token = "function";
+        else if (profile.propertyBeforeColon && line[next] === ":") token = "function";
+      }
+      push(text, token);
+      i += text.length;
+      continue;
+    }
+
+    // Fold punctuation and whitespace into a plain run. The next iteration
+    // tests only the current character, so this stays linear even on minified
+    // one-line files.
+    plain += line[i];
+    i += 1;
+  }
+
+  flushPlain();
+  if (tokens.length === 0) tokens.push({ text: "", token: null });
+  return tokens;
+}
+
+/**
+ * Tokenizes HTML/XML: comments, tag names, attribute names, quoted values and
+ * entities. Text nodes stay plain.
+ *
+ * @param {string} line
+ * @param {{ inComment: boolean }} state
+ * @returns {Array<{ text: string, token: string | null }>}
+ */
+function tokenizeHtmlLine(line, state) {
+  /** @type {Array<{ text: string, token: string | null }>} */
+  const tokens = [];
+  const push = (text, token) => {
+    if (!text) return;
+    const last = tokens[tokens.length - 1];
+    if (last && last.token === (token ?? null)) last.text += text;
+    else tokens.push({ text, token: token ?? null });
+  };
+
+  let i = 0;
+  if (state.inComment) {
+    const end = line.indexOf("-->", i);
+    if (end === -1) {
+      push(line, "comment");
+      return tokens;
+    }
+    const stop = end + 3;
+    push(line.slice(0, stop), "comment");
+    state.inComment = false;
+    i = stop;
+  }
+
+  while (i < line.length) {
+    if (line.startsWith("<!--", i)) {
+      const end = line.indexOf("-->", i + 4);
+      if (end === -1) {
+        push(line.slice(i), "comment");
+        state.inComment = true;
+        break;
+      }
+      const stop = end + 3;
+      push(line.slice(i, stop), "comment");
+      i = stop;
+      continue;
+    }
+
+    if (line[i] === "<") {
+      const end = line.indexOf(">", i);
+      const tag = end === -1 ? line.slice(i) : line.slice(i, end + 1);
+      let j = 0;
+      const closing = tag.startsWith("</");
+      const openingLength = closing ? 2 : 1;
+      push(tag.slice(0, openingLength), null);
+      j = openingLength;
+      const name = /^[A-Za-z][\w:-]*/.exec(tag.slice(j));
+      if (name) {
+        push(name[0], "type");
+        j += name[0].length;
+      }
+      while (j < tag.length) {
+        const rest = tag.slice(j);
+        const quote = rest[0] === '"' || rest[0] === "'" ? rest[0] : null;
+        if (quote) {
+          let k = 1;
+          while (k < rest.length) {
+            if (rest[k] === "\\") { k += 2; continue; }
+            if (rest[k] === quote) { k += 1; break; }
+            k += 1;
+          }
+          push(rest.slice(0, k), "string");
+          j += k;
+          continue;
+        }
+        const attr = /^[A-Za-z_][\w:.-]*/.exec(rest);
+        if (attr) {
+          push(attr[0], "function");
+          j += attr[0].length;
+          continue;
+        }
+        push(rest[0], null);
+        j += 1;
+      }
+      i = end === -1 ? line.length : end + 1;
+      continue;
+    }
+
+    const nextTag = line.indexOf("<", i);
+    const text = nextTag === -1 ? line.slice(i) : line.slice(i, nextTag);
+    let j = 0;
+    while (j < text.length) {
+      const amp = text.indexOf("&", j);
+      if (amp === -1) {
+        push(text.slice(j), null);
+        break;
+      }
+      push(text.slice(j, amp), null);
+      const semi = text.indexOf(";", amp);
+      if (semi === -1) {
+        push(text.slice(amp), null);
+        break;
+      }
+      push(text.slice(amp, semi + 1), "constant");
+      j = semi + 1;
+    }
+    i = nextTag === -1 ? line.length : nextTag;
+  }
+
+  if (tokens.length === 0) tokens.push({ text: "", token: null });
+  return tokens;
+}
+
+/**
+ * Colors Markdown inline constructs in `text` and forwards runs to `push`.
+ *
+ * @param {string} text
+ * @param {(text: string, token: string | null) => void} push
+ * @param {string | null} [baseToken=null] Color for plain text (headings pass `type`).
+ */
+function tokenizeMarkdownInline(text, push, baseToken = null) {
+  const inline = /(`[^`]*`)|(\[[^\]]*\]\([^)]*\))|(\*\*[^*]+\*\*|__[^_]+__)|(\*[^*]+\*|_[^_]+_)|(<[^>]+>)/g;
+  let cursor = 0;
+  let match;
+  while ((match = inline.exec(text)) !== null) {
+    push(text.slice(cursor, match.index), baseToken);
+    const value = match[0];
+    if (value.startsWith("`")) {
+      push(value, "string");
+    } else if (value.startsWith("[")) {
+      const link = /^\[([^\]]*)\]\(([^)]*)\)$/.exec(value);
+      if (link) {
+        push("[", baseToken);
+        push(link[1], "function");
+        push("](", baseToken);
+        push(link[2], "string");
+        push(")", baseToken);
+      } else {
+        push(value, baseToken);
+      }
+    } else if (value.startsWith("<")) {
+      push(value, "type");
+    } else {
+      push(value, "type");
+    }
+    cursor = match.index + value.length;
+  }
+  push(text.slice(cursor), baseToken);
+}
+
+/**
+ * Tokenizes one Markdown line: fences, headings, list markers, blockquotes,
+ * inline code, links and emphasis.
+ *
+ * @param {string} line
+ * @param {{ fence: string | null }} state
+ * @returns {Array<{ text: string, token: string | null }>}
+ */
+function tokenizeMarkdownLine(line, state) {
+  /** @type {Array<{ text: string, token: string | null }>} */
+  const tokens = [];
+  const push = (text, token) => {
+    if (!text) return;
+    const last = tokens[tokens.length - 1];
+    if (last && last.token === (token ?? null)) last.text += text;
+    else tokens.push({ text, token: token ?? null });
+  };
+
+  const fenceMatch = /^\s*(```+|~~~+)/.exec(line);
+  if (state.fence) {
+    push(line, "string");
+    if (fenceMatch) state.fence = null;
+    return tokens;
+  }
+  if (fenceMatch) {
+    state.fence = fenceMatch[1][0];
+    push(line, "string");
+    return tokens;
+  }
+
+  const heading = /^(\s*)(#{1,6})(\s+)(.*)$/.exec(line);
+  if (heading) {
+    push(heading[1], null);
+    push(heading[2], "keyword");
+    push(heading[3], null);
+    tokenizeMarkdownInline(heading[4], push, "type");
+    return tokens;
+  }
+
+  const quote = /^(\s*)(>+)(\s*)(.*)$/.exec(line);
+  if (quote) {
+    push(quote[1], null);
+    push(quote[2], "comment");
+    push(quote[3], null);
+    tokenizeMarkdownInline(quote[4], push);
+    return tokens;
+  }
+
+  const list = /^(\s*)([-*+]|\d+[.)])(\s+)(.*)$/.exec(line);
+  if (list) {
+    push(list[1], null);
+    push(list[2], "keyword");
+    push(list[3], null);
+    tokenizeMarkdownInline(list[4], push);
+    return tokens;
+  }
+
+  tokenizeMarkdownInline(line, push);
+  if (tokens.length === 0) tokens.push({ text: "", token: null });
+  return tokens;
+}
+
+/**
+ * Lightweight, pure syntax tokenizer for the read-only find view. It restores
+ * the token colors the native Editor paints, including constructs that span
+ * lines (block comments, template literals, triple-quoted strings). The
+ * returned runs concatenate back to the input lines exactly.
+ *
+ * @param {string[]} lines
+ * @param {string} language `detectLanguage(...).language`
+ * @returns {Array<Array<{ text: string, token: string | null }>>}
+ */
+export function tokenizeCodeLines(lines, language) {
+  const source = Array.isArray(lines) ? lines : [];
+  const lang = typeof language === "string" ? language.toLowerCase() : "text";
+
+  if (lang === "markdown" || lang === "mdx") {
+    const state = { fence: null };
+    return source.map((line) => tokenizeMarkdownLine(typeof line === "string" ? line : "", state));
+  }
+  if (lang === "html" || lang === "xml") {
+    const state = { inComment: false };
+    return source.map((line) => tokenizeHtmlLine(typeof line === "string" ? line : "", state));
+  }
+
+  const profile = LANGUAGE_PROFILES[lang] || LANGUAGE_PROFILES.text;
+  if (profile === LANGUAGE_PROFILES.text) {
+    return source.map((line) => [{ text: typeof line === "string" ? line : "", token: null }]);
+  }
+
+  const state = { blockEnd: null, stringEnd: null, expectType: false };
+  return source.map((line) => tokenizeGenericLine(typeof line === "string" ? line : "", profile, state));
+}
+
 /**
  * Resolves the workspace location honoring active space, pinned location, focused cwd
  * strictly when focused space matches active space, and space folder fallback.

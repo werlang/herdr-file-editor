@@ -18,7 +18,7 @@ export const SEARCH_MATCH_CAP = 2000;
 export const SEARCH_FILE_CAP = 200;
 
 /** Default height of one line in the read-only find view, in pixels. */
-export const FIND_LINE_HEIGHT = 20;
+export const FIND_LINE_HEIGHT = 20.5;
 
 /** Height of one SEARCH result row, in pixels. */
 export const SEARCH_ROW_HEIGHT = 24;
@@ -958,6 +958,57 @@ export function lineMatchSegments(lineText, matches, line, currentId) {
   }
   if (result.length === 0) {
     result.push({ text, highlight: false, current: false });
+  }
+  return result;
+}
+
+/**
+ * Cuts syntax token runs to the visible window and merges them with the match
+ * runs, so a match keeps its highlight and the rest of the line keeps its
+ * syntax color. The result covers `visibleText` exactly.
+ *
+ * @param {string} visibleText
+ * @param {number} offset Character offset already trimmed from the left.
+ * @param {Array<{ text: string, token: string | null }>} tokenLine
+ * @param {Array<{ text: string, highlight: boolean, current: boolean }>} matchSegments
+ * @returns {Array<{ text: string, token: string | null, highlight: boolean, current: boolean }>}
+ */
+export function mergeSyntaxSegments(visibleText, offset, tokenLine, matchSegments) {
+  const text = typeof visibleText === "string" ? visibleText : "";
+  const types = new Array(text.length).fill(null);
+  let position = 0;
+  for (const token of Array.isArray(tokenLine) ? tokenLine : []) {
+    const start = position;
+    const end = position + token.text.length;
+    position = end;
+    if (end <= offset) continue;
+    const from = Math.max(0, start - offset);
+    const to = Math.min(text.length, end - offset);
+    for (let k = from; k < to; k += 1) types[k] = token.token;
+  }
+
+  const result = [];
+  let cursor = 0;
+  for (const segment of Array.isArray(matchSegments) ? matchSegments : []) {
+    const start = cursor;
+    const end = cursor + segment.text.length;
+    let k = start;
+    while (k < end) {
+      const token = types[k] ?? null;
+      let j = k + 1;
+      while (j < end && (types[j] ?? null) === token) j += 1;
+      result.push({
+        text: text.slice(k, j),
+        token,
+        highlight: segment.highlight,
+        current: segment.current,
+      });
+      k = j;
+    }
+    cursor = end;
+  }
+  if (result.length === 0) {
+    result.push({ text: "", token: null, highlight: false, current: false });
   }
   return result;
 }
