@@ -10,6 +10,9 @@ import {
   detectLanguage,
   isMarkdownFile,
   isSvgFile,
+  isCsvFile,
+  isXlsxFile,
+  spreadsheetKind,
   prepareSvgPreview,
   prepareSvgPreviewInfo,
   defaultViewMode,
@@ -238,6 +241,24 @@ test("isSvgFile - detects svg extensions case-insensitively", () => {
   assert.equal(isSvgFile(null), false);
 });
 
+test("spreadsheet helpers - classify CSV/TSV text tables and XLSX workbooks", () => {
+  assert.equal(spreadsheetKind("data.csv"), "csv");
+  assert.equal(spreadsheetKind("DATA.TSV"), "csv");
+  assert.equal(spreadsheetKind("report.xlsx"), "xlsx");
+  assert.equal(spreadsheetKind("report.xlsm"), "xlsx");
+  assert.equal(spreadsheetKind("legacy.xls"), null);
+  assert.equal(spreadsheetKind("README.md"), null);
+  assert.equal(spreadsheetKind(""), null);
+  assert.equal(spreadsheetKind(null), null);
+
+  assert.equal(isCsvFile("data.csv"), true);
+  assert.equal(isCsvFile("data.tsv"), true);
+  assert.equal(isCsvFile("report.xlsx"), false);
+  assert.equal(isXlsxFile("report.xlsx"), true);
+  assert.equal(isXlsxFile("report.xlsm"), true);
+  assert.equal(isXlsxFile("data.csv"), false);
+});
+
 test("prepareSvgPreview - scales the root to a crisp intrinsic size", () => {
   // Icon with only a viewBox: width/height are added from the viewBox ratio.
   const icon = '<svg viewBox="0 0 24 24" fill="none"><path d="M0 0h24v24H0z"/></svg>';
@@ -304,6 +325,17 @@ test("defaultViewMode - markdown and svg default to preview, others to code", ()
   assert.equal(defaultViewMode("diagram.svg", "preview"), "preview");
   assert.equal(defaultViewMode("diagram.svg", "code"), "code");
   assert.equal(defaultViewMode("DIAGRAM.SVG"), "preview");
+
+  // CSV/TSV have a table preview plus editable code.
+  assert.equal(defaultViewMode("data.csv"), "preview");
+  assert.equal(defaultViewMode("data.csv", "preview"), "preview");
+  assert.equal(defaultViewMode("data.csv", "code"), "code");
+  assert.equal(defaultViewMode("data.tsv"), "preview");
+
+  // XLSX is preview-only: its binary source is never a code view.
+  assert.equal(defaultViewMode("report.xlsx"), "preview");
+  assert.equal(defaultViewMode("report.xlsx", "code"), "preview");
+  assert.equal(defaultViewMode("report.xlsm"), "preview");
 
   // Non-previewable (always code)
   assert.equal(defaultViewMode("main.js"), "code");
@@ -397,6 +429,10 @@ test("isFileReadonly & readonlyReason - identifies uneditable files with descrip
   // Image file
   assert.equal(isFileReadonly({ isImage: true }), true);
   assert.equal(readonlyReason({ isImage: true }), "Image file cannot be edited");
+
+  // Spreadsheet previews are read-only and say so before the binary fallback.
+  assert.equal(isFileReadonly({ isSpreadsheet: true, isBinary: true }), true);
+  assert.equal(readonlyReason({ isSpreadsheet: true, isBinary: true }), "Spreadsheet preview is read-only");
 
   // Truncated large file
   assert.equal(isFileReadonly({ isTruncated: true }), true);

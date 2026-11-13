@@ -134,6 +134,11 @@ const EXTENSION_MAP = {
   kt: { language: "kotlin", label: "Kotlin" },
   kts: { language: "kotlin", label: "Kotlin" },
   txt: { language: "text", label: "Text" },
+  csv: { language: "text", label: "CSV" },
+  tsv: { language: "text", label: "TSV" },
+  xlsx: { language: "text", label: "Excel" },
+  xlsm: { language: "text", label: "Excel" },
+  xls: { language: "text", label: "Excel" },
 };
 
 /**
@@ -199,6 +204,39 @@ export function isMarkdownFile(filePath) {
 export function isSvgFile(filePath) {
   const { ext } = splitPathInfo(filePath);
   return ext === "svg";
+}
+
+/**
+ * Classifies a file as a CSV/TSV text table or a ZIP-based Excel workbook.
+ *
+ * @param {string} [filePath]
+ * @returns {"csv" | "xlsx" | null}
+ */
+export function spreadsheetKind(filePath) {
+  const { ext } = splitPathInfo(filePath);
+  if (ext === "csv" || ext === "tsv") return "csv";
+  if (ext === "xlsx" || ext === "xlsm") return "xlsx";
+  return null;
+}
+
+/**
+ * Checks if a file is a delimited text table (.csv or .tsv).
+ *
+ * @param {string} [filePath]
+ * @returns {boolean}
+ */
+export function isCsvFile(filePath) {
+  return spreadsheetKind(filePath) === "csv";
+}
+
+/**
+ * Checks if a file is an OOXML Excel workbook (.xlsx or .xlsm).
+ *
+ * @param {string} [filePath]
+ * @returns {boolean}
+ */
+export function isXlsxFile(filePath) {
+  return spreadsheetKind(filePath) === "xlsx";
 }
 
 /** Longest intrinsic side of a generated SVG preview, in pixels. */
@@ -283,15 +321,17 @@ export function prepareSvgPreview(text, maxSize = SVG_PREVIEW_SIZE) {
 
 /**
  * Determines the default view mode for a file ("preview" or "code").
- * Markdown and SVG files default to "preview" unless explicitly set to "code".
- * All other files always use "code".
+ * Markdown, SVG, CSV and TSV files default to "preview" unless explicitly set
+ * to "code". XLSX workbooks always use "preview" because their binary source
+ * cannot be edited as text. All other files use "code".
  *
  * @param {string} filePath
  * @param {string} [requestedMode]
  * @returns {"preview" | "code"}
  */
 export function defaultViewMode(filePath, requestedMode) {
-  if (isMarkdownFile(filePath) || isSvgFile(filePath)) {
+  if (isXlsxFile(filePath)) return "preview";
+  if (isMarkdownFile(filePath) || isSvgFile(filePath) || isCsvFile(filePath)) {
     return requestedMode === "code" ? "code" : "preview";
   }
   return "code";
@@ -354,6 +394,7 @@ export function encodeBase64Chunks(text, chunkSize = 50000) {
  * @param {{
  *   isBinary?: boolean,
  *   isImage?: boolean,
+ *   isSpreadsheet?: boolean,
  *   isTruncated?: boolean,
  *   on?: string | null,
  *   fileError?: string | null
@@ -365,6 +406,7 @@ export function isFileReadonly(state) {
   return Boolean(
     state.isBinary ||
     state.isImage ||
+    state.isSpreadsheet ||
     state.isTruncated ||
     state.fileError
   );
@@ -376,6 +418,7 @@ export function isFileReadonly(state) {
  * @param {{
  *   isBinary?: boolean,
  *   isImage?: boolean,
+ *   isSpreadsheet?: boolean,
  *   isTruncated?: boolean,
  *   on?: string | null,
  *   fileError?: string | null
@@ -385,6 +428,7 @@ export function isFileReadonly(state) {
 export function readonlyReason(state) {
   if (!state) return "Read-only";
   if (state.fileError) return state.fileError;
+  if (state.isSpreadsheet) return "Spreadsheet preview is read-only";
   if (state.isBinary) return "Binary file cannot be edited";
   if (state.isImage) return "Image file cannot be edited";
   if (state.isTruncated) return "File exceeds maximum size and cannot be safely edited";

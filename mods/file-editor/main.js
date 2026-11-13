@@ -8,6 +8,7 @@
  * - Syntax highlighting (Editor / EditorState) for code and configuration files.
  * - GitHub-style Markdown preview (markdown-view.js) for .md / .markdown / .mdx.
  * - Rendered SVG preview for .svg, with a Code view toggle.
+ * - Table previews for .csv / .tsv and .xlsx / .xlsm workbooks.
  * - Zoomable, pannable raster image and SVG previews (25%–400%).
  * - Soft-wrap toggle, copy button, file reload, and live disk watching.
  */
@@ -40,6 +41,9 @@ import {
   detectLanguage,
   isMarkdownFile,
   isSvgFile,
+  isCsvFile,
+  isXlsxFile,
+  spreadsheetKind,
   prepareSvgPreviewInfo,
   defaultViewMode,
   prepareFileText,
@@ -93,6 +97,14 @@ import {
   resolveFilesMenuPosition,
 } from "./file-logic.js";
 import { renderMarkdownDocument } from "./markdown-view.js";
+import {
+  parseDelimitedText,
+  parseXlsxWorkbook,
+  visibleColumnRange,
+  visibleRowRange,
+  SPREADSHEET_MAX_COLUMNS,
+  SPREADSHEET_MAX_ROWS,
+} from "./spreadsheet.js";
 
 /** In-memory cache for open and recent file tab states (scroll, cursor, text, view mode, EditorState). */
 const fileTabStates = new Map();
@@ -142,6 +154,15 @@ const TOTAL = 5000;
 
 /** Height of the file tab's header toolbar, in pixels. */
 const HEADER_HEIGHT = 38;
+
+/** `herdr.exec` caps stdout at 8 MiB; base64 needs headroom for a trailing newline. */
+const MAX_SPREADSHEET_BASE64_CHARS = 7.5 * 1024 * 1024;
+
+/** Spreadsheet preview metrics, in pixels. */
+const SPREADSHEET_TOOLBAR_HEIGHT = 34;
+const SPREADSHEET_HEADER_HEIGHT = 28;
+const SPREADSHEET_ROW_HEIGHT = 26;
+const SPREADSHEET_GUTTER_WIDTH = 56;
 
 /** Padding around a picture preview inside its scroll area, in pixels. */
 const PICTURE_PADDING = 24;
@@ -335,6 +356,35 @@ async function deletePath(root, relPath, isDir, on) {
   if (r.code !== 0) throw new Error(r.stderr?.trim() || `Delete failed with code ${r.code}`);
 }
 
+/**
+ * Reads a workbook's raw bytes through `exec`, rather than the capability-gated
+ * `fs` module, so a workspace file can be previewed wherever the user's roots
+ * live. `herdr.exec` caps output at 8 MiB, so workbooks beyond that transport
+ * budget report a friendly notice instead of being truncated.
+ *
+ * @param {string} fullPath
+ * @returns {Promise<Uint8Array>}
+ */
+async function readSpreadsheetBytes(fullPath) {
+  let result;
+  if (window()?.platform === "windows") {
+    const safePath = fullPath.replace(/'/g, "''");
+    const script = `[Convert]::ToBase64String([IO.File]::ReadAllBytes('${safePath}'))`;
+    result = await exec("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], { timeout: 60000 });
+  } else {
+    result = await exec("sh", ["-c", 'base64 < "$1"', "read", fullPath], { timeout: 60000 });
+  }
+
+  if (!result || result.code !== 0) {
+    throw new Error((result?.stderr || "").trim() || "Cannot read this workbook.");
+  }
+  const base64 = result.stdout.trim();
+  if (base64.length > MAX_SPREADSHEET_BASE64_CHARS) {
+    throw new Error("This workbook is too large to preview (over the 8 MiB transport limit).");
+  }
+  return Buffer.from(base64, "base64");
+}
+
 export default class FileEditor extends View {
   /**
    * Initializes the view based on whether props().file is provided.
@@ -442,8 +492,17 @@ export default class FileEditor extends View {
     this.fileError = null;
     this.lineCount = cached?.lineCount ?? 0;
     this.isBinary = cached?.isBinary ?? false;
-    this.isImage = isImageFile(this.file);
-    this.isSvg = isSvgFile(this.file);
+    this.refreshFileKindFlags();
+    this.spreadsheet = cached?.spreadsheet ?? null;
+    const cachedSheet = Number.isInteger(cached?.activeSheet) ? cached.activeSheet : (this.spreadsheet?.activeSheet ?? 0);
+    const cachedSheetCount = this.spreadsheet?.sheets?.length ?? 0;
+    this.activeSheet = cachedSheetCount > 0
+      ? Math.max(0, Math.min(cachedSheetCount - 1, cachedSheet))
+      : Math.max(0, cachedSheet);
+    this.sheetScrolls = cached?.sheetScrolls ?? {};
+    this.sheetScrollX = cached?.sheetScrollX ?? 0;
+    this.sheetScrollY = cached?.sheetScrollY ?? 0;
+    if (this.isXlsx) this.isBinary = true;
     this.imageSrc = cached?.imageSrc ?? null;
     this.imageLoading = false;
     this.imageSize = cached?.imageSize ?? null;
@@ -512,9 +571,14 @@ export default class FileEditor extends View {
       imageSrc: this.imageSrc ?? existing.imageSrc,
       pictureViewport: this.pictureViewport ?? existing.pictureViewport,
       tabViewport: this.tabViewport ?? existing.tabViewport,
+      spreadsheet: this.spreadsheet ?? null,
+      activeSheet: this.activeSheet,
+      sheetScrolls: this.sheetScrolls ?? existing.sheetScrolls,
+      sheetScrollX: this.sheetScrollX ?? existing.sheetScrollX ?? 0,
+      sheetScrollY: this.sheetScrollY ?? existing.sheetScrollY ?? 0,
       wrap: this.wrap,
-      code: this.code ?? existing.code,
-      editorInputs: this.editorInputs ?? existing.editorInputs,
+      code: this.code ?? null,
+      editorInputs: this.editorInputs ?? null,
       mdScrollY: this.mdScrollY ?? existing.mdScrollY ?? 0,
       pictureScrollX: this.pictureScrollX ?? existing.pictureScrollX ?? 0,
       pictureScrollY: this.pictureScrollY ?? existing.pictureScrollY ?? 0,
@@ -530,6 +594,9 @@ export default class FileEditor extends View {
       mdScrollY: updated.mdScrollY,
       pictureScrollX: updated.pictureScrollX,
       pictureScrollY: updated.pictureScrollY,
+      activeSheet: updated.activeSheet,
+      sheetScrollX: updated.sheetScrollX,
+      sheetScrollY: updated.sheetScrollY,
     });
     const evicted = pruneFileTabStates(fileTabStates, MAX_CACHED_FILE_STATES, this.fileKey);
     for (const { entry } of evicted) {
@@ -611,6 +678,39 @@ export default class FileEditor extends View {
   }
 
   /**
+   * Whether the file offers a Preview / Code segmented switcher. Markdown, SVG
+   * and CSV/TSV files have a readable preview plus their raw source. XLSX is
+   * preview-only because the workbook is binary.
+   *
+   * @returns {boolean}
+   */
+  hasPreviewToggle() {
+    return this.isMarkdown || this.isSvg || this.isCsv;
+  }
+
+  /**
+   * Recomputes file-kind flags after a rename changes the extension.
+   */
+  refreshFileKindFlags() {
+    this.isImage = isImageFile(this.file);
+    this.isMarkdown = isMarkdownFile(this.file);
+    this.isSvg = isSvgFile(this.file);
+    this.isCsv = isCsvFile(this.file);
+    this.isXlsx = isXlsxFile(this.file);
+    this.spreadsheetKind = spreadsheetKind(this.file);
+  }
+
+  /**
+   * Whether the current tab shows the text editor instead of a rendered preview.
+   *
+   * @returns {boolean}
+   */
+  showsCodeView() {
+    if (this.isImage || this.isXlsx) return false;
+    return !this.hasPreviewToggle() || this.viewMode === "code";
+  }
+
+  /**
    * Whether another pane was split into this file's tab. A preview with a
    * split terminal or a second editor must become permanent: closing the tab
    * would take that unrelated work with it.
@@ -657,7 +757,18 @@ export default class FileEditor extends View {
       renamed.oldPath === this.file
     ) {
       this.lastRenamedTimestamp = renamed.timestamp;
+      const previousKind = this.spreadsheetKind;
       this.file = renamed.newPath;
+      this.refreshFileKindFlags();
+      if (previousKind !== this.spreadsheetKind) {
+        this.spreadsheet = null;
+        this.activeSheet = 0;
+        this.sheetScrollX = 0;
+        this.sheetScrollY = 0;
+        this.sheetScrolls = {};
+      }
+      this.isBinary = this.isXlsx;
+      this.viewMode = defaultViewMode(this.file, this.viewMode);
       this.fileKey = toFileKey(this.root, this.file);
       this.loadFile(cx);
       changed = true;
@@ -715,8 +826,7 @@ export default class FileEditor extends View {
       }
     }
 
-    const hasPreview = isMarkdownFile(this.file) || this.isSvg;
-    const isCodeView = !hasPreview || this.viewMode === "code";
+    const isCodeView = this.showsCodeView();
     if (isCodeView && this.preparedText !== null && !this.isBinary) {
       const appSettings = settings() || {};
       const syntax = buildSyntaxTheme(theme());
@@ -750,6 +860,10 @@ export default class FileEditor extends View {
    * @param {import("gpui-kit").ViewContext} cx
    */
   loadFile(cx) {
+    if (this.isXlsx) {
+      this.loadSpreadsheet(cx);
+      return;
+    }
     if (this.isImage) {
       this.loadImage(cx);
       return;
@@ -785,9 +899,16 @@ export default class FileEditor extends View {
 
         if (this.isSvg) this.loadImage(cx);
 
+        if (this.isCsv) {
+          this.spreadsheet = isBinary || preparedText === null
+            ? null
+            : parseDelimitedText(text, { extension: splitPathInfo(this.file).ext });
+        } else if (!this.isXlsx) {
+          this.spreadsheet = null;
+        }
+
         if (this.preparedText !== null && !this.isBinary) {
-          const hasPreview = isMarkdownFile(this.file) || this.isSvg;
-          if (!hasPreview || this.viewMode === "code") {
+          if (this.showsCodeView()) {
             if (this.code && this.code.value() === this.preparedText) {
               // Current editor already has the latest text; do not rebuild to preserve cursor and focus.
             } else if (this.code && !hadUnsavedEdits) {
@@ -812,6 +933,7 @@ export default class FileEditor extends View {
         this.isBinary = false;
         this.isTruncated = false;
         this.dirty = false;
+        if (this.isCsv) this.spreadsheet = null;
         this.code?.release();
         this.code = null;
         this.editorInputs = null;
@@ -836,6 +958,7 @@ export default class FileEditor extends View {
     return isFileReadonly({
       isBinary: this.isBinary,
       isImage: this.isImage,
+      isSpreadsheet: this.isXlsx,
       isTruncated: this.isTruncated,
       on: this.on,
       fileError: this.fileError,
@@ -851,6 +974,7 @@ export default class FileEditor extends View {
     return readonlyReason({
       isBinary: this.isBinary,
       isImage: this.isImage,
+      isSpreadsheet: this.isXlsx,
       isTruncated: this.isTruncated,
       on: this.on,
       fileError: this.fileError,
@@ -871,7 +995,7 @@ export default class FileEditor extends View {
       return;
     }
 
-    const hasPreview = isMarkdownFile(this.file) || this.isSvg;
+    const hasPreview = this.hasPreviewToggle();
     if (hasPreview && this.viewMode !== "code") {
       return;
     }
@@ -1030,8 +1154,7 @@ export default class FileEditor extends View {
       return;
     }
 
-    const hasPreview = isMarkdownFile(this.file) || this.isSvg;
-    const isCodeView = !this.isImage && (!hasPreview || this.viewMode === "code");
+    const isCodeView = this.showsCodeView();
     const isToggleWrap =
       event.keystroke === "alt-z" ||
       event.keystroke === "opt-z" ||
@@ -1140,7 +1263,7 @@ export default class FileEditor extends View {
    * @param {import("gpui-kit").ViewContext} cx
    */
   focusEditor(cx) {
-    if (this.closed || this.isImage || (this.viewMode !== "code" && (isMarkdownFile(this.file) || this.isSvg))) {
+    if (this.closed || this.isImage || this.isXlsx || (this.hasPreviewToggle() && this.viewMode !== "code")) {
       return;
     }
     const attempt = () => {
@@ -1173,18 +1296,22 @@ export default class FileEditor extends View {
   }
 
   /**
-   * Toggles Markdown preview vs. raw code view mode.
+   * Toggles rendered preview vs. raw code view mode.
    *
    * @param {"preview" | "code"} mode
    * @param {import("gpui-kit").ViewContext} cx
    */
   setViewMode(mode, cx) {
+    if (this.isXlsx) return;
     if (this.viewMode === mode) return;
     if (this.code) {
       const currentText = this.code.value();
       this.preparedText = currentText;
       if (this.isSvg && mode === "preview") {
         this.loadSvgImage(cx);
+      }
+      if (this.isCsv && mode === "preview") {
+        this.spreadsheet = parseDelimitedText(currentText, { extension: splitPathInfo(this.file).ext });
       }
     }
     this.viewMode = mode;
@@ -1292,7 +1419,7 @@ export default class FileEditor extends View {
       this.pictureViewport = { width, height };
     }
     this.updateCachedTabState({ tabViewport: this.tabViewport, pictureViewport: this.pictureViewport });
-    if (this.showsPicturePreview() || this.isMarkdown) {
+    if (this.showsPicturePreview() || this.hasPreviewToggle() || this.isXlsx) {
       cx.notify();
     }
   }
@@ -1417,7 +1544,7 @@ export default class FileEditor extends View {
    * @param {import("gpui-kit").ViewContext} cx
    */
   checkDiskChanges(cx) {
-    if (this.closed || this.loading || this.saving || this.dirty || !this.file) return;
+    if (this.closed || this.loading || this.saving || this.dirty || !this.file || this.isXlsx) return;
 
     const root = this.root;
     const file = this.file;
@@ -1451,14 +1578,21 @@ export default class FileEditor extends View {
   renderFileTab(cx) {
     const t = theme();
     const { base, dir } = splitPathInfo(this.file);
-    const isMarkdown = isMarkdownFile(this.file);
+    const isMarkdown = this.isMarkdown;
     const isSvg = this.isSvg;
-    const hasPreview = isMarkdown || isSvg;
+    const hasPreview = this.hasPreviewToggle();
     const { label: langLabel } = detectLanguage(this.file);
+    const activeSheet = this.activeSpreadsheetSheet();
     const lineLabel = this.isImage
       ? `Image · ${(base.split(".").pop() || "").toUpperCase()}`
-      : `${this.lineCount} line${this.lineCount === 1 ? "" : "s"} · ${langLabel}`;
-    const isCodeView = !this.isImage && (!hasPreview || this.viewMode === "code");
+      : this.isXlsx
+        ? this.spreadsheet
+          ? `${this.spreadsheet.sheets.length} sheet${this.spreadsheet.sheets.length === 1 ? "" : "s"} · Excel`
+          : "Excel"
+        : this.isCsv && this.viewMode === "preview" && activeSheet
+          ? `${Math.max(0, activeSheet.rows.length - 1)} rows × ${activeSheet.columnCount} cols · ${langLabel}`
+          : `${this.lineCount} line${this.lineCount === 1 ? "" : "s"} · ${langLabel}`;
+    const isCodeView = this.showsCodeView();
     const preview = this.isPreviewTab();
     const tabId = fileElementId("file-editor-tab", this.fileKey);
 
@@ -1515,7 +1649,7 @@ export default class FileEditor extends View {
                 )
               )
           )
-          .when(!this.isImage, (e) =>
+          .when(!this.isImage && !this.isXlsx, (e) =>
             e.child(
               h_flex()
                 .id("file-editor-copy")
@@ -1624,7 +1758,7 @@ export default class FileEditor extends View {
                     .when(this.viewMode === "preview", (btn) => btn.bg(t.selected).text_color(t.foreground))
                     .when(this.viewMode !== "preview", (btn) => btn.text_color(t.dim))
                     .hover((s) => s.bg(this.viewMode === "preview" ? t.selected : t.hover))
-                    .tooltip(isSvg ? "Rendered SVG preview" : "Rendered Markdown preview")
+                    .tooltip(isSvg ? "Rendered SVG preview" : isMarkdown ? "Rendered Markdown preview" : "Rendered CSV/TSV table preview")
                     .on_click((_e, cx) => this.setViewMode("preview", cx))
                     .child(svg("mods/file-editor/eye.svg").size(12))
                 )
@@ -1741,11 +1875,15 @@ export default class FileEditor extends View {
               )
           : this.isImage
             ? this.renderImageView(t)
-            : !isCodeView
-              ? isMarkdown
-                ? this.renderMarkdownView(t)
-                : this.renderSvgView(t)
-              : this.renderCodeView(t)
+            : this.isXlsx
+              ? this.renderSpreadsheetView(t)
+              : !isCodeView
+                ? isMarkdown
+                  ? this.renderMarkdownView(t)
+                  : isSvg
+                    ? this.renderSvgView(t)
+                    : this.renderSpreadsheetView(t)
+                : this.renderCodeView(t)
       );
   }
 
@@ -1832,6 +1970,495 @@ export default class FileEditor extends View {
       this.imageSrc = ok ? rel : null;
       cx.notify();
     });
+  }
+
+  /**
+   * Reads an XLSX/XLSM workbook from disk and builds its table preview.
+   * The host reads binaries from this machine only, so remote workbooks show
+   * a notice instead of an empty table.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  loadSpreadsheet(cx) {
+    if (!this.file || this.closed) return;
+    if (this.on) {
+      this.loading = false;
+      this.spreadsheet = null;
+      this.fileError = "Workbook preview works only for files on this machine.";
+      this.updateCachedTabState({ spreadsheet: null });
+      cx.notify();
+      return;
+    }
+    if (this.loading) {
+      this.reloadPending = true;
+      return;
+    }
+
+    this.loading = true;
+    const fullPath = this.root ? `${this.root}/${this.file}` : this.file;
+    this.code?.release();
+    this.code = null;
+    this.editorInputs = null;
+    this.isBinary = true;
+
+    cx.spawn(async (cx) => {
+      try {
+        const bytes = await readSpreadsheetBytes(fullPath);
+        if (this.closed) return;
+        const parsed = parseXlsxWorkbook(bytes);
+        const previousName = this.spreadsheet?.sheets?.[this.activeSheet]?.name;
+        const preserved = previousName
+          ? parsed.sheets.findIndex((candidate) => candidate.name === previousName)
+          : -1;
+
+        this.spreadsheet = parsed;
+        this.activeSheet = preserved >= 0
+          ? preserved
+          : Math.max(0, Math.min(parsed.sheets.length - 1, parsed.activeSheet || 0));
+        if (!this.sheetScrolls || typeof this.sheetScrolls !== "object") this.sheetScrolls = {};
+        this.rawText = null;
+        this.preparedText = null;
+        this.lineCount = 0;
+        this.isTruncated = parsed.truncated;
+        this.fileError = null;
+        this.dirty = false;
+        this.updateCachedTabState({ spreadsheet: parsed, activeSheet: this.activeSheet });
+      } catch (error) {
+        if (this.closed) return;
+        this.spreadsheet = null;
+        this.rawText = null;
+        this.preparedText = null;
+        this.lineCount = 0;
+        this.isTruncated = false;
+        this.fileError = error instanceof Error && error.message
+          ? error.message
+          : "Could not read this workbook.";
+        this.updateCachedTabState({ spreadsheet: null });
+      } finally {
+        if (!this.closed) {
+          this.loading = false;
+          cx.notify();
+          if (this.reloadPending) {
+            this.reloadPending = false;
+            this.loadFile(cx);
+          }
+        }
+      }
+    });
+  }
+
+  /**
+   * The active worksheet, clamped to the workbook's actual sheet list.
+   *
+   * @returns {import("./spreadsheet.js").SpreadsheetSheet | null}
+   */
+  activeSpreadsheetSheet() {
+    const workbook = this.spreadsheet;
+    if (!workbook || !Array.isArray(workbook.sheets) || workbook.sheets.length === 0) return null;
+    const index = Math.max(0, Math.min(workbook.sheets.length - 1, this.activeSheet | 0));
+    return workbook.sheets[index] ?? null;
+  }
+
+  /**
+   * Remembers the current sheet's scroll position before switching away.
+   */
+  saveSheetScroll() {
+    if (!this.spreadsheet) return;
+    this.sheetScrolls = {
+      ...(this.sheetScrolls || {}),
+      [this.activeSheet]: { x: this.sheetScrollX || 0, y: this.sheetScrollY || 0 },
+    };
+  }
+
+  /**
+   * Switches the visible worksheet and restores its own scroll position.
+   *
+   * @param {number} index
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  selectSheet(index, cx) {
+    const workbook = this.spreadsheet;
+    if (!workbook || index < 0 || index >= workbook.sheets.length || index === this.activeSheet) return;
+    this.saveSheetScroll();
+    this.activeSheet = index;
+    const saved = (this.sheetScrolls || {})[index];
+    this.sheetScrollX = saved?.x ?? 0;
+    this.sheetScrollY = saved?.y ?? 0;
+    this.updateCachedTabState({
+      activeSheet: index,
+      sheetScrolls: this.sheetScrolls,
+      sheetScrollX: this.sheetScrollX,
+      sheetScrollY: this.sheetScrollY,
+    });
+    cx.notify();
+  }
+
+  /**
+   * Wheel scrolling for the spreadsheet table. Vertical wheel moves rows,
+   * horizontal wheel moves columns, and Shift+wheel pans sideways.
+   *
+   * @param {import("gpui-kit").ScrollWheelEvent} event
+   * @param {import("gpui-kit").Context} cx
+   * @param {number} maxScrollX
+   * @param {number} maxScrollY
+   */
+  handleSpreadsheetWheel(event, cx, maxScrollX, maxScrollY) {
+    const modifiers = event.modifiers || {};
+    const deltaX = event.delta?.x || 0;
+    const deltaY = event.delta?.y || 0;
+    let stepX = deltaX || (event.delta_lines?.x ? event.delta_lines.x * SPREADSHEET_ROW_HEIGHT : 0);
+    let stepY = deltaY || (event.delta_lines?.y ? event.delta_lines.y * SPREADSHEET_ROW_HEIGHT : 0);
+    if (modifiers.shift && stepX === 0) {
+      stepX = stepY;
+      stepY = 0;
+    }
+    if (stepX === 0 && stepY === 0) return;
+
+    const nextX = Math.max(0, Math.min(maxScrollX, (this.sheetScrollX || 0) - stepX));
+    const nextY = Math.max(0, Math.min(maxScrollY, (this.sheetScrollY || 0) - stepY));
+    if (nextX === this.sheetScrollX && nextY === this.sheetScrollY) return;
+
+    this.sheetScrollX = nextX;
+    this.sheetScrollY = nextY;
+    this.updateCachedTabState({ sheetScrollX: nextX, sheetScrollY: nextY });
+    cx.notify();
+  }
+
+  /**
+   * One spreadsheet row: a sticky row-number gutter plus the visible cells.
+   *
+   * @param {Record<string, string>} t
+   * @param {import("./spreadsheet.js").SpreadsheetSheet} sheet
+   * @param {number} rowIndex
+   * @param {{ start: number, end: number, offset: number }} columns
+   * @param {{ header?: boolean, stripe?: boolean }} [options]
+   * @returns {import("gpui-kit").Element}
+   */
+  renderSpreadsheetRow(t, sheet, rowIndex, columns, options = {}) {
+    const header = options.header === true;
+    const height = header ? SPREADSHEET_HEADER_HEIGHT : SPREADSHEET_ROW_HEIGHT;
+    const row = sheet.rows[rowIndex] ?? [];
+    const rowNumber = sheet.rowNumbers[rowIndex] ?? rowIndex + 1;
+
+    const cells = [];
+    for (let column = columns.start; column < columns.end; column += 1) {
+      const raw = row[column] ?? "";
+      const text = raw === "" ? " " : raw;
+      const trimmed = raw.trim();
+      const numeric =
+        trimmed.length > 0 &&
+        /^[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)?(?:\.\d+)?%?$/.test(trimmed) &&
+        /\d/.test(trimmed);
+
+      cells.push(
+        div()
+          .w(sheet.widths[column] ?? 64)
+          .h(height)
+          .flex_none()
+          .px(8)
+          .flex()
+          .items_center()
+          .border_r_1()
+          .border_color(t.border)
+          .when(header, (el) => el.font_semibold())
+          .child(
+            div()
+              .truncate()
+              .text_size(header ? 11 : 11.5)
+              .text_color(header ? t.foreground : t.muted)
+              .when(!header && numeric, (el) => el.w_full().text_right())
+              .child(text)
+          )
+      );
+    }
+
+    return h_flex()
+      .h(height)
+      .flex_none()
+      .w_full()
+      .when(header, (el) => el.bg(t.raised))
+      .when(!header && options.stripe === true, (el) => el.bg(t.raised))
+      .when(!header, (el) => el.border_b_1().border_color(t.border))
+      .child(
+        h_flex()
+          .w(SPREADSHEET_GUTTER_WIDTH)
+          .h(height)
+          .flex_none()
+          .items_center()
+          .justify_end()
+          .px(7)
+          .border_r_1()
+          .border_color(t.border)
+          .bg(t.chrome)
+          .text_size(9.5)
+          .text_color(t.dim)
+          .child(header ? "" : String(rowNumber))
+      )
+      .child(
+        div()
+          .flex_1()
+          .min_w(0)
+          .h(height)
+          .overflow_hidden()
+          .relative()
+          .child(
+            h_flex()
+              .relative()
+              .left(-columns.offset)
+              .flex_none()
+              .children(cells)
+          )
+      );
+  }
+
+  /**
+   * The sheet tabs or CSV summary strip above the table.
+   *
+   * @param {Record<string, string>} t
+   * @param {import("./spreadsheet.js").SpreadsheetWorkbook} workbook
+   * @param {import("./spreadsheet.js").SpreadsheetSheet} sheet
+   * @returns {import("gpui-kit").Element}
+   */
+  renderSpreadsheetToolbar(t, workbook, sheet) {
+    const truncated = sheet.truncatedRows || sheet.truncatedColumns;
+    const limits = [];
+    if (sheet.truncatedRows) limits.push(`${SPREADSHEET_MAX_ROWS} rows`);
+    if (sheet.truncatedColumns) limits.push(`${SPREADSHEET_MAX_COLUMNS} columns`);
+    const summary = this.isXlsx
+      ? null
+      : `${workbook.delimiterLabel || "Comma"} · ${Math.max(0, sheet.rows.length - 1)} rows × ${sheet.columnCount} columns`;
+
+    return h_flex()
+      .h(SPREADSHEET_TOOLBAR_HEIGHT)
+      .flex_none()
+      .px(8)
+      .gap(6)
+      .items_center()
+      .bg(t.chrome)
+      .border_b_1()
+      .border_color(t.border)
+      .child(
+        h_flex()
+          .flex_1()
+          .min_w(0)
+          .gap(2)
+          .items_center()
+          .overflow_x_scroll()
+          .when(this.isXlsx, (el) =>
+            el.children(
+              workbook.sheets.map((candidate, index) =>
+                h_flex()
+                  .id(`file-sheet-${index}`)
+                  .h(22)
+                  .max_w(180)
+                  .flex_none()
+                  .items_center()
+                  .px(8)
+                  .rounded(4)
+                  .cursor_pointer()
+                  .when(index === this.activeSheet, (tab) => tab.bg(t.selected).text_color(t.foreground))
+                  .when(index !== this.activeSheet, (tab) =>
+                    tab.text_color(t.dim).hover((state) => state.bg(t.hover).text_color(t.foreground))
+                  )
+                  .tooltip(candidate.name)
+                  .on_click((_event, cx) => this.selectSheet(index, cx))
+                  .child(div().truncate().text_size(11).child(candidate.name || `Sheet ${index + 1}`))
+              )
+            )
+          )
+          .when(!this.isXlsx, (el) =>
+            el
+              .child(
+                h_flex()
+                  .h(20)
+                  .flex_none()
+                  .items_center()
+                  .px(6)
+                  .rounded(4)
+                  .bg(t.raised)
+                  .text_size(9.5)
+                  .text_color(t.muted)
+                  .child(sheet.name || "CSV")
+              )
+              .child(div().truncate().text_size(10.5).text_color(t.dim).child(summary))
+          )
+      )
+      .when(truncated, (el) =>
+        el.child(
+          div()
+            .flex_none()
+            .text_size(9.5)
+            .text_color(t.dim)
+            .child(
+              `Preview limited · ${limits.join(" / ")}`
+            )
+        )
+      );
+  }
+
+  /**
+   * Shows a CSV/TSV table or an XLSX worksheet as a scrollable, sticky-header
+   * grid. Rows are virtualized to the viewport, so large sheets stay cheap.
+   *
+   * @param {Record<string, string>} t
+   * @returns {import("gpui-kit").Element}
+   */
+  renderSpreadsheetView(t) {
+    const tableId = fileElementId("file-editor-spreadsheet", this.fileKey);
+    const workbook = this.spreadsheet;
+    if (!workbook) {
+      return v_flex()
+        .id(tableId)
+        .flex_1()
+        .min_h(0)
+        .p(24)
+        .items_center()
+        .justify_center()
+        .child(
+          div()
+            .max_w(620)
+            .text_size(12)
+            .text_color(t.dim)
+            .child(this.loading ? "Loading spreadsheet…" : "Could not build a spreadsheet preview.")
+        );
+    }
+
+    if (workbook.sheets.length === 0) {
+      return v_flex()
+        .id(tableId)
+        .flex_1()
+        .min_h(0)
+        .p(24)
+        .items_center()
+        .justify_center()
+        .child(div().max_w(620).text_size(12).text_color(t.dim).child("This workbook has no worksheets."));
+    }
+
+    const sheet = this.activeSpreadsheetSheet();
+    if (!sheet) {
+      return v_flex()
+        .id(tableId)
+        .flex_1()
+        .min_h(0)
+        .p(24)
+        .items_center()
+        .justify_center()
+        .child(div().max_w(620).text_size(12).text_color(t.dim).child("This worksheet is unavailable."));
+    }
+
+    const toolbar = this.renderSpreadsheetToolbar(t, workbook, sheet);
+    if (sheet.error) {
+      return v_flex()
+        .id(tableId)
+        .size_full()
+        .min_h(0)
+        .bg(t.background)
+        .child(toolbar)
+        .child(
+          v_flex()
+            .flex_1()
+            .min_h(0)
+            .p(24)
+            .items_center()
+            .justify_center()
+            .child(div().max_w(620).text_size(12).text_color(t.dim).child(sheet.error))
+        );
+    }
+
+    const viewport = this.tabViewport || { width: 800, height: 600 };
+    const viewportWidth = Math.max(120, viewport.width || 800);
+    const viewportHeight = Math.max(120, viewport.height || 600);
+    const contentWidth = Math.max(80, viewportWidth - SPREADSHEET_GUTTER_WIDTH);
+    const bodyHeight = Math.max(SPREADSHEET_ROW_HEIGHT, viewportHeight - SPREADSHEET_TOOLBAR_HEIGHT - SPREADSHEET_HEADER_HEIGHT);
+    const bodyRowCount = Math.max(0, sheet.rows.length - 1);
+    const totalWidth = sheet.widths.reduce((sum, width) => sum + width, 0);
+    const totalHeight = bodyRowCount * SPREADSHEET_ROW_HEIGHT;
+    const maxScrollX = Math.max(0, totalWidth - contentWidth);
+    const maxScrollY = Math.max(0, totalHeight - bodyHeight);
+
+    this.sheetScrollX = Math.max(0, Math.min(maxScrollX, this.sheetScrollX || 0));
+    this.sheetScrollY = Math.max(0, Math.min(maxScrollY, this.sheetScrollY || 0));
+
+    const columns = visibleColumnRange(sheet.widths, this.sheetScrollX, contentWidth);
+    const rows = visibleRowRange(bodyRowCount, this.sheetScrollY, bodyHeight, SPREADSHEET_ROW_HEIGHT, 3);
+    const visibleRows = [];
+    for (let row = rows.start; row < rows.end; row += 1) {
+      visibleRows.push(
+        this.renderSpreadsheetRow(t, sheet, row + 1, columns, { stripe: row % 2 === 1 })
+      );
+    }
+
+    const verticalThumbHeight = totalHeight > 0
+      ? Math.max(28, Math.round((bodyHeight / totalHeight) * bodyHeight))
+      : 0;
+    const verticalThumbTop = Math.round((this.sheetScrollY / Math.max(1, maxScrollY)) * (bodyHeight - verticalThumbHeight));
+    const horizontalThumbWidth = totalWidth > 0
+      ? Math.max(28, Math.round((contentWidth / totalWidth) * contentWidth))
+      : 0;
+    const horizontalThumbLeft = Math.round((this.sheetScrollX / Math.max(1, maxScrollX)) * (contentWidth - horizontalThumbWidth));
+
+    return v_flex()
+      .id(tableId)
+      .size_full()
+      .min_h(0)
+      .relative()
+      .bg(t.background)
+      .overflow_hidden()
+      .on_scroll_wheel((event, cx) => this.handleSpreadsheetWheel(event, cx, maxScrollX, maxScrollY))
+      .child(toolbar)
+      .child(
+        sheet.rows.length === 0 || sheet.columnCount === 0
+          ? v_flex()
+            .flex_1()
+            .min_h(0)
+            .p(24)
+            .items_center()
+            .justify_center()
+            .child(div().max_w(620).text_size(12).text_color(t.dim).child("This spreadsheet has no data."))
+          : v_flex()
+            .flex_1()
+            .min_h(0)
+            .child(this.renderSpreadsheetRow(t, sheet, 0, columns, { header: true }))
+            .child(
+              div()
+                .relative()
+                .flex_1()
+                .min_h(0)
+                .overflow_hidden()
+                .child(
+                  v_flex()
+                    .relative()
+                    .top(-rows.offset)
+                    .children(visibleRows)
+                )
+            )
+      )
+      .when(maxScrollY > 0, (el) =>
+        el.child(
+          div()
+            .absolute()
+            .right(3)
+            .top(SPREADSHEET_TOOLBAR_HEIGHT + SPREADSHEET_HEADER_HEIGHT + verticalThumbTop)
+            .w(4)
+            .h(verticalThumbHeight)
+            .rounded(2)
+            .bg(t.dim)
+            .opacity(0.6)
+        )
+      )
+      .when(maxScrollX > 0, (el) =>
+        el.child(
+          div()
+            .absolute()
+            .left(SPREADSHEET_GUTTER_WIDTH + horizontalThumbLeft)
+            .bottom(2)
+            .w(horizontalThumbWidth)
+            .h(4)
+            .rounded(2)
+            .bg(t.dim)
+            .opacity(0.6)
+        )
+      );
   }
 
   /**

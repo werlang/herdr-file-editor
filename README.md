@@ -1,8 +1,8 @@
 # Herdr File Explorer & Editor
 
-A native, dual-mode **File Explorer & Editor** mod for Herdr featuring directory tree navigation, Git status porcelain badges, dedicated tabbed file viewing, theme-aware syntax highlighting, and rich Markdown and SVG previews powered directly by GPUI.
+A native, dual-mode **File Explorer & Editor** mod for Herdr featuring directory tree navigation, Git status porcelain badges, dedicated tabbed file viewing, theme-aware syntax highlighting, and rich Markdown, SVG, CSV, and XLSX previews powered directly by GPUI.
 
-Instead of opening raw code files inside the narrow Files panel, `file-editor` opens files into their own dedicated Herdr tabs with full-pane syntax highlighting and Markdown or SVG rendering, keeping your directory tree accessible and intact.
+Instead of opening raw code files inside the narrow Files panel, `file-editor` opens files into their own dedicated Herdr tabs with full-pane syntax highlighting and Markdown, SVG, or spreadsheet rendering, keeping your directory tree accessible and intact.
 
 ---
 
@@ -37,6 +37,13 @@ Instead of opening raw code files inside the narrow Files panel, `file-editor` o
   - For `.svg` files, defaults to a rendered preview on a light canvas so `currentColor` icons stay visible on dark themes.
   - The preview copy is rasterized at a large intrinsic size, keeping small 24×24 icon view boxes crisp when enlarged.
   - Supports the same **Preview** / **Code** switcher, with full SVG source highlighting in Code view.
+- **Spreadsheet Preview**:
+  - For `.csv` and `.tsv` files, defaults to a table preview with a sticky header and row numbers. Quoted fields, escaped quotes, CRLF, embedded newlines, BOMs, and comma/semicolon/tab delimiters are handled automatically.
+  - For `.xlsx` and `.xlsm` workbooks, reads the OOXML ZIP container directly (no extra dependency), with worksheet tabs, shared strings, inline strings, booleans, dates, percentages, and number formatting.
+  - The table virtualizes rows for large sheets, scrolls in both directions, restores each worksheet's own scroll position, and caps the preview at 2,000 rows × 100 columns, with a visible note when a limit is hit.
+  - CSV/TSV files keep the **Preview** / **Code** switcher so the raw text stays editable; workbooks are preview-only and read-only.
+  - Legacy `.xls` files are not previewed; only the ZIP-based `.xlsx` / `.xlsm` formats are supported.
+  - Workbooks are read through Herdr's `exec` transport, which caps output at 8 MiB; a larger workbook shows a friendly notice instead of a partial table.
 - **Picture Zoom**:
   - Raster images and SVG previews support zoom controls (`−` / percentage / `+`), a reset-to-fit button, and Cmd/Ctrl + wheel zooming.
   - 100% fits the picture to the pane; larger levels overflow and scroll in both directions.
@@ -44,7 +51,7 @@ Instead of opening raw code files inside the narrow Files panel, `file-editor` o
   - **Header Info**: Bold basename with unsaved dot (`●`), copy button, truncated folder path, line count & language pill.
   - **Action Controls**: Compact icon buttons with tooltips and uniform 24px vertical alignment:
     - `Save` icon button (`save.svg`), accent-highlighted when dirty, or `Read-only` lock icon indicator (`lock.svg`).
-    - `Preview` / `Code` segmented icon switcher (`eye.svg` and `code.svg`) for Markdown and SVG files.
+    - `Preview` / `Code` segmented icon switcher (`eye.svg` and `code.svg`) for Markdown, SVG, CSV, and TSV files.
     - `Zoom Controls`: `−` / percentage / `+` for raster images and SVG previews; the percentage resets to fit.
     - `Wrap Toggle`: `wrap.svg` icon button toggling soft line wrapping on and off (via button or `Alt+Z` / `Opt+Z`), remembered in shared settings (`file-editor.wrap`).
     - `Split Actions`: `split-right.svg` and `split-down.svg` icon buttons splitting the editor right (also `Cmd+\` / `Ctrl+\`) or down, opening the `new-pane` chooser.
@@ -56,6 +63,7 @@ Instead of opening raw code files inside the narrow Files panel, `file-editor` o
   - Friendly warnings for deleted or missing files (`"This file is no longer available"`).
   - Binary file detection (`"Binary file · no text preview"`).
   - Graceful truncation of files exceeding 400,000 characters.
+  - Spreadsheet previews stop at 2,000 rows × 100 columns and 500 characters per cell, showing a limit note instead of freezing on huge exports.
 
 ---
 
@@ -118,6 +126,23 @@ Force Code view for a Markdown document:
 ```sh
 herdr-app do tab.new --name "CHANGELOG.md" --mod file-editor \
   --props '{"folder":"/path/to/project","file":"CHANGELOG.md","viewMode":"code"}'
+```
+
+Open a CSV in its table preview (the default) or force the editable code view:
+
+```sh
+herdr-app do tab.new --name "export.csv" --mod file-editor \
+  --props '{"folder":"/path/to/project","file":"data/export.csv"}'
+
+herdr-app do tab.new --name "export.csv" --mod file-editor \
+  --props '{"folder":"/path/to/project","file":"data/export.csv","viewMode":"code"}'
+```
+
+Open an XLSX workbook in its read-only spreadsheet preview:
+
+```sh
+herdr-app do tab.new --name "report.xlsx" --mod file-editor \
+  --props '{"folder":"/path/to/project","file":"reports/report.xlsx"}'
 ```
 
 Open an SVG in its rendered preview (the default) at 150% zoom:

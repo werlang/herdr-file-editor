@@ -1,6 +1,6 @@
 # File Explorer & Editor
 
-A native, dual-mode file explorer panel and tabbed file editor for Herdr with syntax highlighting, Markdown and SVG previews, picture zoom, and live filesystem watching powered directly by GPUI.
+A native, dual-mode file explorer panel and tabbed file editor for Herdr with syntax highlighting, Markdown/SVG/CSV/XLSX previews, picture zoom, and live filesystem watching powered directly by GPUI.
 
 ![File Explorer & Editor](preview.png)
 
@@ -16,6 +16,7 @@ Inside any Herdr sidebar, split pane, or dedicated tab:
   - **Editing & Saving**: Full editing support in Code view for code, config, Markdown, and SVG files with live dirty state tracking, `Save` button, and `Cmd+S` / `Ctrl+S` saving.
   - **Markdown Mode Switcher**: For `.md`, `.markdown`, and `.mdx` files, a segmented toggle (`Preview` / `Code`) defaulting to rendered preview.
   - **SVG Mode Switcher**: For `.svg` files, the same `Preview` / `Code` toggle, defaulting to a rendered preview on a light canvas so `currentColor` icons stay visible on dark themes.
+  - **Spreadsheet Preview**: For `.csv` / `.tsv`, a table with a sticky header and row numbers, quoted-field parsing, delimiter detection and the same `Preview` / `Code` toggle. For `.xlsx` / `.xlsm`, worksheet tabs and a read-only table parsed from the OOXML ZIP container, with shared strings, inline strings, dates, percentages and number styles. Legacy `.xls` is not supported.
   - **Zoom Controls**: Raster images and SVG previews show `−` / percentage / `+` controls beside the view switcher; the percentage resets to fit. Cmd/Ctrl + wheel also zooms.
   - **Wrap Toggle**: In Code view, a `Wrap` button toggling soft line wrapping on long lines.
   - **Copy Button**: One-click clipboard copy button (`copy.svg`) with an instant toast notification.
@@ -24,6 +25,7 @@ Inside any Herdr sidebar, split pane, or dedicated tab:
   - **Markdown Preview**: GitHub-style rendering (headings with rules, code boxes, bordered tables, quote bars, task lists) in a centered, readable 880px max-width column.
   - **SVG Preview**: `prepareSvgPreview` writes an enlarged copy to `cache/file-editor/` so the host rasterizes small icon view boxes crisply, and the preview is drawn on a light canvas so black `currentColor` fallbacks remain visible.
   - **Edge State Banners**: Friendly centered messages for deleted/missing files (`"This file is no longer available"`), binary files (`"Binary file · no text preview"`), or files truncated past 400,000 characters.
+  - **Spreadsheet Limits**: Tables stop at 2,000 rows × 100 columns and 500 characters per cell; the toolbar shows a limit note when a sheet is capped. Workbooks above the 8 MiB `exec` transport budget show a friendly notice.
 
 ## How it behaves
 
@@ -40,7 +42,10 @@ Inside any Herdr sidebar, split pane, or dedicated tab:
 - In File Editor tab mode:
   - Reads file text asynchronously off the UI thread with `readTextFile`.
   - Automatically detects language and syntax coloring tokens from Herdr's active theme.
-  - Defaults Markdown and SVG files to `"preview"` mode and all other files to `"code"` mode.
+  - Defaults Markdown, SVG, CSV and TSV files to `"preview"` mode, XLSX/XLSM to read-only preview, and all other files to `"code"` mode.
+  - Parses CSV/TSV tables in memory with delimiter detection and quoted-field support; XLSX/XLSM is read from its ZIP container through `exec` + base64, then inflated and parsed as OOXML.
+  - Virtualizes spreadsheet rows, keeps the header and row-number gutter sticky, scrolls in both axes, and restores each worksheet's scroll position.
+  - Caps spreadsheet previews at 2,000 rows × 100 columns and 500 characters per cell, showing a limit note in the toolbar.
   - Allows full editing in Code view, updating line counts dynamically and tracking dirty state against the disk snapshot.
   - Saves file contents atomically (via `writeTextFile` locally or `writeRemoteTextFile` over SSH via `herdr-core` `exec`), triggered by the toolbar `Save` button or `Cmd+S` / `Ctrl+S`, alerting if disk files were modified externally.
   - Watches the workspace directory via `watchFolder` so external edits reload automatically without clobbering active unsaved work.
@@ -52,7 +57,8 @@ Inside any Herdr sidebar, split pane, or dedicated tab:
 
 - `mods/file-editor/`:
   - `main.js`: Main dual-mode View component handling tree navigation, tab management, toolbar interactions, and editor rendering.
-  - `file-logic.js`: Pure, deterministic helpers for language mapping, Markdown block parsing, SVG preview preparation, picture zoom levels, location resolution, and tab deduplication.
+  - `file-logic.js`: Pure, deterministic helpers for language mapping, Markdown block parsing, SVG preview preparation, picture zoom levels, location resolution, spreadsheet file classification, and tab deduplication.
+  - `spreadsheet.js`: Pure CSV/TSV parsing and XLSX/XLSM OOXML reading, plus visible table range and column-width helpers.
   - `mod.json`: Herdr mod manifest (`"place": "none"`).
   - Vector SVG icons: `chevron-down.svg`, `chevron-right.svg`, `folder.svg`, `file.svg`, `copy.svg`, `refresh.svg`.
 - `gpui-kit` & `gpui-base`: Native GPU elements, flex layouts, `Editor`, `EditorState`, and `TextView.markdown` for inline text.
@@ -67,6 +73,8 @@ Inside any Herdr sidebar, split pane, or dedicated tab:
 - Per-loop `watchToken` objects invalidate stale background watchers when switching directories or closing views.
 - The host rasterizes SVG at its root `width`/`height`, not the layout size; use `prepareSvgPreview` so small view boxes stay crisp, and never draw SVG previews on the app background alone because `currentColor` falls back to black.
 - Cache previews live outside `mods/` so writing them does not trigger a mod reload; remove them in `close(_cx)`.
+- XLSX bytes are read with `exec` + base64 because `fs.readFile` is capability-gated. Keep the 8 MiB stdout cap in mind: the preview rejects larger workbooks instead of showing a truncated ZIP.
+- Spreadsheet rows are virtualized; do not render every row or every off-screen column, or a large CSV will stall the UI.
 
 ## Done when
 
@@ -75,4 +83,5 @@ Inside any Herdr sidebar, split pane, or dedicated tab:
 - `sync.sh` synchronizes the mod to `~/.config/herdr-app/mods/file-editor`.
 - Clicking files in the Files browser opens dedicated Herdr tabs rather than replacing the directory tree.
 - Syntax highlighting and Markdown preview render smoothly.
+- CSV/TSV table previews handle quotes, delimiters and large row counts; XLSX worksheet tabs, dates and percentages render correctly.
 - SVG previews render crisply on a light canvas, and raster/SVG zoom controls work at every level.
