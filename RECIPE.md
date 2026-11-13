@@ -15,7 +15,7 @@ Inside any Herdr sidebar, split pane, or dedicated tab:
 
 - **Dedicated File Editor Tab (`#file-editor-tab`)**:
   - **Toolbar (`h(38)`)**: Matches Herdr diff tab craft with vector file icon, bold filename with an accent dot indicator (`●`) on unsaved edits, truncated directory path, metadata pill showing line count and language name (e.g., `142 lines · JavaScript` or `85 lines · Markdown`), dynamic `Save` button (or `Read-only` badge on protected files), find button, and copy/refresh buttons.
-  - **Find Widget**: Docked top-right, with a focused query input, `Aa` / `ab` / `.*` toggles, `N of M` counter, previous/next buttons and close. A chevron expands a second row with a replace input, `AB` preserve-case toggle, Replace and Replace All (`Cmd+Alt+F` / `Ctrl+H` opens it directly). Matches are highlighted in a read-only virtualised view and the current match is scrolled into view. `Esc` returns to the native editor; invalid regexes show `Invalid regex`; images disable find. Replacing edits only the buffer (`set_value`), marks the tab dirty and supports `Cmd+Z` / `Ctrl+Z` through a small in-memory undo stack; nothing is saved until `Cmd+S`.
+  - **Find Widget**: Docked top-right, with a focused query input, `Aa` / `ab` / `.*` toggles, `N of M` counter, previous/next buttons and close. A chevron expands a second row with a replace input, `AB` preserve-case toggle, Replace and Replace All (`Cmd+Alt+F` / `Ctrl+H` opens it directly). Matches are highlighted in a read-only virtualised view that keeps the file's syntax colors and the current match is scrolled into view. `Esc` returns to the native editor; invalid regexes show `Invalid regex`; images disable find. Replacing edits only the buffer (`set_value`), marks the tab dirty and supports `Cmd+Z` / `Ctrl+Z` through a small in-memory undo stack; nothing is saved until `Cmd+S`.
 
   - **Editing & Saving**: Full editing support in Code view for code, config, Markdown, and SVG files with live dirty state tracking, `Save` button, and `Cmd+S` / `Ctrl+S` saving.
   - **Markdown Mode Switcher**: For `.md`, `.markdown`, and `.mdx` files, a segmented toggle (`Preview` / `Code`) defaulting to rendered preview.
@@ -103,7 +103,7 @@ Inside any Herdr sidebar, split pane, or dedicated tab:
 - `node --test test/` passes all unit tests.
 - `sync.sh` synchronizes the mod to `~/.config/herdr-app/mods/file-editor`.
 - Clicking files in the Files browser opens dedicated Herdr tabs rather than replacing the directory tree.
-- `Cmd+F` opens the find widget, highlights matches, steps with wrap-around, and `Esc` returns to the editor with unsaved edits intact.
+- `Cmd+F` / `Ctrl+F` (on key release, because the native editor consumes the press) or `F3` / `Shift+F3` opens the find widget while the editor is focused, highlights matches, steps with wrap-around, and `Esc` returns to the editor with unsaved edits intact.
 - `Cmd+Alt+F` / `Ctrl+H` opens the replace row; Replace/Replace All edit the buffer, mark the tab dirty, leave the disk untouched until save, and `Cmd+Z` restores the previous text while find is open.
 - `Cmd+Shift+F` expands SEARCH, results group by file, and clicking a match opens the file at that match through the find prop.
 - SEARCH replace shows the inline strike/insert diff, Replace/Dismiss hover actions, and a confirmation dialog for multi-file runs; the write re-reads each file, skips dirty open tabs and files changed on disk, then re-runs the search.

@@ -55,15 +55,15 @@ Instead of opening raw code files inside the narrow Files panel, `file-editor` o
     - `Zoom Controls`: `−` / percentage / `+` for raster images and SVG previews; the percentage resets to fit.
     - `Wrap Toggle`: `wrap.svg` icon button toggling soft line wrapping on and off (via button or `Alt+Z` / `Opt+Z`), remembered in shared settings (`file-editor.wrap`).
     - `Split Actions`: `split-right.svg` and `split-down.svg` icon buttons splitting the editor right (also `Cmd+\` / `Ctrl+\`) or down, opening the `new-pane` chooser.
-    - `Find Button`: `search.svg` opening the in-editor find widget (also `Cmd+F` / `Ctrl+F`).
+    - `Find Button`: `search.svg` opening the in-editor find widget (also `Cmd+F` / `Ctrl+F`, or `F3` / `Shift+F3`).
     - `Copy Button`: `copy.svg` button copying file text to the clipboard with an instant toast notification.
     - `Refresh Button`: `refresh.svg` button reloading file contents directly from disk.
 - **Live Disk Watching & Polling**:
   - Integrates with `watchFolder` off the UI thread and a 1.5s disk change poll so external modifications by agents or tools automatically update the open tab without clobbering unsaved edits.
 - **Find in File**:
-  - `Cmd+F` / `Ctrl+F` (or the `search.svg` toolbar button) opens a VS Code-style find bar docked over the editor: focused query input, `Aa` match case, `ab` whole word, `.*` regex (also `Alt+C` / `Alt+W` / `Alt+R`), an `N of M` counter, previous/next, and close.
-  - `Enter` / `Shift+Enter`, `F3` / `Shift+F3`, and `Cmd/Ctrl+G` / `Cmd/Ctrl+Shift+G` step through matches with wrap-around; `Esc` closes and returns to the native editor.
-  - Every match is highlighted and the current one is scrolled into view, horizontally too when it lies past the pane width. Regex `^`/`$` anchor at every line, whole-word matches backtrack through alternations (`foo|foobar`), and invalid regexes show `Invalid regex` with a red input border instead of throwing. Images disable find.
+  - `Cmd+F` / `Ctrl+F` (or `F3` / `Shift+F3`, or the `search.svg` toolbar button) opens a VS Code-style find bar docked over the editor: focused query input, `Aa` match case, `ab` whole word, `.*` regex (also `Alt+C` / `Alt+W` / `Alt+R`), an `N of M` counter, previous/next, and close. Current Herdr's native editor consumes the Cmd+F key press, so the tab opens find on the key release; F3 remains the immediate key-down path.
+  - `Enter` / `Shift+Enter` and `F3` / `Shift+F3` step through matches with wrap-around; `Cmd/Ctrl+G` / `Cmd/Ctrl+Shift+G` are also bound but the native editor may take the unmodified chords first. `Esc` closes and returns to the native editor.
+  - Every match is highlighted and the current one is scrolled into view, horizontally too when it lies past the pane width. The read-only match view keeps the file's syntax colors (keywords, strings, comments, numbers, functions and types) through a lightweight tokenizer, including block comments and multi-line strings. Regex `^`/`$` anchor at every line, whole-word matches backtrack through alternations (`foo|foobar`), and invalid regexes show `Invalid regex` with a red input border instead of throwing. Images disable find.
   - A chevron at the left of the find bar expands a VS Code-style replace row: replace input, `AB` preserve-case toggle, Replace and Replace All. `Cmd+Alt+F` / `Ctrl+H` opens it directly. While the replace input is focused, `Enter` replaces the current match and moves to the next, `Cmd+Enter` / `Ctrl+Alt+Enter` replaces all, and `Cmd+Shift+1` / `Cmd+Alt+Enter` are also accepted. The expanded state, last replacement and preserve-case flag persist in `shared("file-editor.find")`.
   - Regex replacements support `$0` / `$&` (the whole match), `$1`…`$99`, `$$`, `\n`, `\t`, `\\` and the `\u` / `\l` / `\U` / `\L` / `\E` case operations; unknown escapes keep their backslash, so `C:\path` survives. Preserve case follows VS Code: all-upper → upper, all-lower → lower, mixed case adjusts only the first letter (and hyphen/underscore-separated segments are handled per segment). Replacements edit only the in-memory buffer through `set_value`, mark the tab dirty and promote a preview tab; nothing is written until `Cmd+S`. `Cmd+Z` / `Ctrl+Z` while find is open restores the text before the last replace, and does not consume the chord when the replace undo stack is empty. Replace is disabled with a read-only tooltip on binary, image, truncated or unreadable files.
   - The widget renders a read-only, virtualised text view while open because GPUI's `EditorState` has no selection/cursor/decoration API; the native editor state is left untouched, so unsaved edits survive. Markdown and SVG previews switch to Code view when find opens.
@@ -216,12 +216,12 @@ herdr-app do tab.new --name "replace" --mod file-editor \
 
 | Action | Shortcut |
 | --- | --- |
-| Find in file | `Cmd+F` / `Ctrl+F`, or the `search.svg` toolbar button |
+| Find in file | `Cmd+F` / `Ctrl+F`, `F3` / `Shift+F3`, or the `search.svg` toolbar button |
 | Find and replace in file | `Cmd+Alt+F` / `Ctrl+H` |
 | Replace current match (replace input focused) | `Enter`, or `Cmd+Shift+1` |
 | Replace all in file (replace input focused) | `Cmd+Enter`, `Ctrl+Alt+Enter`, or `Cmd+Alt+Enter` |
 | Undo last replace while find is open | `Cmd+Z` / `Ctrl+Z` |
-| Next / previous match | `Enter` / `Shift+Enter`, `F3` / `Shift+F3`, `Cmd/Ctrl+G` / `Cmd/Ctrl+Shift+G` |
+| Next / previous match | `Enter` / `Shift+Enter`, `F3` / `Shift+F3` (`Cmd/Ctrl+G` may be captured by the native editor) |
 | Close find | `Esc` |
 | Toggle match case / whole word / regex | `Alt+C` / `Alt+W` / `Alt+R` (or the `Aa` / `ab` / `.*` buttons) |
 | Find in files | `Cmd+Shift+F` / `Ctrl+Shift+F`, or the search icon in the EXPLORER header |
