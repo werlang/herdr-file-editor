@@ -54,6 +54,7 @@ import {
   readonlyReason,
   shouldReloadWatchedFile,
   buildSyntaxTheme,
+  tokenizeCodeLines,
   resolveLocationState,
   resolveFileTab,
   isTabMatchingFile,
@@ -174,6 +175,12 @@ const MAX_CACHED_FILE_STATES = 15;
 function ensureFileEditorKeyBindings(cx) {
   if (globalThis.__fileEditorFindKeyBindingsInstalled === true) return;
   try {
+    // The native Editor's own input bindings own Cmd+F / Cmd+Shift+F / Cmd+G
+    // (input::Search / input::Replace) and stop the key press before GPUI's
+    // keymap sees it. F3 / Shift+F3 are the immediate key-down path; the tab's
+    // on_key_up handler also opens find from the release of Cmd+F/Ctrl+F, and
+    // the Cmd/Ctrl bindings below cover previews and hosts that leave the chord
+    // alone.
     cx.bind_keys([
       { keystroke: "cmd-f", action: "file-editor.find", context: "FileEditor" },
       { keystroke: "ctrl-f", action: "file-editor.find", context: "FileEditor" },
@@ -545,6 +552,7 @@ export default class FileEditor extends View {
     } catch {}
     this.findScrollHandle = null;
     this.findUndo = [];
+    this.findSyntax = null;
     for (const input of [this.searchInput, this.searchReplaceInput, this.includeInput, this.excludeInput]) {
       try {
         input?.release();
@@ -698,6 +706,7 @@ export default class FileEditor extends View {
     };
     this.pendingFindLine = activePropFind?.line ?? null;
     this.findScrollHandle = VirtualListScrollHandle.new();
+    this.findSyntax = null;
     this.findInput = InputState.new({ placeholder: "Find", value: this.find.query });
     this.findInput.on("change", (_event, eventCx) => this.handleFindInputChange(eventCx));
     this.findInput.on("submit", (event, eventCx) => this.stepFind(event?.shift ? -1 : 1, eventCx));
@@ -745,6 +754,19 @@ export default class FileEditor extends View {
 
     this.loadFile(cx);
     this.watchTab(this.root, cx);
+
+    // A new file tab should take the keyboard: the native editor in Code view,
+    // the view root in previews. Without this, Cmd+F/F3 do nothing until the
+    // user clicks the text. Only act while this pane is still the focused one.
+    const focusIfActive = () => {
+      if (this.closed || this.find?.open) return;
+      const paneId = this.findCurrentPaneId();
+      if (paneId && focused()?.pane !== paneId) return;
+      if (this.code) this.focusEditor(cx);
+      else if (!this.isImage && !this.isXlsx) this.focusHandle?.focus();
+    };
+    cx.timer.after(200, focusIfActive);
+    cx.timer.after(600, focusIfActive);
 
     // Sync theme, font, and shared wrap setting periodically
     cx.timer.every(500, (cx) => this.syncTabConfig(cx));
@@ -1876,9 +1898,11 @@ export default class FileEditor extends View {
       .on_action("file-editor.find-prev", (_event, cx) => this.stepFindOrOpen(-1, cx))
       .on_action("file-editor.find-close", (_event, cx) => this.closeFind(cx))
       .on_key_down((event, cx) => this.handleKeyDown(event, cx))
+      .on_key_up((event, cx) => this.handleKeyUp(event, cx))
       .on_mouse_move((event, cx) => this.rememberViewport(event?.bounds, cx))
       .on_mouse_down("left", (event, cx) => {
         this.rememberViewport(event?.bounds, cx);
+        if (!this.code && !this.isImage && !this.isXlsx) this.focusHandle?.focus();
         setShared("file-editor.activeFile", { root: this.root, file: this.file });
         const paneId = this.findCurrentPaneId();
         if (paneId) run("pane.focus", { pane: paneId });
@@ -2067,7 +2091,7 @@ export default class FileEditor extends View {
                 .when(this.find?.open, (btn) => btn.bg(t.selected).text_color(t.foreground))
                 .when(!this.find?.open, (btn) => btn.text_color(t.dim))
                 .hover((s) => s.bg(this.find?.open ? t.selected : t.hover))
-                .tooltip("Find in file (Cmd+F)")
+                .tooltip("Find in file (Cmd+F / F3)")
                 .on_click((_e, cx) => this.openFind(cx))
                 .child(svg("mods/file-editor/search.svg").size(12))
             )
@@ -3195,6 +3219,7 @@ export default class FileEditor extends View {
     this.find.open = false;
     this.pendingFindLine = null;
     this.findUndo = [];
+    this.findSyntax = null;
     if (options.focus !== false) {
       const refocus = (timerCx) => {
         if (!this.closed && !this.find?.open) this.focusEditor(timerCx);
@@ -3231,7 +3256,16 @@ export default class FileEditor extends View {
    */
   refreshFindMatches(cx, notify = true) {
     if (!this.find) return;
-    const result = findMatches(this.findSourceText(), this.find.query, {
+    const source = this.findSourceText();
+    const language = detectLanguage(this.file).language;
+    if (!this.findSyntax || this.findSyntax.text !== source || this.findSyntax.language !== language) {
+      this.findSyntax = {
+        text: source,
+        language,
+        lines: tokenizeCodeLines(source.split("\n"), language),
+      };
+    }
+    const result = findMatches(source, this.find.query, {
       caseSensitive: this.find.caseSensitive,
       wholeWord: this.find.wholeWord,
       regex: this.find.regex,
@@ -3513,6 +3547,25 @@ export default class FileEditor extends View {
     this.persistFindPrefs();
     cx.notify();
     return true;
+  }
+
+  /**
+   * Key-release handler. The native editor consumes Cmd+F on key down, but its
+   * input handlers only stop the press; the release still travels the focus
+   * path and opens the find widget.
+   *
+   * @param {import("gpui-kit").KeyEvent} event
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  handleKeyUp(event, cx) {
+    const key = String(event.key ?? "").toLowerCase();
+    const modifiers = event.modifiers || {};
+    const commandOrControl = Boolean(modifiers.platform || modifiers.control);
+    const isFindChord = event.keystroke === "cmd-f" || event.keystroke === "ctrl-f";
+    if (!isFindChord && !(commandOrControl && !modifiers.shift && key === "f")) return;
+    if (this.find?.open || this.isImage) return;
+    cx.stop_propagation();
+    this.openFind(cx);
   }
 
   /**

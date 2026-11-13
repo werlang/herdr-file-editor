@@ -20,16 +20,32 @@ import {
   describeFindCounter,
   formatSearchSummary,
   lineMatchSegments,
+  mergeSyntaxSegments,
   searchWindow,
   trimMatchContext,
 } from "./find-logic.js";
-import { fileIconPath, isLightColor } from "./file-logic.js";
+import { fileIconPath, isLightColor, buildSyntaxTheme, detectLanguage, tokenizeCodeLines } from "./file-logic.js";
 
 /** Height of a Files pane section header, in pixels. */
 const SECTION_HEADER_HEIGHT = 30;
 
 /** Width of the line-number gutter in the read-only find view, in pixels. */
-const FIND_GUTTER_WIDTH = 48;
+const FIND_GUTTER_BASE = 30;
+const FIND_GUTTER_DIGIT = 7.8;
+const FIND_GUTTER_MIN = 38;
+const FIND_GUTTER_MAX = 96;
+
+/**
+ * Matches the native editor's gutter: wider for files with more digits and
+ * never below the room a small file needs.
+ *
+ * @param {number} lineCount
+ * @returns {number}
+ */
+function findGutterWidth(lineCount) {
+  const digits = String(Math.max(1, Math.floor(Number(lineCount) || 1))).length;
+  return Math.min(FIND_GUTTER_MAX, Math.max(FIND_GUTTER_MIN, Math.round(FIND_GUTTER_BASE + digits * FIND_GUTTER_DIGIT)));
+}
 
 /**
  * Renders one of the Files pane's collapsible section headers.
@@ -345,21 +361,25 @@ export function renderFindBar(view, t) {
  *
  * @param {number} index
  * @param {string} lineText
+ * @param {Array<{ text: string, token: string | null }>} tokenLine
  * @param {Array<Record<string, any>>} matches
  * @param {number} current
  * @param {boolean} isCurrentLine
  * @param {Record<string, string>} t
  * @param {string} codeFont
  * @param {number} scrollColumn Character offset that keeps the current match visible.
+ * @param {Record<string, string>} syntax Token colors from `buildSyntaxTheme`.
+ * @param {number} gutterWidth Width of the line-number column, matched to the editor.
  * @returns {import("gpui-kit").Element}
  */
-function renderFindLine(index, lineText, matches, current, isCurrentLine, t, codeFont, scrollColumn) {
+function renderFindLine(index, lineText, tokenLine, matches, current, isCurrentLine, t, codeFont, scrollColumn, syntax, gutterWidth) {
   const offset = Math.max(0, Math.min(lineText.length, scrollColumn || 0));
   const visibleText = offset > 0 ? lineText.slice(offset) : lineText;
   const lineMatches = (Array.isArray(matches) ? matches : [])
     .filter((match) => match.line === index && match.column + match.length > offset)
     .map((match) => ({ ...match, column: match.column - offset }));
-  const segments = lineMatchSegments(visibleText, lineMatches, index, current);
+  const matchSegments = lineMatchSegments(visibleText, lineMatches, index, current);
+  const segments = mergeSyntaxSegments(visibleText, offset, tokenLine, matchSegments);
   return h_flex()
     .h(FIND_LINE_HEIGHT)
     .w_full()
@@ -368,11 +388,11 @@ function renderFindLine(index, lineText, matches, current, isCurrentLine, t, cod
     .when(isCurrentLine, (el) => el.bg(t.raised))
     .child(
       div()
-        .w(FIND_GUTTER_WIDTH)
+        .w(gutterWidth)
         .flex_none()
-        .pr(10)
+        .pr(24)
         .text_right()
-        .text_size(11)
+        .text_size(11.5)
         .text_color(t.dim)
         .child(String(index + 1))
     )
@@ -384,7 +404,7 @@ function renderFindLine(index, lineText, matches, current, isCurrentLine, t, cod
         .items_center()
         .whitespace_nowrap()
         .font_family(codeFont)
-        .text_size(12.5)
+        .text_size(13)
         .text_color(t.foreground)
         .when(offset > 0, (el) => el.child(div().flex_none().text_color(t.dim).child("…")))
         .children(
@@ -398,6 +418,9 @@ function renderFindLine(index, lineText, matches, current, isCurrentLine, t, cod
                 el.bg(t.ansi3 || t.selected).text_color(t.background)
               )
               .when(segment.highlight && segment.current, (el) => el.bg(t.accent).text_color(t.background))
+              .when(!segment.highlight, (el) =>
+                el.text_color((segment.token && syntax[segment.token]) || t.foreground)
+              )
           )
         )
     );
@@ -422,12 +445,24 @@ export function renderFindCodeView(view, t, codeFont) {
   const current = view.find?.current ?? -1;
   const currentLine = matches[current]?.line ?? -1;
   const scrollColumn = view.find?.scrollColumn ?? 0;
+  const language = detectLanguage(view.file).language;
+  const syntax = buildSyntaxTheme(t);
+  const gutterWidth = findGutterWidth(lineCount);
+
+  let tokenLines = view.findSyntax?.text === text && view.findSyntax?.language === language
+    ? view.findSyntax.lines
+    : null;
+  if (!tokenLines) {
+    tokenLines = tokenizeCodeLines(lines, language);
+    view.findSyntax = { text, language, lines: tokenLines };
+  }
 
   return v_flex()
     .id("file-find-code")
     .relative()
     .flex_1()
     .min_h(0)
+    .pt(6)
     .bg(t.background)
     .child(
       v_virtual_list(
@@ -439,7 +474,19 @@ export function renderFindCodeView(view, t, codeFont) {
           const out = [];
           for (let index = range.start; index < range.end; index += 1) {
             out.push(
-              renderFindLine(index, lines[index] ?? "", matches, current, index === currentLine, t, codeFont, scrollColumn)
+              renderFindLine(
+                index,
+                lines[index] ?? "",
+                tokenLines[index] ?? [],
+                matches,
+                current,
+                index === currentLine,
+                t,
+                codeFont,
+                scrollColumn,
+                syntax,
+                gutterWidth
+              )
             );
           }
           return out;
