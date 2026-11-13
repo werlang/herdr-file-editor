@@ -1,7 +1,7 @@
 {
   "name": "file-editor",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "title": "File Explorer & Editor",
-  "description": "File explorer tree and tabbed file editor with syntax highlighting, Markdown, SVG, CSV and XLSX previews, image zoom, and live reload",
+  "description": "File explorer tree and tabbed file editor with syntax highlighting, Markdown, SVG, CSV and XLSX previews, image zoom, in-editor find and replace, workspace search and replace, and live reload",
   "place": "none"
 }
