@@ -24,7 +24,14 @@ import {
   searchWindow,
   trimMatchContext,
 } from "./find-logic.js";
-import { fileIconPath, isLightColor, buildSyntaxTheme, detectLanguage, tokenizeCodeLines } from "./file-logic.js";
+import {
+  fileIconPath,
+  isLightColor,
+  buildSyntaxTheme,
+  detectLanguage,
+  resolveAbsolutePath,
+  tokenizeCodeLines,
+} from "./file-logic.js";
 
 /** Height of a Files pane section header, in pixels. */
 const SECTION_HEADER_HEIGHT = 30;
@@ -553,8 +560,10 @@ function renderSearchRow(view, row, t, light, collapsedFiles) {
   if (row.kind === "group") {
     const group = row.group;
     const collapsed = collapsedFiles.has(group.file);
+    const absPath = view.root ? resolveAbsolutePath(view.root, group.file) : "";
     return h_flex()
       .id(row.key)
+      .when(Boolean(absPath), (el) => el.drag_paths([absPath], view.on ? { on: view.on } : undefined))
       .h(SEARCH_ROW_HEIGHT)
       .w_full()
       .flex_none()
@@ -643,9 +652,11 @@ function renderSearchRow(view, row, t, light, collapsedFiles) {
   const highlighted = trimmed.text.slice(trimmed.matchStart, trimmed.matchStart + trimmed.matchLength);
   const after = trimmed.text.slice(trimmed.matchStart + trimmed.matchLength);
   const diff = replaceOpen ? view.searchRowDiff(row.group, match, trimmed.matchLength) : null;
+  const absPath = view.root ? resolveAbsolutePath(view.root, row.group.file) : "";
 
   return h_flex()
     .id(row.key)
+    .when(Boolean(absPath), (el) => el.drag_paths([absPath], view.on ? { on: view.on } : undefined))
     .h(SEARCH_ROW_HEIGHT)
     .w_full()
     .flex_none()

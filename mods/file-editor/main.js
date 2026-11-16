@@ -6037,6 +6037,7 @@ export default class FileEditor extends View {
     for (const entry of this.entries.get(prefix) ?? []) {
       if (out.length >= TOTAL) break;
       const path = prefix ? `${prefix}/${entry.name}` : entry.name;
+      const absPath = this.root ? resolveAbsolutePath(this.root, path) : "";
       const open = this.folders.has(path);
       const mark = this.marks[`${this.root}/${path}`] || this.marks[path];
       const isSelected = this.selectedFile === path;
@@ -6046,6 +6047,7 @@ export default class FileEditor extends View {
       out.push(
         h_flex()
           .id(`file-${path}`)
+          .when(Boolean(absPath), (el) => el.drag_paths([absPath], this.on ? { on: this.on } : undefined))
           .h(28)
           .flex_none()
           .pl(8 + depth * 18)
