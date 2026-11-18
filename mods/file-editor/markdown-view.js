@@ -2,12 +2,14 @@
  * GitHub-style Markdown preview. Block structure (headings with rules, code boxes,
  * bordered tables, quote bars, list markers and task boxes) is drawn here, because
  * TextView.markdown takes no styling. Inline runs (emphasis, code, links) go through
- * TextView.markdown, which does handle them.
+ * TextView.markdown, which does handle them. ```mermaid blocks are drawn as diagrams when the
+ * caller passes `ctx.diagram` (mermaid.js).
  */
 
-import { div } from "gpui-kit";
+import { div, image } from "gpui-kit";
 import { v_flex, h_flex, TextView } from "gpui-base";
 import { parseMarkdownBlocks } from "./file-logic.js";
+import { isMermaidLang, mermaidDisplaySize } from "./mermaid-svg.js";
 
 /** Font sizes for h1..h6, following GitHub's 2em/1.5em/1.25em/1em/0.875em/0.85em scale on a 16px body. */
 const HEADING_SIZE = { 1: 32, 2: 24, 3: 20, 4: 16, 5: 14, 6: 13.6 };
@@ -20,8 +22,10 @@ const BODY_LINE = "24px";
  * Renders Markdown source as a GitHub-style document.
  *
  * @param {string} source
- * @param {{ t: Record<string, string>, codeFont: string | null, idPrefix: string }} ctx
- *   `t` is the theme; `codeFont` the editor font for code; `idPrefix` keeps TextView ids unique.
+ * @param {{ t: Record<string, string>, codeFont: string | null, idPrefix: string, maxWidth?: number,
+ *   diagram?: (source: string) => { status: string, src?: string, width?: number, height?: number, message?: string } }} ctx
+ *   `t` is the theme; `codeFont` the editor font for code; `idPrefix` keeps TextView ids unique;
+ *   `maxWidth` the column width diagrams shrink to fit; `diagram` the state of a Mermaid drawing.
  * @returns {import("gpui-kit").Element}
  */
 export function renderMarkdownDocument(source, ctx) {
@@ -59,7 +63,7 @@ function renderBlock(block, ctx, path) {
     case "paragraph":
       return renderInline(block.text, ctx, path, BODY_SIZE, ctx.t.foreground);
     case "code":
-      return renderCode(block, ctx);
+      return ctx.diagram && isMermaidLang(block.lang) ? renderDiagram(block, ctx) : renderCode(block, ctx);
     case "quote":
       return renderQuote(block, ctx, path);
     case "list":
@@ -137,6 +141,48 @@ function renderCode(block, ctx) {
 }
 
 /**
+ * A Mermaid diagram, centered and shrunk to the column. Until it is drawn the block shows its
+ * source; if it can't be drawn, the source under the renderer's message.
+ *
+ * @param {{ text: string }} block
+ * @param {object} ctx
+ * @returns {import("gpui-kit").Element}
+ */
+function renderDiagram(block, ctx) {
+  const drawing = ctx.diagram(block.text);
+  if (drawing.status === "ready") {
+    const size = mermaidDisplaySize(drawing, ctx.maxWidth);
+    return h_flex().w_full().justify_center().child(image(drawing.src).flex_none().w(size.width).h(size.height));
+  }
+  if (drawing.status === "error") {
+    return v_flex()
+      .w_full()
+      .gap(6)
+      .child(
+        div()
+          .w_full()
+          .text_size(13)
+          .line_height("18px")
+          .text_color(ctx.t.muted)
+          .child(`Mermaid: ${drawing.message}`)
+      )
+      .child(renderCode(block, ctx));
+  }
+  return renderCode(block, ctx);
+}
+
+/**
+ * A narrower copy of ctx for nested blocks, so diagrams fit beside a quote bar or list marker.
+ *
+ * @param {object} ctx
+ * @param {number} inset
+ * @returns {object}
+ */
+function insetCtx(ctx, inset) {
+  return Number.isFinite(ctx.maxWidth) ? { ...ctx, maxWidth: Math.max(100, ctx.maxWidth - inset) } : ctx;
+}
+
+/**
  * A block quote: nested blocks beside a muted bar.
  *
  * @param {{ blocks: import("./file-logic.js").MarkdownBlock[] }} block
@@ -154,7 +200,7 @@ function renderQuote(block, ctx, path) {
         .flex_1()
         .min_w(0)
         .text_color(ctx.t.muted)
-        .child(renderBlocks(block.blocks, ctx, path, 16))
+        .child(renderBlocks(block.blocks, insetCtx(ctx, 24), path, 16))
     );
 }
 
@@ -182,7 +228,7 @@ function renderList(block, ctx, path) {
             div()
               .flex_1()
               .min_w(0)
-              .child(renderBlocks(item.blocks, ctx, `${path}.${i}`, 8))
+              .child(renderBlocks(item.blocks, insetCtx(ctx, 40), `${path}.${i}`, 8))
           )
       )
     );

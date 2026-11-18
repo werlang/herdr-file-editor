@@ -6,7 +6,8 @@
  *
  * Mode 2 (File Editor Tab): When props().file is set, renders a full-pane editor tab with:
  * - Syntax highlighting (Editor / EditorState) for code and configuration files.
- * - GitHub-style Markdown preview (markdown-view.js) for .md / .markdown / .mdx.
+ * - GitHub-style Markdown preview (markdown-view.js) for .md / .markdown / .mdx, with
+ *   ```mermaid blocks drawn as diagrams (mermaid.js).
  * - Rendered SVG preview for .svg, with a Code view toggle.
  * - Table previews for .csv / .tsv and .xlsx / .xlsm workbooks.
  * - Zoomable, pannable raster image and SVG previews (25%–400%).
@@ -144,6 +145,8 @@ import {
   renderSidebarSectionHeader,
 } from "./find-view.js";
 import { renderMarkdownDocument } from "./markdown-view.js";
+import { MermaidDiagrams } from "./mermaid.js";
+import { isMermaidLang, mermaidColors, mermaidDisplaySize } from "./mermaid-svg.js";
 import {
   parseDelimitedText,
   parseXlsxWorkbook,
@@ -533,6 +536,7 @@ export default class FileEditor extends View {
    */
   async close(_cx) {
     this.closed = true;
+    this.mermaid?.close();
     this.watched = null;
     this.watchToken = null;
     this.hoveredPath = null;
@@ -2198,7 +2202,7 @@ export default class FileEditor extends View {
                   ? this.renderSpreadsheetView(t)
                   : !isCodeView
                     ? isMarkdown
-                      ? this.renderMarkdownView(t)
+                      ? this.renderMarkdownView(t, cx)
                       : isSvg
                         ? this.renderSvgView(t)
                         : this.renderSpreadsheetView(t)
@@ -2957,24 +2961,45 @@ export default class FileEditor extends View {
 
   /**
    * Renders the Markdown preview as a GitHub-style document, centered in a readable column.
+   * Mermaid blocks are drawn by this tab's MermaidDiagrams, which redraws it as each is ready.
    *
    * @param {Record<string, string>} t
+   * @param {import("gpui-kit").ViewContext} cx
    * @returns {import("gpui-kit").Element}
    */
-  renderMarkdownView(t) {
+  renderMarkdownView(t, cx) {
     const codeFont = settings()?.font_family ?? null;
     const mdId = fileElementId("file-editor-markdown", this.fileKey);
     const viewportHeight = this.tabViewport?.height || 600;
     const viewportWidth = this.tabViewport?.width || 800;
+    // The document column: the same width estimateMarkdownHeight assumes.
+    const columnWidth = Math.min(880, Math.max(280, viewportWidth - 64));
+    this.mermaid ??= new MermaidDiagrams();
+    const colors = mermaidColors(t);
+    const diagram = (source) => this.mermaid.get(source, colors);
+    const measureDiagram = (block, width) => {
+      if (!isMermaidLang(block.lang)) return null;
+      const drawing = diagram(block.text);
+      return drawing.status === "ready" ? mermaidDisplaySize(drawing, width).height : null;
+    };
     const bottomPadding = Math.max(160, Math.round(viewportHeight * 0.4));
     const estContentHeight = Math.max(
       viewportHeight,
-      estimateMarkdownHeight(this.preparedText ?? "", viewportWidth) + bottomPadding
+      estimateMarkdownHeight(this.preparedText ?? "", viewportWidth, measureDiagram) + bottomPadding
     );
     const maxScroll = Math.max(0, estContentHeight - viewportHeight);
     if (this.preparedText && !this.loading) {
       this.mdScrollY = Math.max(0, Math.min(maxScroll, this.mdScrollY || 0));
     }
+    const doc = renderMarkdownDocument(this.preparedText ?? "", {
+      t,
+      codeFont,
+      idPrefix: `md-${mdId}`,
+      maxWidth: columnWidth,
+      diagram,
+    });
+    // Draws the diagrams this render asked for; each one redraws the tab when ready.
+    this.mermaid.pump(cx);
 
     return div()
       .relative()
@@ -3014,7 +3039,7 @@ export default class FileEditor extends View {
                 div()
                   .w_full()
                   .max_w(880)
-                  .child(renderMarkdownDocument(this.preparedText ?? "", { t, codeFont, idPrefix: `md-${mdId}` }))
+                  .child(doc)
               )
           )
       )

@@ -740,9 +740,11 @@ function parseBlocks(lines) {
  *
  * @param {string | null | undefined} source - Markdown source text.
  * @param {number} [viewportWidth=800] - Available viewport width in pixels.
+ * @param {((block: MarkdownBlock, width: number) => number | null) | null} [measure=null] - The
+ *   drawn height of a code block shown as something else (a Mermaid diagram), or null to estimate it as code.
  * @returns {number} Estimated content height in pixels.
  */
-export function estimateMarkdownHeight(source, viewportWidth = 800) {
+export function estimateMarkdownHeight(source, viewportWidth = 800, measure = null) {
   if (typeof source !== "string" || !source.trim()) return 0;
   const blocks = parseMarkdownBlocks(source);
   if (!blocks.length) return 0;
@@ -753,7 +755,7 @@ export function estimateMarkdownHeight(source, viewportWidth = 800) {
 
   for (let i = 0; i < blocks.length; i++) {
     if (i > 0) total += 16; // Block vertical gap: gap(16)
-    total += estimateBlockHeight(blocks[i], contentWidth);
+    total += estimateBlockHeight(blocks[i], contentWidth, measure);
   }
 
   // 1.35x safety multiplier to absorb UI zoom (e.g. 1.1x zoom + font variations)
@@ -766,9 +768,10 @@ export function estimateMarkdownHeight(source, viewportWidth = 800) {
  *
  * @param {MarkdownBlock} block
  * @param {number} width - Available content width for text wrapping.
+ * @param {((block: MarkdownBlock, width: number) => number | null) | null} [measure=null]
  * @returns {number}
  */
-function estimateBlockHeight(block, width) {
+function estimateBlockHeight(block, width, measure = null) {
   if (!block) return 0;
   switch (block.type) {
     case "heading": {
@@ -792,6 +795,8 @@ function estimateBlockHeight(block, width) {
       return lines * 26; // line_height: 24px + inter-paragraph spacing margin
     }
     case "code": {
+      const measured = measure ? measure(block, width) : null;
+      if (typeof measured === "number" && Number.isFinite(measured)) return measured;
       const lines = (block.text || "").split("\n").length;
       return lines * 22 + 36; // line_height 20px + p(16) top/bottom
     }
@@ -804,7 +809,7 @@ function estimateBlockHeight(block, width) {
       const sub = block.blocks || [];
       for (let i = 0; i < sub.length; i++) {
         if (i > 0) h += 16;
-        h += estimateBlockHeight(sub[i], innerWidth);
+        h += estimateBlockHeight(sub[i], innerWidth, measure);
       }
       return h + 8;
     }
@@ -819,7 +824,7 @@ function estimateBlockHeight(block, width) {
         const sub = items[i].blocks || [];
         for (let j = 0; j < sub.length; j++) {
           if (j > 0) itemH += 10; // gap(8) between blocks within a list item
-          itemH += estimateBlockHeight(sub[j], innerWidth);
+          itemH += estimateBlockHeight(sub[j], innerWidth, measure);
         }
         h += Math.max(26, itemH);
       }

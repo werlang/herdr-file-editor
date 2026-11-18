@@ -26,7 +26,7 @@ Inside any Herdr sidebar, split pane, or dedicated tab:
   - **Copy Button**: One-click clipboard copy button (`copy.svg`) with an instant toast notification.
   - **Refresh Button**: One-click reload button (`refresh.svg`) that re-reads file content from disk.
   - **Code View**: Interactive editor with line numbers, code folding, theme-matched syntax highlighting, user font settings, and in-place editing.
-  - **Markdown Preview**: GitHub-style rendering (headings with rules, code boxes, bordered tables, quote bars, task lists) in a centered, readable 880px max-width column.
+  - **Markdown Preview**: GitHub-style rendering (headings with rules, code boxes, bordered tables, quote bars, task lists) in a centered, readable 880px max-width column. ` ```mermaid ` blocks are drawn as diagrams in the theme's colors.
   - **SVG Preview**: `prepareSvgPreview` writes an enlarged copy to `cache/file-editor/` so the host rasterizes small icon view boxes crisply, and the preview is drawn on a light canvas so black `currentColor` fallbacks remain visible.
   - **Edge State Banners**: Friendly centered messages for deleted/missing files (`"This file is no longer available"`), binary files (`"Binary file · no text preview"`), or files truncated past 400,000 characters.
   - **Spreadsheet Limits**: Tables stop at 2,000 rows × 100 columns and 500 characters per cell; the toolbar shows a limit note when a sheet is capped. Workbooks above the 8 MiB `exec` transport budget show a friendly notice.
@@ -75,6 +75,9 @@ Inside any Herdr sidebar, split pane, or dedicated tab:
   - `spreadsheet.js`: Pure CSV/TSV parsing and XLSX/XLSM OOXML reading, plus visible table range and column-width helpers.
   - `find-logic.js`: Pure match/search/replace engine (query → regex, match scanning, counters, wrap/step, line lookup, highlight segments, context trimming, globs, rg/grep parsing, grouping/capping, summaries, replacement expansion, preserve case, back-to-front application, single-match next selection, inline diff segments, safe file-replace planning, confirmation text).
   - `find-view.js`: Find bar and replace row, virtualised read-only match view and the SEARCH sidebar section (replace row, inline diff, hover actions).
+  - `mermaid-svg.js`: Pure Mermaid helpers: which fences are Mermaid, theme colors, a stable drawing key, display size, and the rewrite of beautiful-mermaid's SVG (custom properties and `color-mix()` resolved to plain colors, Google Fonts `@import` dropped, root sized for a crisp bitmap) so the host's resvg draws it.
+  - `mermaid.js`: Per-view `MermaidDiagrams`: lazy `import()` of the renderer, drawing queue, and the `cache/file-editor/mermaid/<key>.svg` cache.
+  - `vendor/beautiful-mermaid.js`: beautiful-mermaid 1.1.3 + elkjs 0.11.1 + entities 7.0.1 bundled as one ES module for Herdr's QuickJS by `vendor/beautiful-mermaid/build.sh` (licenses in `vendor/beautiful-mermaid.LICENSES.txt`).
   - `mod.json`: Herdr mod manifest (`"place": "none"`).
   - Vector SVG icons: `chevron-down.svg`, `chevron-right.svg`, `folder.svg`, `file.svg`, `copy.svg`, `refresh.svg`, `search.svg`, `arrow-up.svg`, `arrow-down.svg`, `close.svg`, `replace.svg`, `replace-all.svg`.
 
@@ -92,7 +95,9 @@ Inside any Herdr sidebar, split pane, or dedicated tab:
 - Never use synchronous event `cx` across an `await`; wrap asynchronous workflows in `cx.spawn(async (cx) => ...)`.
 - Per-loop `watchToken` objects invalidate stale background watchers when switching directories or closing views.
 - The host rasterizes SVG at its root `width`/`height`, not the layout size; use `prepareSvgPreview` so small view boxes stay crisp, and never draw SVG previews on the app background alone because `currentColor` falls back to black.
-- Cache previews live outside `mods/` so writing them does not trigger a mod reload; remove them in `close(_cx)`.
+- Cache previews live outside `mods/` so writing them does not trigger a mod reload; remove them in `close(_cx)`. Mermaid drawings are the exception: they are keyed by source and colors, so they are kept across sessions (a reopened document needs no renderer) and pruned after 30 days.
+- The Mermaid renderer must stay synchronous and DOM-free, and it is ~1.5 MB: load it with `import()` only when a diagram has to be drawn. resvg knows neither `var()` nor `color-mix()`, so every drawing goes through `flattenMermaidSvg` before it is written.
+- Herdr's QuickJS has no usable `setTimeout`, a non-browser `window` and a frozen `Object.prototype`; `vendor/beautiful-mermaid/build.sh` documents the three build-time shims elkjs needs. Don't replace the bundle with the npm build.
 - XLSX bytes are read with `exec` + base64 because `fs.readFile` is capability-gated. Keep the 8 MiB stdout cap in mind: the preview rejects larger workbooks instead of showing a truncated ZIP.
 - Spreadsheet rows are virtualized; do not render every row or every off-screen column, or a large CSV will stall the UI.
 - Known limitation: remote writes through `writeRemoteTextFile` use a temp file + `mv -f`, which may drop the target file's mode. A portable mode copy is not attempted (`chmod --reference` is not portable).
@@ -107,6 +112,6 @@ Inside any Herdr sidebar, split pane, or dedicated tab:
 - `Cmd+Alt+F` / `Ctrl+H` opens the replace row; Replace/Replace All edit the buffer, mark the tab dirty, leave the disk untouched until save, and `Cmd+Z` restores the previous text while find is open.
 - `Cmd+Shift+F` expands SEARCH, results group by file, and clicking a match opens the file at that match through the find prop.
 - SEARCH replace shows the inline strike/insert diff, Replace/Dismiss hover actions, and a confirmation dialog for multi-file runs; the write re-reads each file, skips dirty open tabs and files changed on disk, then re-runs the search.
-- Syntax highlighting and Markdown preview render smoothly.
+- Syntax highlighting and Markdown preview render smoothly, with ` ```mermaid ` blocks drawn as diagrams in dark and light themes.
 - CSV/TSV table previews handle quotes, delimiters and large row counts; XLSX worksheet tabs, dates and percentages render correctly.
 - SVG previews render crisply on a light canvas, and raster/SVG zoom controls work at every level.

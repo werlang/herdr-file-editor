@@ -32,6 +32,7 @@ Instead of opening raw code files inside the narrow Files panel, `file-editor` o
   - Supports JavaScript, TypeScript, JSX/TSX, Python, Rust, Go, C/C++, Shell, HTML, CSS, JSON, YAML, TOML, Dockerfile, Makefile, and more.
 - **Rendered Markdown Preview**:
   - For `.md`, `.markdown`, and `.mdx` files, defaults to a GitHub-style rendered preview (headings, code, tables, quotes, task lists) inside a centered, readable reading column.
+  - ` ```mermaid ` blocks are drawn as diagrams (flowchart, sequence, state, class, ER and `xychart-beta`) in the theme's colors, centered and shrunk to fit the column (also inside lists and quotes). They are rendered in-process by the vendored [beautiful-mermaid](https://github.com/lukilabs/beautiful-mermaid) (MIT, with the elkjs layout engine, EPL-2.0): no browser, no network. While a diagram is drawn, or when it can't be (other types such as pie or gantt), the block shows its source, under the renderer's message on failure.
   - Supports switching seamlessly between **Preview** and **Code** modes via a segmented header switcher.
 - **Rendered SVG Preview**:
   - For `.svg` files, defaults to a rendered preview on a light canvas so `currentColor` icons stay visible on dark themes.
@@ -93,7 +94,7 @@ Instead of opening raw code files inside the narrow Files panel, `file-editor` o
 
 - Herdr desktop app (`herdr-app`).
 - Git installed on your system.
-- Node.js (v18+) for running unit tests.
+- Node.js (v18+) for running unit tests; Node.js and npm only to rebuild the vendored Mermaid renderer (`vendor/beautiful-mermaid/build.sh`).
 - Optional: ripgrep (`rg`) for fast, `.gitignore`-aware Find in Files. Without it, the mod falls back to `grep -rn`.
 
 ---
@@ -241,6 +242,12 @@ Run mod syntax and manifest validation:
 
 ```sh
 herdr-app check mods/file-editor
+```
+
+Rebuild the vendored Mermaid renderer (`mods/file-editor/vendor/beautiful-mermaid.js` and its licenses) after changing the versions pinned at the top of the script:
+
+```sh
+vendor/beautiful-mermaid/build.sh
 ```
 
 ---

@@ -1923,6 +1923,18 @@ test("planFilePlacement - replaces empty pane or placeholder tab when present", 
   });
 });
 
+test("estimateMarkdownHeight - code blocks drawn as something else use their measured height", () => {
+  const md = "# T\n\n```mermaid\ngraph TD\nA-->B\n```\n\n- item\n\n  ```mermaid\n  graph LR\n  A-->B\n  ```\n\n```js\nx\n```\n";
+  const widths = [];
+  const measured = estimateMarkdownHeight(md, 800, (block, width) => {
+    widths.push(width);
+    return block.lang === "mermaid" ? 500 : null;
+  });
+  assert.ok(measured > estimateMarkdownHeight(md, 800) + 1000);
+  // Top level, inside the list item, then the js block (estimated as code).
+  assert.deepEqual(widths, [736, 696, 736]);
+});
+
 test("estimateMarkdownHeight - handles empty, basic, tables, and prevents clipping", () => {
   // Empty or invalid inputs
   assert.equal(estimateMarkdownHeight(null), 0);
