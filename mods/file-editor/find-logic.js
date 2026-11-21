@@ -18,7 +18,7 @@ export const SEARCH_MATCH_CAP = 2000;
 export const SEARCH_FILE_CAP = 200;
 
 /** Default height of one line in the read-only find view, in pixels. */
-export const FIND_LINE_HEIGHT = 20.5;
+export const FIND_LINE_HEIGHT = 20.7;
 
 /** Height of one SEARCH result row, in pixels. */
 export const SEARCH_ROW_HEIGHT = 24;

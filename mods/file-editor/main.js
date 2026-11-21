@@ -98,6 +98,7 @@ import {
   resolveFilesMenuPosition,
 } from "./file-logic.js";
 import {
+  FIND_LINE_HEIGHT,
   FIND_MATCH_CAP,
   REPLACE_MAX_BYTES,
   SEARCH_FILE_CAP,
@@ -690,6 +691,7 @@ export default class FileEditor extends View {
     this.findPropSignature = shouldOpenPropFind ? propSignature : consumedFindSignature;
     this.find = {
       open: shouldOpenPropFind,
+      editing: false,
       query: activePropFind?.query ?? persistedFind.query,
       caseSensitive: activePropFind?.caseSensitive ?? persistedFind.caseSensitive,
       wholeWord: activePropFind?.wholeWord ?? persistedFind.wholeWord,
@@ -705,13 +707,20 @@ export default class FileEditor extends View {
       scrollColumn: 0,
     };
     this.pendingFindLine = activePropFind?.line ?? null;
+    this.findVisibleStart = 0;
+    this.findVisibleEnd = 0;
     this.findScrollHandle = VirtualListScrollHandle.new();
     this.findSyntax = null;
     this.findInput = InputState.new({ placeholder: "Find", value: this.find.query });
     this.findInput.on("change", (_event, eventCx) => this.handleFindInputChange(eventCx));
     this.findInput.on("submit", (event, eventCx) => this.stepFind(event?.shift ? -1 : 1, eventCx));
-    this.findInput.on("focus", () => {
+    this.findInput.on("focus", (_event, eventCx) => {
       this.findFocusTarget = "find";
+      if (this.find?.open && this.find.editing) {
+        this.find.editing = false;
+        this.scrollToCurrentFindMatch(eventCx);
+        eventCx.notify();
+      }
     });
     this.replaceInput = InputState.new({ placeholder: "Replace", value: this.find.replace });
     this.replaceInput.on("change", (_event, eventCx) => this.handleReplaceInputChange(eventCx));
@@ -719,19 +728,26 @@ export default class FileEditor extends View {
       if (event?.secondary) this.replaceAllInEditor(eventCx);
       else this.replaceCurrentMatch(eventCx);
     });
-    this.replaceInput.on("focus", () => {
+    this.replaceInput.on("focus", (_event, eventCx) => {
       this.findFocusTarget = "replace";
+      if (this.find?.open && this.find.editing) {
+        this.find.editing = false;
+        this.scrollToCurrentFindMatch(eventCx);
+        eventCx.notify();
+      }
     });
     this.findFocusTarget = "find";
     this.findUndo = [];
     this.lastReplaceActionAt = 0;
     this.lastPendingFindTimestamp = null;
     if (this.find.open) {
-      // A find prop wins over the preview default: the read-only match view is
-      // the only surface that can bring a line into view.
+      // A find prop wins over the preview default: the highlighted match view is
+      // the surface that brings a line into view with all matches marked.
       this.viewMode = "code";
       cx.timer.after(120, () => {
-        if (!this.closed && this.find.open) this.findInput?.focus();
+        if (!this.closed && this.find.open && !this.find.editing) {
+          this.findInput?.focus();
+        }
       });
     }
 
@@ -1333,6 +1349,10 @@ export default class FileEditor extends View {
     }
     this.preparedText = current;
     this.updateCachedTabState({ dirty: newDirty, lineCount: newLineCount, preparedText: current });
+    if (this.find?.open) {
+      this.refreshFindMatches(cx, false, { select: false });
+      notifyNeeded = true;
+    }
     if (notifyNeeded) {
       cx.notify();
     }
@@ -2202,7 +2222,7 @@ export default class FileEditor extends View {
                       : isSvg
                         ? this.renderSvgView(t)
                         : this.renderSpreadsheetView(t)
-                    : this.find?.open
+                    : this.find?.open && !this.find.editing
                       ? renderFindCodeView(this, t, codeFont)
                       : this.renderCodeView(t)
           )
@@ -3170,6 +3190,7 @@ export default class FileEditor extends View {
     if (typeof options.preserveCase === "boolean") this.find.preserveCase = options.preserveCase;
     if (Number.isFinite(options.line)) this.pendingFindLine = options.line;
     this.find.open = true;
+    this.find.editing = false;
     this.find.scrollColumn = 0;
     this.refreshFindMatches(cx, false);
     this.persistFindPrefs();
@@ -3216,17 +3237,123 @@ export default class FileEditor extends View {
    */
   closeFind(cx, options = {}) {
     if (!this.find?.open) return;
+    const wasEditing = this.find.editing === true;
+    const activeMatch = this.find.matches?.[this.find.current] ?? null;
     this.find.open = false;
+    this.find.editing = false;
     this.pendingFindLine = null;
     this.findUndo = [];
     this.findSyntax = null;
     if (options.focus !== false) {
-      const refocus = (timerCx) => {
-        if (!this.closed && !this.find?.open) this.focusEditor(timerCx);
-      };
-      cx.timer.after(20, refocus);
-      cx.timer.after(100, refocus);
+      if (!wasEditing) {
+        const activeRange = activeMatch
+          ? { start: activeMatch.index, end: activeMatch.index + activeMatch.length }
+          : null;
+        this.syncEditorViewportAndSelect(cx, activeRange, () => !this.closed && !this.find?.open);
+      } else {
+        const refocus = (timerCx) => {
+          if (!this.closed && !this.find?.open) this.focusEditor(timerCx);
+        };
+        cx.timer.after(20, refocus);
+        cx.timer.after(100, refocus);
+      }
     }
+    cx.notify();
+  }
+
+  /**
+   * Returns the UTF-16 offset of the given 0-based line in `text`, optionally
+   * advancing past leading spaces/tabs on that line.
+   *
+   * @param {string} text
+   * @param {number} lineIndex
+   * @param {boolean} [skipIndent=false]
+   * @returns {number}
+   */
+  lineOffsetInText(text, lineIndex, skipIndent = false) {
+    let offset = 0;
+    for (let i = 0; i < lineIndex && offset < text.length; i += 1) {
+      const nl = text.indexOf("\n", offset);
+      if (nl < 0) {
+        offset = text.length;
+        break;
+      }
+      offset = nl + 1;
+    }
+    if (skipIndent) {
+      while (offset < text.length && (text[offset] === " " || text[offset] === "\t")) {
+        offset += 1;
+      }
+    }
+    return offset;
+  }
+
+  /**
+   * Aligns the native `Editor`'s scroll viewport to `[findVisibleStart, findVisibleEnd]`
+   * before placing `targetRange`, so switching out of `renderFindCodeView` keeps the
+   * exact same lines on screen regardless of where the editor was scrolled previously.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   * @param {{ start: number, end: number } | null} targetRange
+   * @param {() => boolean} guardFn
+   */
+  syncEditorViewportAndSelect(cx, targetRange, guardFn) {
+    const visibleStart = Math.max(0, Number.isFinite(this.findVisibleStart) ? this.findVisibleStart : 0);
+    const visibleEnd = Math.max(
+      visibleStart,
+      (Number.isFinite(this.findVisibleEnd) ? this.findVisibleEnd : visibleStart + 1) - 2
+    );
+    cx.timer.after(16, () => {
+      if (!guardFn() || !this.code) return;
+      this.code.focus();
+      const topOff = this.lineOffsetInText(this.code.value(), visibleStart);
+      this.code.set_selected_range({ start: topOff, end: topOff });
+    });
+    cx.timer.after(48, () => {
+      if (!guardFn() || !this.code) return;
+      const botOff = this.lineOffsetInText(this.code.value(), visibleEnd);
+      this.code.set_selected_range({ start: botOff, end: botOff });
+    });
+    cx.timer.after(84, () => {
+      if (!guardFn() || !this.code) return;
+      this.code.focus();
+      if (targetRange && targetRange.end <= this.code.value().length) {
+        this.code.set_selected_range(targetRange);
+      }
+    });
+  }
+
+  /**
+   * Switches from the highlighted find view into the native editable `Editor`
+   * when the user clicks inside the code area, landing on the clicked line (or
+   * the active match if that line was clicked).
+   *
+   * @param {Record<string, any>} event
+   * @param {import("gpui-kit").ViewContext} cx
+   * @param {number} lineCount
+   */
+  enterFindEditMode(event, cx, lineCount) {
+    if (this.closed || !this.find?.open || this.find.editing) return;
+    const zoom = Number(settings()?.zoom) || 1;
+    const localX = (Number(event?.local_position?.x) || 0) / zoom;
+    if (this.tabViewport?.width && localX >= this.tabViewport.width - 14) return;
+
+    const localY = (Number(event?.local_position?.y) || 0) / zoom - 7;
+    const baseLine = Number.isFinite(this.findVisibleStart) ? this.findVisibleStart : 0;
+    const maxLine = Math.max(0, (Number(lineCount) || 1) - 1);
+    const clickedLine = Math.max(0, Math.min(maxLine, baseLine + Math.floor(Math.max(0, localY) / FIND_LINE_HEIGHT)));
+
+    let range = null;
+    const activeMatch = this.find.matches?.[this.find.current];
+    if (activeMatch && activeMatch.line === clickedLine) {
+      range = { start: activeMatch.index, end: activeMatch.index + activeMatch.length };
+    } else if (this.code) {
+      const offset = this.lineOffsetInText(this.code.value(), clickedLine, true);
+      range = { start: offset, end: offset };
+    }
+
+    this.find.editing = true;
+    this.syncEditorViewportAndSelect(cx, range, () => !this.closed && (!this.find?.open || this.find.editing));
     cx.notify();
   }
 
@@ -3238,6 +3365,7 @@ export default class FileEditor extends View {
    */
   handleFindInputChange(cx) {
     if (!this.find) return;
+    this.find.editing = false;
     this.find.query = this.findInput ? this.findInput.value() : "";
     this.pendingFindLine = null;
     this.find.current = -1;
@@ -3254,8 +3382,9 @@ export default class FileEditor extends View {
    * @param {import("gpui-kit").ViewContext} cx
    * @param {boolean} [notify=true]
    */
-  refreshFindMatches(cx, notify = true) {
+  refreshFindMatches(cx, notify = true, options = {}) {
     if (!this.find) return;
+    const select = options.select !== false;
     const source = this.findSourceText();
     const language = detectLanguage(this.file).language;
     if (!this.findSyntax || this.findSyntax.text !== source || this.findSyntax.language !== language) {
@@ -3282,17 +3411,17 @@ export default class FileEditor extends View {
     } else if (this.pendingFindLine !== null && this.pendingFindLine !== undefined) {
       this.find.current = findMatchIndexAtLine(result.matches, this.pendingFindLine - 1);
       this.pendingFindLine = null;
-      this.scrollToCurrentFindMatch(cx);
+      if (select) this.scrollToCurrentFindMatch(cx);
     } else if (this.find.current < 0 || this.find.current >= result.matches.length) {
       this.find.current = 0;
-      this.scrollToCurrentFindMatch(cx);
+      if (select) this.scrollToCurrentFindMatch(cx);
     }
 
     if (notify) cx.notify();
   }
 
   /**
-   * Brings the current match's line into view in the read-only virtual list.
+   * Brings the current match's line into view in the highlighted find view.
    *
    * @param {import("gpui-kit").ViewContext} cx
    */
@@ -3305,7 +3434,7 @@ export default class FileEditor extends View {
       this.tabViewport?.width || this.find?.viewportWidth || 800
     );
     const apply = () => {
-      if (this.closed || !this.find?.open) return;
+      if (this.closed || !this.find?.open || this.find.editing) return;
       try {
         this.findScrollHandle?.scroll_to_item(line, "center");
       } catch {}
@@ -3340,8 +3469,9 @@ export default class FileEditor extends View {
    */
   stepFind(direction, cx) {
     if (!this.find?.open) return;
+    this.find.editing = false;
     const next = stepMatchIndex(this.find.current, this.find.matches.length, direction);
-    if (next === this.find.current) return;
+    if (next < 0) return;
     this.find.current = next;
     this.scrollToCurrentFindMatch(cx);
     cx.notify();
@@ -3355,6 +3485,7 @@ export default class FileEditor extends View {
    */
   toggleFindOption(name, cx) {
     if (!this.find || !["caseSensitive", "wholeWord", "regex"].includes(name)) return;
+    this.find.editing = false;
     this.find[name] = !this.find[name];
     this.find.current = -1;
     this.pendingFindLine = null;

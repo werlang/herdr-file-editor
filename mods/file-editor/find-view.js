@@ -37,10 +37,10 @@ import {
 const SECTION_HEADER_HEIGHT = 30;
 
 /** Width of the line-number gutter in the read-only find view, in pixels. */
-const FIND_GUTTER_BASE = 30;
-const FIND_GUTTER_DIGIT = 7.8;
-const FIND_GUTTER_MIN = 38;
-const FIND_GUTTER_MAX = 96;
+const FIND_GUTTER_BASE = 21;
+const FIND_GUTTER_DIGIT = 8;
+const FIND_GUTTER_MIN = 29;
+const FIND_GUTTER_MAX = 85;
 
 /**
  * Matches the native editor's gutter: wider for files with more digits and
@@ -392,15 +392,16 @@ function renderFindLine(index, lineText, tokenLine, matches, current, isCurrentL
     .w_full()
     .flex_none()
     .items_center()
-    .when(isCurrentLine, (el) => el.bg(t.raised))
     .child(
       div()
         .w(gutterWidth)
         .flex_none()
-        .pr(24)
+        .pr(19)
         .text_right()
-        .text_size(11.5)
-        .text_color(t.dim)
+        .font_family(codeFont)
+        .text_size(12)
+        .text_color(isCurrentLine ? t.foreground : t.dim)
+        .when(isCurrentLine, (el) => el.font_medium())
         .child(String(index + 1))
     )
     .child(
@@ -422,9 +423,9 @@ function renderFindLine(index, lineText, tokenLine, matches, current, isCurrentL
               .when(segment.text === "", (el) => el.child(" "))
               .when(segment.text !== "", (el) => el.child(segment.text))
               .when(segment.highlight && !segment.current, (el) =>
-                el.bg(t.ansi3 || t.selected).text_color(t.background)
+                el.rounded(2).bg(t.ansi3 || t.selected).text_color(t.background)
               )
-              .when(segment.highlight && segment.current, (el) => el.bg(t.accent).text_color(t.background))
+              .when(segment.highlight && segment.current, (el) => el.rounded(2).bg(t.accent).text_color(t.background))
               .when(!segment.highlight, (el) =>
                 el.text_color((segment.token && syntax[segment.token]) || t.foreground)
               )
@@ -469,8 +470,10 @@ export function renderFindCodeView(view, t, codeFont) {
     .relative()
     .flex_1()
     .min_h(0)
-    .pt(6)
+    .pt(7)
     .bg(t.background)
+    .cursor_text()
+    .on_mouse_down("left", (event, cx) => view.enterFindEditMode(event, cx, lineCount))
     .child(
       v_virtual_list(
         "file-find-lines",
@@ -478,6 +481,8 @@ export function renderFindCodeView(view, t, codeFont) {
         FIND_LINE_HEIGHT,
         (index) => `find-line-${index}`,
         (range) => {
+          view.findVisibleStart = range.start;
+          view.findVisibleEnd = range.end;
           const out = [];
           for (let index = range.start; index < range.end; index += 1) {
             out.push(
