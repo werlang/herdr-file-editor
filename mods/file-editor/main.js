@@ -4128,6 +4128,44 @@ export default class FileEditor extends View {
   }
 
   /**
+   * Captures the user-typed search fields so they can return with their space.
+   *
+   * @returns {object}
+   */
+  snapshotSearchInputs() {
+    const { query, caseSensitive, wholeWord, regex, include, exclude, filtersOpen, replace, replaceOpen, preserveCase } =
+      this.search;
+    return { query, caseSensitive, wholeWord, regex, include, exclude, filtersOpen, replace, replaceOpen, preserveCase };
+  }
+
+  /**
+   * Applies saved search fields (or empty defaults) to state and inputs.
+   *
+   * @param {object | undefined} saved
+   */
+  restoreSearchInputs(saved) {
+    Object.assign(this.search, {
+      query: "",
+      caseSensitive: false,
+      wholeWord: false,
+      regex: false,
+      include: "",
+      exclude: "",
+      filtersOpen: false,
+      replace: "",
+      replaceOpen: false,
+      preserveCase: false,
+      valid: true,
+      collapsedFiles: new Set(),
+      ...saved,
+    });
+    this.searchInput.set_value(this.search.query);
+    this.searchReplaceInput.set_value(this.search.replace);
+    this.includeInput.set_value(this.search.include);
+    this.excludeInput.set_value(this.search.exclude);
+  }
+
+  /**
    * Refreshes the directory tree and git status marks.
    *
    * @param {import("gpui-kit").ViewContext} cx
@@ -4138,9 +4176,15 @@ export default class FileEditor extends View {
 
     if (next !== this.context?.key) {
       if (this.context) {
-        this.saved.set(this.context.key, { folders: this.folders, selectedFile: this.selectedFile });
+        this.saved.set(this.context.key, {
+          folders: this.folders,
+          selectedFile: this.selectedFile,
+          search: this.snapshotSearchInputs(),
+        });
       }
       const saved = this.saved.get(next);
+      // Search is scoped to the space: restore its own query or start empty.
+      if (this.context) this.restoreSearchInputs(saved?.search);
       this.context = { key: next, cwd, on, space };
       this.root = cwd;
       this.on = on;
