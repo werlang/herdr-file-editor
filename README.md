@@ -212,16 +212,27 @@ herdr-app do tab.new --name "replace" --mod file-editor \
 
 `find` also accepts `wholeWord`, `regex`, `line` (1-based), `replace`, `replaceOpen` and `preserveCase`. `search` also accepts `wholeWord`, `regex`, `replace`, `replaceOpen` and `preserveCase`. For screenshots or UI automation, `search.replaceDialog: true` (with `replaceOpen: true`) opens the Replace All confirmation for the settled results; it only opens the dialog and never writes anything.
 
-### Find & Search Shortcuts
+### Keyboard Shortcuts
+
+| Editor action | macOS | Windows / Linux |
+| --- | --- | --- |
+| Go to Line | `Ctrl+G` | `Ctrl+G` |
+| Move selected lines up / down | `Option+↑` / `Option+↓` | `Alt+↑` / `Alt+↓` |
+| Duplicate selected lines above / below | `Shift+Option+↑` / `Shift+Option+↓` | `Shift+Alt+↑` / `Shift+Alt+↓` |
+| Delete selected lines | `Cmd+Shift+K` | `Ctrl+Shift+K` |
+
+In Go to Line, enter a line number or a `line:column` position such as `42:8`. Press `Enter` to jump or `Esc` to cancel. Opening it from a Markdown, SVG, or CSV preview switches to Code view. Line edits work in writable Code view and apply to the cursor's line when there is no selection. Use the editor's Undo command to undo each edit.
+
+#### Find & Search
 
 | Action | Shortcut |
 | --- | --- |
-| Find in file | `Cmd+F` / `Ctrl+F`, `F3` / `Shift+F3`, or the `search.svg` toolbar button |
+| Find in file | `Ctrl+F`, `F3` / `Shift+F3`, or the search toolbar button. `Cmd+F` also opens the mod's search when Herdr passes it through. |
 | Find and replace in file | `Cmd+Alt+F` / `Ctrl+H` |
 | Replace current match (replace input focused) | `Enter`, or `Cmd+Shift+1` |
 | Replace all in file (replace input focused) | `Cmd+Enter`, `Ctrl+Alt+Enter`, or `Cmd+Alt+Enter` |
 | Undo last replace while find is open | `Cmd+Z` / `Ctrl+Z` |
-| Next / previous match | `Enter` / `Shift+Enter`, `F3` / `Shift+F3` (`Cmd/Ctrl+G` may be captured by the native editor) |
+| Next / previous match | `Enter` / `Shift+Enter`, `F3` / `Shift+F3`, or `Cmd+G` / `Cmd+Shift+G` |
 | Close find | `Esc` |
 | Toggle match case / whole word / regex | `Alt+C` / `Alt+W` / `Alt+R` (or the `Aa` / `ab` / `.*` buttons) |
 | Find in files | `Cmd+Shift+F` / `Ctrl+Shift+F`, or the search icon in the EXPLORER header |
