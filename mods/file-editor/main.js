@@ -145,6 +145,7 @@ import {
   renderSidebarSectionHeader,
 } from "./find-view.js";
 import { renderMarkdownDocument } from "./markdown-view.js";
+import { editorPosition, planLineEdit } from "./editor-shortcuts.js";
 import {
   parseDelimitedText,
   parseXlsxWorkbook,
@@ -174,19 +175,15 @@ const MAX_CACHED_FILE_STATES = 15;
  * @param {import("gpui-kit").ViewContext} cx
  */
 function ensureFileEditorKeyBindings(cx) {
-  if (globalThis.__fileEditorFindKeyBindingsInstalled === true) return;
+  if (globalThis.__fileEditorKeyBindingsInstalled === true) return;
   try {
-    // The native Editor's own input bindings own Cmd+F / Cmd+Shift+F / Cmd+G
-    // (input::Search / input::Replace) and stop the key press before GPUI's
-    // keymap sees it. F3 / Shift+F3 are the immediate key-down path; the tab's
-    // on_key_up handler also opens find from the release of Cmd+F/Ctrl+F, and
-    // the Cmd/Ctrl bindings below cover previews and hosts that leave the chord
-    // alone.
+    // Match the native Input context for shortcuts that override its keys.
+    // Go to Line also matches the parent context when a preview has focus.
     cx.bind_keys([
       { keystroke: "cmd-f", action: "file-editor.find", context: "FileEditor" },
       { keystroke: "ctrl-f", action: "file-editor.find", context: "FileEditor" },
       { keystroke: "cmd-g", action: "file-editor.find-next", context: "FileEditor" },
-      { keystroke: "ctrl-g", action: "file-editor.find-next", context: "FileEditor" },
+      { keystroke: "ctrl-g", action: "file-editor.goto-line", context: "FileEditor > Input || FileEditor" },
       { keystroke: "cmd-shift-g", action: "file-editor.find-prev", context: "FileEditor" },
       { keystroke: "ctrl-shift-g", action: "file-editor.find-prev", context: "FileEditor" },
       { keystroke: "f3", action: "file-editor.find-next", context: "FileEditor" },
@@ -194,10 +191,17 @@ function ensureFileEditorKeyBindings(cx) {
       { keystroke: "cmd-alt-f", action: "file-editor.replace", context: "FileEditor" },
       { keystroke: "ctrl-h", action: "file-editor.replace", context: "FileEditor" },
       { keystroke: "escape", action: "file-editor.find-close", context: "FileEditorFind" },
+      { keystroke: "escape", action: "file-editor.goto-line-close", context: "FileEditorGotoLine > Input" },
+      { keystroke: "alt-up", action: "file-editor.move-line-up", context: "FileEditorCode > Input" },
+      { keystroke: "alt-down", action: "file-editor.move-line-down", context: "FileEditorCode > Input" },
+      { keystroke: "alt-shift-up", action: "file-editor.duplicate-line-up", context: "FileEditorCode > Input" },
+      { keystroke: "alt-shift-down", action: "file-editor.duplicate-line-down", context: "FileEditorCode > Input" },
+      { keystroke: "cmd-shift-k", action: "file-editor.delete-line", context: "FileEditorCode > Input" },
+      { keystroke: "ctrl-shift-k", action: "file-editor.delete-line", context: "FileEditorCode > Input" },
       { keystroke: "cmd-shift-f", action: "file-editor.search", context: "FilesPane" },
       { keystroke: "ctrl-shift-f", action: "file-editor.search", context: "FilesPane" },
     ]);
-    globalThis.__fileEditorFindKeyBindingsInstalled = true;
+    globalThis.__fileEditorKeyBindingsInstalled = true;
   } catch {}
 }
 
@@ -548,6 +552,8 @@ export default class FileEditor extends View {
       this.replaceInput?.release();
     } catch {}
     this.replaceInput = null;
+    this.gotoLineInput?.release();
+    this.gotoLineInput = null;
     try {
       this.findScrollHandle?.release();
     } catch {}
@@ -673,10 +679,8 @@ export default class FileEditor extends View {
     this.saving = false;
     this.lastSavedText = null;
 
-    // In-editor Find: the native EditorState exposes no selection or cursor
-    // API, so this state owns the query, matches and current index. While the
-    // widget is open the tab renders a read-only, highlighted virtual list
-    // instead of the native Editor (see find-view.js).
+    // The Find widget owns the query and renders a read-only virtual list with
+    // all matches highlighted until the user returns to native editing.
     const persistedFind = normalizeFindPrefs(shared("file-editor.find"));
     const persistedReplace = normalizeReplacePrefs(shared("file-editor.find"));
     const propFind = normalizeFindProp(p.find);
@@ -775,7 +779,7 @@ export default class FileEditor extends View {
     // the view root in previews. Without this, Cmd+F/F3 do nothing until the
     // user clicks the text. Only act while this pane is still the focused one.
     const focusIfActive = () => {
-      if (this.closed || this.find?.open) return;
+      if (this.closed || this.find?.open || this.gotoLineOpen) return;
       const paneId = this.findCurrentPaneId();
       if (paneId && focused()?.pane !== paneId) return;
       if (this.code) this.focusEditor(cx);
@@ -1420,6 +1424,8 @@ export default class FileEditor extends View {
     const commandOrControl = Boolean(event.modifiers?.platform || event.modifiers?.control);
     const key = String(event.key ?? "").toLowerCase();
 
+    if (this.gotoLineOpen) return;
+
     if (this.find?.open && this.handleFindWidgetKeyDown(event, cx)) {
       return;
     }
@@ -1609,7 +1615,10 @@ export default class FileEditor extends View {
   setViewMode(mode, cx, options = {}) {
     if (this.isXlsx) return;
     if (this.viewMode === mode) return;
-    if (mode === "preview" && this.find?.open) this.closeFind(cx, { focus: false });
+    if (mode === "preview") {
+      this.gotoLineOpen = false;
+      this.closeFind(cx, { focus: false });
+    }
     if (this.code) {
       const currentText = this.code.value();
       this.preparedText = currentText;
@@ -1917,6 +1926,7 @@ export default class FileEditor extends View {
       .on_action("file-editor.find-next", (_event, cx) => this.stepFindOrOpen(1, cx))
       .on_action("file-editor.find-prev", (_event, cx) => this.stepFindOrOpen(-1, cx))
       .on_action("file-editor.find-close", (_event, cx) => this.closeFind(cx))
+      .on_action("file-editor.goto-line", (_event, cx) => this.openGotoLine(cx))
       .on_key_down((event, cx) => this.handleKeyDown(event, cx))
       .on_key_up((event, cx) => this.handleKeyUp(event, cx))
       .on_mouse_move((event, cx) => this.rememberViewport(event?.bounds, cx))
@@ -2227,6 +2237,7 @@ export default class FileEditor extends View {
                       : this.renderCodeView(t)
           )
           .when(this.find?.open && !this.isImage, (el) => el.child(renderFindBar(this, t)))
+          .when(this.gotoLineOpen, (el) => el.child(this.renderGotoLine(t)))
       );
   }
 
@@ -3064,7 +3075,19 @@ export default class FileEditor extends View {
   renderCodeView(t) {
     if (this.code) {
       const codeId = fileElementId("file-editor-code", this.fileKey);
-      return Editor.new(this.code).id(codeId).flex_1().min_h(0);
+      return v_flex()
+        .flex_1()
+        .min_h(0)
+        .when(!this.isReadonly(), (view) =>
+          view
+            .key_context("FileEditorCode")
+            .on_action("file-editor.move-line-up", (_event, cx) => this.editSelectedLines("move", -1, cx))
+            .on_action("file-editor.move-line-down", (_event, cx) => this.editSelectedLines("move", 1, cx))
+            .on_action("file-editor.duplicate-line-up", (_event, cx) => this.editSelectedLines("duplicate", -1, cx))
+            .on_action("file-editor.duplicate-line-down", (_event, cx) => this.editSelectedLines("duplicate", 1, cx))
+            .on_action("file-editor.delete-line", (_event, cx) => this.editSelectedLines("delete", 0, cx))
+        )
+        .child(Editor.new(this.code).id(codeId).flex_1().min_h(0));
     }
     const emptyId = fileElementId("file-editor-code-empty", this.fileKey);
     return v_flex()
@@ -3080,6 +3103,107 @@ export default class FileEditor extends View {
           .text_color(t.dim)
           .child(this.loading ? "Loading file…" : "No content")
       );
+  }
+
+  /** Applies the line command as one undoable edit to the native text buffer. */
+  editSelectedLines(operation, direction, cx) {
+    if (!this.code || this.isReadonly() || typeof this.code.replace !== "function") return;
+    cx.stop_propagation();
+    const edit = planLineEdit(this.code.value(), this.code.selected_range(), operation, direction);
+    if (!edit) return;
+    this.code.set_selected_range(edit.range);
+    this.code.replace(edit.text);
+    this.code.set_selected_range(edit.selection);
+  }
+
+  /** Opens the line input above the file, switching text previews to Code view. */
+  openGotoLine(cx) {
+    if (this.closed || this.gotoLineOpen || this.loading || this.fileError || this.isBinary || this.isImage || this.isXlsx) return;
+    if (this.hasPreviewToggle() && this.viewMode !== "code") this.setViewMode("code", cx, { focus: false });
+    if (typeof this.code?.set_selected_range !== "function") return;
+    this.closeFind(cx, { focus: false });
+    if (!this.gotoLineInput) {
+      this.gotoLineInput = InputState.new({ placeholder: "Line or line:column" });
+      this.gotoLineInput.on("submit", (_event, eventCx) => this.submitGotoLine(eventCx));
+      this.gotoLineInput.on("change", (_event, eventCx) => {
+        if (!this.gotoLineError) return;
+        this.gotoLineError = false;
+        eventCx.notify();
+      });
+    }
+    this.gotoLineInput.set_value("");
+    this.gotoLineError = false;
+    this.gotoLineOpen = true;
+    this.gotoLineInput.focus();
+    cx.notify();
+    cx.timer.after(16, () => {
+      if (!this.closed && this.gotoLineOpen) this.gotoLineInput.focus();
+    });
+  }
+
+  /** Moves the caret once the requested position is valid in the current buffer. */
+  submitGotoLine(cx) {
+    if (!this.gotoLineOpen || !this.code) return;
+    const offset = editorPosition(this.code.value(), this.gotoLineInput.value());
+    if (offset === null) {
+      this.gotoLineError = true;
+      cx.notify();
+      return;
+    }
+    this.code.set_selected_range({ start: offset, end: offset });
+    this.closeGotoLine(cx);
+  }
+
+  /** Closes the line input and returns keyboard focus to the editor. */
+  closeGotoLine(cx) {
+    this.gotoLineOpen = false;
+    this.code?.focus?.();
+    cx.notify();
+  }
+
+  /** Renders the Go to Line field with keyboard dismissal and validation feedback. */
+  renderGotoLine(t) {
+    return v_flex()
+      .id("file-editor-goto-line")
+      .absolute()
+      .top(8)
+      .right(12)
+      .w(260)
+      .max_w("92%")
+      .p(8)
+      .gap(5)
+      .rounded(6)
+      .bg(t.raised)
+      .border_1()
+      .border_color(t.border)
+      .key_context("FileEditorGotoLine")
+      .on_action("file-editor.goto-line-close", (_event, cx) => this.closeGotoLine(cx))
+      .on_mouse_down("left", (_event, cx) => cx.stop_propagation())
+      .child(h_flex()
+        .items_center()
+        .justify_between()
+        .child(div().text_size(12).child("Go to Line"))
+        .child(div()
+          .id("file-editor-goto-line-close")
+          .cursor_pointer()
+          .tooltip("Close (Esc)")
+          .on_click((_event, cx) => this.closeGotoLine(cx))
+          .child(svg("mods/file-editor/close.svg").size(12))))
+      .child(Input.new(this.gotoLineInput)
+        .id("file-editor-goto-line-input")
+        .h(24)
+        .w_full()
+        .px(7)
+        .rounded(4)
+        .border_1()
+        .border_color(this.gotoLineError ? t.ansi1 : t.border)
+        .bg(t.background)
+        .text_size(12)
+        .text_color(t.foreground))
+      .when(this.gotoLineError, (view) => view.child(div()
+        .text_size(11)
+        .text_color(t.ansi1)
+        .child("Enter a line and column within the file.")));
   }
 
   /* ========================================================================
@@ -3170,6 +3294,7 @@ export default class FileEditor extends View {
    */
   openFind(cx, options = {}) {
     if (this.closed || this.isImage || !this.find || !this.findInput) return;
+    this.gotoLineOpen = false;
     const hasPreview = isMarkdownFile(this.file) || this.isSvg;
     if (hasPreview && this.viewMode !== "code") {
       this.setViewMode("code", cx, { focus: false });
@@ -3692,6 +3817,10 @@ export default class FileEditor extends View {
     const key = String(event.key ?? "").toLowerCase();
     const modifiers = event.modifiers || {};
     const commandOrControl = Boolean(modifiers.platform || modifiers.control);
+    if (event.keystroke === "ctrl-g") {
+      this.openGotoLine(cx);
+      return;
+    }
     const isFindChord = event.keystroke === "cmd-f" || event.keystroke === "ctrl-f";
     if (!isFindChord && !(commandOrControl && !modifiers.shift && key === "f")) return;
     if (this.find?.open || this.isImage) return;
